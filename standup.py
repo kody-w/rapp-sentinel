@@ -281,8 +281,10 @@ def render(hours=14):
             tag = "p-ok" if "CONTRIBUTED" in out else ("p-mut" if "DECLINED" in out else "p-bad")
             word = out.split(",")[0].split("—")[0].strip()[:12] or "?"
             t = transcript_for("evolve", a["slug"], a["when"])
-            ev = f'<a href="file://{t}">full transcript</a>' if t else \
-                 f'<span class="ev">frame {a["hash"][:12]}…</span>'
+            # relative, not file:// — a file:// link from an http page is
+            # blocked by the browser, and this report is served over http
+            ev = (f'<a href="/logs/{t.name}">full transcript</a>' if t else
+                  f'<span class="ev">frame {a["hash"][:12]}…</span>')
             p.append(f'<tr><td class="ev">{a["when"].astimezone():%H:%M}</td>'
                      f'<td>{esc(a["slug"])}</td>'
                      f'<td><span class="pill {tag}">{esc(word)}</span> {esc(out[:150])}</td>'

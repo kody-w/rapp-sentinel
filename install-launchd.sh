@@ -14,3 +14,11 @@ echo "loaded $LABEL — every 15 min"
 echo "  logs:      $DIR/logs/"
 echo "  stop:      touch $DIR/STOP"
 echo "  uninstall: launchctl unload $PLIST && rm $PLIST"
+
+# the dashboard server — always on, so the page is just a bookmark
+DLABEL="com.rapp.watch-dashboard"
+DPLIST="$HOME/Library/LaunchAgents/$DLABEL.plist"
+sed "s|__DIR__|$DIR|g; s|__HOME__|$HOME|g" "$DIR/$DLABEL.plist.template" > "$DPLIST"
+launchctl unload "$DPLIST" 2>/dev/null || true
+launchctl load "$DPLIST"
+echo "loaded $DLABEL — http://localhost:9797"
