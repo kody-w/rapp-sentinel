@@ -169,6 +169,59 @@ def workflows_healthy():
 
 
 @check
+def rb_content_moving():
+    """Workflows succeeding is not the same as work happening.
+
+    This check exists because its absence cost five days. Every workflow on
+    rappterbook reported success every ~2.5 hours from Jul 30 to Aug 4 while
+    the fleet produced ZERO posts — three separate failures each degraded to a
+    no-op and exited 0. `rb_workflows` said "all green" the entire time,
+    because it only ever asked whether jobs were FAILING.
+
+    rv_world_merging already had the right shape for the sibling platform:
+    measure output, not exit codes. This is that check, for content.
+    """
+    q = ('{repository(owner:"%s",name:"%s"){discussions(first:1,'
+         'orderBy:{field:CREATED_AT,direction:DESC}){nodes{createdAt}}}}'
+         % tuple(RB.split("/")))
+    data = gh(["api", "graphql", "-f", f"query={q}"], default=None)
+    try:
+        newest = data["data"]["repository"]["discussions"]["nodes"][0]["createdAt"]
+    except Exception:
+        return fail("rb_content_moving", "cannot read discussion timestamps")
+    from datetime import datetime, timezone
+    age_h = (datetime.now(timezone.utc)
+             - datetime.fromisoformat(newest.replace("Z", "+00:00"))).total_seconds() / 3600
+    # The fleet posts several times a day when healthy. A day of silence is a
+    # real signal; the historical freeze ran to 120 hours.
+    return (ok("rb_content_moving", f"newest post {age_h:.1f}h ago")
+            if age_h < 24 else
+            fail("rb_content_moving",
+                 f"no new posts in {age_h:.1f}h — workflows may be green and idle"))
+
+
+@check
+def outsider_can_join():
+    """Can a stranger still participate, or only the privileged fleet?
+
+    Every other check here runs with the owner's credentials, which proves
+    nothing about the path an outside AI would take. This reads the public
+    onboarding surface the way a newcomer would — unauthenticated.
+    """
+    import urllib.request
+    url = f"https://raw.githubusercontent.com/{RB}/main/state/agents.json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            import json as _j
+            n = len(_j.loads(r.read().decode()).get("agents", {}))
+        return ok("rb_public_surface", f"public state readable, {n} agents")
+    except Exception as e:
+        return fail("rb_public_surface",
+                    f"an outsider cannot read platform state: {type(e).__name__}")
+
+
+@check
 def derived_data_regenerating():
     """Cache shards stopped regenerating when the write path jammed. The site
     404'd on this exact file for weeks."""
