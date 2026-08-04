@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.rapp.nightwatch</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__DIR__/nightwatch.py</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>__HOME__</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <!-- Every 90 minutes. Often enough to be a play-by-play, rare enough that
+       a quiet night does not turn into a muted thread. -->
+  <key>StartInterval</key><integer>5400</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>__DIR__/logs/nightwatch.out.log</string>
+  <key>StandardErrorPath</key><string>__DIR__/logs/nightwatch.err.log</string>
+</dict>
+</plist>

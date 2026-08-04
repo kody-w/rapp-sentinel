@@ -22,6 +22,25 @@ import checks as C
 HOME = Path(__file__).resolve().parent
 
 
+def _brainstem_answers_turns():
+    """Liveness for a thing whose job is answering: make it answer."""
+    import urllib.request, urllib.error
+    body = json.dumps({"user_input": "reply with the single word: ok"}).encode()
+    req = urllib.request.Request("http://localhost:7071/chat", data=body,
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+        if isinstance(data.get("response"), str) and data["response"].strip():
+            return C.ok("w_brainstem", f'answered a turn ({data["response"].strip()[:20]})')
+        return C.fail("w_brainstem", "responded but produced no answer", critical=False)
+    except urllib.error.HTTPError as e:
+        return C.fail("w_brainstem", f"/chat HTTP {e.code}", critical=False)
+    except Exception as e:
+        return C.fail("w_brainstem", f"/chat unreachable: {type(e).__name__}", critical=False)
+
+
 def probe_watchers():
     """The watchers watching the watchmen.
 
@@ -32,7 +51,13 @@ def probe_watchers():
     for the next run, and for the other two, to judge.
     """
     out = []
-    out.append(C.url_check("w_brainstem", "http://localhost:7071/", critical=False))
+    # Exercise the turn endpoint, not the front page. A GET on / returns 200
+    # from a brainstem that can no longer answer a single turn — which is the
+    # exact "green while frozen" failure this whole loop exists to catch, and
+    # it was sitting in the loop's own liveness check. The brainstem neighbor
+    # found it by reading its own chain: 14 "alive" attestations, none of which
+    # had ever touched /chat.
+    out.append(_brainstem_answers_turns())
 
     try:
         r = subprocess.run(["launchctl", "list"], capture_output=True,

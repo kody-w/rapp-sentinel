@@ -22,3 +22,11 @@ sed "s|__DIR__|$DIR|g; s|__HOME__|$HOME|g" "$DIR/$DLABEL.plist.template" > "$DPL
 launchctl unload "$DPLIST" 2>/dev/null || true
 launchctl load "$DPLIST"
 echo "loaded $DLABEL — http://localhost:9797"
+
+# the overnight play-by-play texter (optional — needs report_number in config)
+NLABEL="com.rapp.nightwatch"
+NPLIST="$HOME/Library/LaunchAgents/$NLABEL.plist"
+sed "s|__DIR__|$DIR|g; s|__HOME__|$HOME|g" "$DIR/$NLABEL.plist.template" > "$NPLIST"
+launchctl unload "$NPLIST" 2>/dev/null || true
+launchctl load "$NPLIST"
+echo "loaded $NLABEL — texts a play-by-play every 90 min"
