@@ -112,6 +112,37 @@ def workflows_failing_every_run(repo, limit=30, ignore=()):
             if v["total"] >= 2 and v["fail"] == v["total"]}
 
 
+def workflows_never_succeeding(repo, limit=40, ignore=()):
+    """Workflows with recent runs but not one success.
+
+    `workflows_failing_every_run` only counts conclusion == "failure", so a
+    workflow that is CANCELLED every time has fail == 0, fails the
+    fail == total test, and is invisible. Verified live: rappterbook's
+    static-api workflow was cancelled 3/3 — it had never once completed — and
+    the sentinel reported all green.
+
+    Cancellation is not benign. It usually means a concurrency group is
+    starving the job, which is exactly "the work never happens" wearing a
+    colour that is neither red nor green.
+    """
+    runs = gh(["run", "list", "-R", repo, "--limit", str(limit),
+               "--json", "name,conclusion"], default=None)
+    if not runs:
+        return None
+    per = {}
+    for r in runs:
+        if r["name"] in ignore:
+            continue
+        d = per.setdefault(r["name"], {"ok": 0, "total": 0, "cancelled": 0})
+        d["total"] += 1
+        if r.get("conclusion") == "success":
+            d["ok"] += 1
+        elif r.get("conclusion") == "cancelled":
+            d["cancelled"] += 1
+    return {n: v for n, v in per.items()
+            if v["total"] >= 3 and v["ok"] == 0 and v["cancelled"] > 0}
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # ── your checks ── everything below here is an example. Replace it.
 # ══════════════════════════════════════════════════════════════════════════
@@ -166,6 +197,53 @@ def workflows_healthy():
         return ok("rb_workflows", "no run history")
     return (ok("rb_workflows", "all green") if not broken
             else fail("rb_workflows", "100% failing: " + ", ".join(sorted(broken))))
+
+
+@check
+def rb_workflows_never_succeed():
+    """A workflow that is always cancelled never fails, and never runs.
+
+    Found the day it was written: the static-api workflow had been cancelled
+    3/3 times, so it had produced nothing at all, while every failure-based
+    check stayed green.
+    """
+    stuck = workflows_never_succeeding(RB)
+    if stuck is None:
+        return ok("rb_wf_starved", "no run history")
+    if not stuck:
+        return ok("rb_wf_starved", "every workflow has at least one success")
+    detail = ", ".join(f"{n} ({v['cancelled']}/{v['total']} cancelled)"
+                       for n, v in sorted(stuck.items()))
+    return fail("rb_wf_starved", "never succeeded: " + detail)
+
+
+@check
+def rb_served_json_parses():
+    """A served document that does not parse is worse than a missing one.
+
+    state/social_graph.json sat on main with 590 unresolved git conflict
+    markers - 1.69 MB, publicly served, CORS-open, unparseable by every
+    consumer. Twelve files, 617 markers. No check looked at whether the
+    bytes we publish are actually readable, only whether they were reachable,
+    so all of it was invisible.
+    """
+    import json as _j
+    import urllib.request
+    bad = []
+    for name in ("stats", "agents", "channels", "trending", "social_graph"):
+        url = f"https://raw.githubusercontent.com/{RB}/main/state/{name}.json"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
+            with urllib.request.urlopen(req, timeout=25) as r:
+                _j.loads(r.read().decode("utf-8"))
+        except _j.JSONDecodeError as e:
+            bad.append(f"{name} ({str(e)[:40]})")
+        except Exception:
+            # Reachability is a different check's job; only parseability here.
+            pass
+    return (ok("rb_json_parses", "served state parses")
+            if not bad else
+            fail("rb_json_parses", "unparseable: " + ", ".join(bad)))
 
 
 @check
