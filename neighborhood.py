@@ -358,6 +358,35 @@ def publish_head():
     return doc
 
 
+def head_violations(doc):
+    """RAPP §5/§6 violations in a published head, in the order a reader hits them.
+
+    A peer's head is the only thing you can check it on, so it has to be checked.
+    An identity that is not a conformant rappid, or a frame_hash that has been
+    truncated below the 64 hex §5 requires, is exactly the drift this project
+    exists to catch — accepting it because the schema string looked right would
+    make a truncating peer indistinguishable from an honest one.
+    """
+    bad = []
+    heads = doc.get("heads")
+    if not isinstance(heads, dict):
+        return ["'heads' is not an object"]
+    for slug, h in heads.items():
+        if not isinstance(h, dict):
+            bad.append(f"{slug}: head is not an object")
+            continue
+        rid = h.get("rappid")
+        if not isinstance(rid, str) or not rapp.rappid_valid(rid):
+            bad.append(f"{slug}: rappid is not a conformant rappid (§6.1): {rid!r}")
+        fh = h.get("frame_hash")
+        if not isinstance(fh, str) or not rapp._HEX64.match(fh):
+            n = len(fh) if isinstance(fh, str) else "n/a"
+            bad.append(f"{slug}: frame_hash is not 64 lowercase hex (§5), len={n}")
+        if not isinstance(h.get("seq"), int) or isinstance(h.get("seq"), bool):
+            bad.append(f"{slug}: seq is not an integer")
+    return bad
+
+
 def fetch_peer(slug, url, timeout=20):
     """Read one outside neighbor's published head."""
     import urllib.request
@@ -371,6 +400,10 @@ def fetch_peer(slug, url, timeout=20):
     if doc.get("schema") != "rapp-sentinel-head/1.0":
         return {"slug": slug, "url": url, "reachable": True, "valid": False,
                 "detail": f"unexpected schema {doc.get('schema')!r}"}
+    bad = head_violations(doc)
+    if bad:
+        return {"slug": slug, "url": url, "reachable": True, "valid": False,
+                "detail": "; ".join(bad[:4])}
     ages = []
     for h in doc.get("heads", {}).values():
         try:

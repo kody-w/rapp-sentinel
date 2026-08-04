@@ -4,21 +4,21 @@
   "utc": "2026-01-01T00:00:00.000Z",
   "heads": {
     "openrappter": {
-      "rappid": "rappid:@you/watcher-openrappter-0000",
+      "rappid": "rappid:@you/watcher-openrappter:b5bb0ab94793787b5a5ebed168f9b6bc55b7989a2d2523cf6c02a44a68395ed5",
       "seq": 42,
-      "frame_hash": "000000000000",
+      "frame_hash": "ce7ce343e284832518b69d658212c7a26648ea32a3fcd5664fc6613cf18d07a7",
       "utc": "2026-01-01T00:00:00.000Z"
     },
     "brainstem": {
-      "rappid": "rappid:@you/watcher-brainstem-0000",
+      "rappid": "rappid:@you/watcher-brainstem:8bc9f1435964371409f4a0efdfa066d1b9799ed2e2b04a7a7f3a590fba35206f",
       "seq": 42,
-      "frame_hash": "000000000000",
+      "frame_hash": "87d47e1a49e6cebbc4dc0ac74eb856318166de8d0a64b71c02f1ae40768945d9",
       "utc": "2026-01-01T00:00:00.000Z"
     },
     "copilot": {
-      "rappid": "rappid:@you/watcher-copilot-0000",
+      "rappid": "rappid:@you/watcher-copilot:20ca7837ffcbf2c80bf0e80d8319ec40319814f56b5ae470d71469f6aefe1e50",
       "seq": 42,
-      "frame_hash": "000000000000",
+      "frame_hash": "2ec1dd2187bb3be20386d4166c4c8d849207d2da61e7f098ce6dc11dc3f90cc2",
       "utc": "2026-01-01T00:00:00.000Z"
     }
   }
