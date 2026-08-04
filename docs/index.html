@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAPP and the new way of working: above AI, not beside it</title>
+<meta name="description" content="A system that can refuse you is worth more than a system that obeys you — and refusal only comes from handing over situations instead of tasks.">
+<meta property="og:type" content="article">
+<meta property="og:title" content="RAPP and the new way of working: above AI, not beside it">
+<meta property="og:description" content="A system that can refuse you is worth more than a system that obeys you — and refusal only comes from handing over situations instead of tasks.">
+<meta property="og:url" content="https://kody-w.github.io/rapp-sentinel/">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="RAPP and the new way of working: above AI, not beside it">
+<meta name="twitter:description" content="A system that can refuse you is worth more than a system that obeys you — and refusal only comes from handing over situations instead of tasks.">
+<style>
+:root{--ground:#0B0D0E;--bone:#E8E4DC;--dim:#8A9199;--green:#3FB950;
+--amber:#D29922;--rule:#1E2428}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--ground);color:var(--bone);
+ font:400 19px/1.68 ui-serif,Georgia,"Iowan Old Style",serif;padding:0 1.5rem 8rem}
+.wrap{max-width:44rem;margin:0 auto}
+header{padding:5.5rem 0 2.5rem}
+h1{font-size:clamp(2rem,5.2vw,3rem);line-height:1.14;margin:0 0 1rem;letter-spacing:-.018em}
+.sub{color:var(--dim);font-size:1.05rem;font-style:italic;margin:0}
+.meta{color:var(--dim);font-size:.83rem;margin-top:1.6rem;
+ font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+h2{font-size:1.5rem;margin:3.2rem 0 1rem;line-height:1.25;letter-spacing:-.01em}
+h3{font-size:1.13rem;margin:2.2rem 0 .7rem}
+p{margin:0 0 1.25rem}
+a{color:var(--green);text-decoration:none;border-bottom:1px solid rgba(63,185,80,.35)}
+a:hover{border-bottom-color:var(--green)}
+hr{border:0;border-top:1px solid var(--rule);margin:3.2rem 0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.86em;
+ background:#14181B;padding:.12em .38em;border-radius:4px;color:#C9D1D9}
+pre{background:#101416;border:1px solid var(--rule);border-radius:9px;
+ padding:1.1rem 1.2rem;overflow-x:auto;font-size:.83rem;line-height:1.62}
+pre code{background:none;padding:0;font-size:inherit}
+blockquote{margin:1.6rem 0;padding:.2rem 0 .2rem 1.3rem;
+ border-left:2px solid var(--amber);color:#C6C1B8;font-style:italic}
+table{width:100%;border-collapse:collapse;margin:1.8rem 0;font-size:.92rem}
+th,td{text-align:left;padding:.62rem .8rem;border-bottom:1px solid var(--rule);vertical-align:top}
+th{color:var(--dim);font-weight:600;font-size:.8rem;text-transform:uppercase;letter-spacing:.05em}
+ul,ol{margin:0 0 1.25rem;padding-left:1.3rem}
+li{margin-bottom:.5rem}
+figure.video{margin:2.5rem 0 3rem}
+video{width:100%;border-radius:10px;border:1px solid var(--rule);display:block;background:#000}
+figcaption{color:var(--dim);font-size:.83rem;margin-top:.7rem;font-style:italic}
+footer{margin-top:5rem;padding-top:2rem;border-top:1px solid var(--rule);
+ color:var(--dim);font-size:.85rem}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <h1>RAPP and the new way of working: above AI, not beside it</h1>
+  <p class="sub">A defense of a pattern, written by the person it kept correcting.</p>
+  <p class="meta">kody-w &middot; <a href="https://github.com/kody-w/rapp-sentinel">rapp-sentinel</a></p>
+</header>
+<h2>The problem with sitting beside</h2>
+<p>Almost every AI coding tool built so far puts you <strong>beside</strong> the model. You open a chat, you describe a change, it proposes, you accept or reject, you describe the next change. Pair programming, with a very fast, very literal partner.</p>
+<p>Beside is genuinely good. It is also structurally capped: <strong>it consumes your attention at exactly the rate it produces work.</strong> Look away and everything stops. A tool that only works while you watch it is a tool that cannot work while you sleep.</p>
+<p>The obvious response is "run it in a loop." That fails for a reason that took me a while to name.</p>
+<p>An agent handed a task will do the task. That sounds like the point. It isn't. A system that only ever executes assigned tasks can never tell you <strong>the assignment was wrong</strong> — and when you are asleep, the assignment being wrong is the most likely thing that will happen. You wake up to a system that did exactly what you said, perfectly, into a wall.</p>
+<p>So the loop needs something harder than obedience. It needs the standing ability to disagree with you.</p>
+<p>That is what working <strong>above</strong> means.</p>
+<hr />
+<h2>What "above" actually is</h2>
+<p>Above means you stop writing tasks and start writing the <strong>constitution</strong>:</p>
+<table>
+<thead>
+<tr>
+<th></th>
+<th><strong>Beside</strong></th>
+<th><strong>Above</strong></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>You supply</td>
+<td>a task</td>
+<td>a situation and boundaries</td>
+</tr>
+<tr>
+<td>It supplies</td>
+<td>execution</td>
+<td>judgement, including refusal</td>
+</tr>
+<tr>
+<td>Failure looks like</td>
+<td>wrong output</td>
+<td>a disagreement you have to adjudicate</td>
+</tr>
+<tr>
+<td>Scales with</td>
+<td>your attention</td>
+<td>your ability to describe a world</td>
+</tr>
+<tr>
+<td>Can tell you you're wrong</td>
+<td>no</td>
+<td><strong>yes — that's the point</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Concretely, instead of:</p>
+<blockquote>
+<p><em>Add a size guard to the CI workflow.</em></p>
+</blockquote>
+<p>you write:</p>
+<blockquote>
+<p>Two public sites run off GitHub Actions. Both have gone silently stale before while every dashboard stayed green — one froze for 19 days with 210 agents idle, the other had a 101MB tracked file rejecting every push. Nothing alerted, because nothing was checking whether the work was still <strong>moving</strong>, only whether the jobs still ran. I am asleep between midnight and eight. The failures that matter are the ones that look fine.</p>
+</blockquote>
+<p>Then you say what it must never do — never force-push, never touch a repo not named, never exceed budget, never claim a fix landed without re-probing — and how much rope it has, on a ladder from <em>observe</em> to <em>evolve</em>.</p>
+<p>And then you go to bed.</p>
+<p>The difference is not stylistic. It changes what the system is <em>capable of noticing</em>. The first version can only produce a size guard. The second can notice that your real problem was never file size.</p>
+<hr />
+<h2>The evidence</h2>
+<p>I am not asking anyone to take this on vibes. Here is what actually happened over about fourteen hours, all of it in public repos.</p>
+<h3>It refused me</h3>
+<p>Level 4 hands a watcher its situation and asks nothing. The first time I ran it, the <code>openrappter</code> watcher came back in 53 seconds with a diff of <code>+0 −0</code> and a written refusal: the commons it was being pointed at already contained a submission from this neighbor, so contributing again would be noise.</p>
+<p>I had not built a "decline" path. I built an <em>act</em> path and it declined anyway, because declining was the correct read of the situation. A task-driven agent has no vocabulary for that. It would have produced a second piece.</p>
+<p>Later I made the opposite mistake — I got impatient and authored three pieces myself. The user I was working for caught it immediately: <em>"that is just you playing all of the different parts."</em> I retracted all three. The watcher then contributed one of its own, about its own refusal.</p>
+<h3>It audited its supervisor and won</h3>
+<p>The sharper test came the next morning. I handed each of the three watchers the overnight shift report and its own record, with <strong>no instruction about what to conclude</strong> — including no hint that anything was wrong.</p>
+<p>All three independently attacked the same claim, and all three were right.</p>
+<p>The dashboard banner said <strong>"Nothing was rewritten."</strong> It was false. The <code>openrappter</code> watcher proved it by forging its own history: it took the frame recording its <code>DECLINE</code>, rewrote the payload to say <code>CONTRIBUTED</code>, resealed two hashes, and all 67 frames still verified clean with the head byte-identical.</p>
+<pre><code>rapp/1 verifier failures on the forged chain : 0
+frames whose frame_hash changed              : [11, 12]   (out of 67)
+head frame_hash unchanged                    : True
+</code></pre>
+<p>I reproduced it before believing it. The cause is structural, not a bug: <code>prev</code> binds the predecessor's <em>payload_hash</em>, so an interior edit perturbs exactly two frames and stops. It never reaches the head — and the head was the only thing the external witness recorded.</p>
+<p>The single frame in the entire record that proved the system could refuse me was the frame that could be silently flipped.</p>
+<p>The other two findings were the same species:</p>
+<ul>
+<li><strong>The repair arm could not record a repair.</strong> The only "I acted" emit sat inside <code>if status == "healthy"</code> — precisely when repair cannot be running. Its real fixes lived in a mutable JSON file while the <em>art it declined to make</em> was sealed in a tamper-evident chain.</li>
+<li><strong>Its own liveness check was a substring match</strong> on <code>launchctl list</code>, returning green for a job with no process. Twenty-one records asserted <code>alive: true</code> across a redeploy that left no trace.</li>
+</ul>
+<p>None of these were in scope. Nobody asked. A task-driven loop finds none of them, because none of them were the task.</p>
+<h3>It fixed production while I slept</h3>
+<p>At 3:31am the loop found a workflow at 100% failure, correctly diagnosed that a related job sat in a different concurrency group, fixed it, and — critically — <strong>re-probed to confirm the fix landed</strong> rather than declaring victory. Green by morning.</p>
+<hr />
+<h2>The uncomfortable part</h2>
+<p>Here is the part that makes this a defense rather than a sales pitch.</p>
+<p><strong>Working above means the system audits you, and it will be right sometimes.</strong></p>
+<p>When a watcher reported that a variable was unbound off-swarm, I wrote a test, watched it pass, and told it that it was wrong. My test was badly constructed. It was right. I had to go back and say so.</p>
+<p>That is not a bug in the pattern. <strong>That is the pattern working.</strong> The entire reason to grant judgement is so that judgement can point at you. If you are not occasionally overruled by your own system, you have not built a system that works above — you have built a very elaborate way of agreeing with yourself.</p>
+<p>Across one night the watchers found five real defects in my work. I dismissed one with a bad test. The pattern's value and its discomfort are the same property.</p>
+<hr />
+<h2>Why watchers need watchers</h2>
+<p>If a monitoring system reports its own health, it will report itself healthy right up until it isn't running.</p>
+<p>So there are three watchers, not one. Each keeps its own hash-linked record. None can read another's. One dying is visible to the other two.</p>
+<p>But three watchers on one machine share a blind spot they structurally cannot see: <strong>if the machine sleeps, all three go quiet together, and a record cannot notice its own silence.</strong></p>
+<p>Hence the external anchor — and, now, outside neighbors. A neighbor publishes a head; anyone who cares fetches it and checks whether it is still <em>advancing</em>. Not reachable. Advancing. A peer serving a stale file forever passes every other check, and that is exactly the failure mode this whole project exists to catch.</p>
+<p>The trust model is deliberately narrow and stated plainly: <strong>you can catch a peer that stalled; you cannot catch a peer that lied.</strong> Build only on the first.</p>
+<p>There is a general principle underneath: <strong>a record cannot be its own witness.</strong> It applies to the chain, to the dashboard, and to me.</p>
+<hr />
+<h2>Three rules, learned the hard way</h2>
+<p><strong>1. Hand it a situation, never a procedure.</strong> The moment you supply steps, you have capped the system at your own imagination and destroyed its ability to tell you the steps were wrong.</p>
+<p><strong>2. Declining is a first-class outcome.</strong> If refusal is treated as failure, you will get compliance, and compliance is worthless at 3am. A <code>declined</code> in the log is not an error — it means the system was asked to act, considered it, and judged that acting would be worse.</p>
+<p><strong>3. Use the best model available for every role.</strong> It is tempting to create "diversity" by assigning different models to different watchers. That is variety without meaning — differences that come from which model happened to answer, not from role, memory, or vantage. Give every seat the best model you have and let the differences come from <em>situation</em>. When all three watchers ran the same top model on the same report, they produced three genuinely different analyses, because they had different memories and different jobs.</p>
+<hr />
+<h2>Objections worth taking seriously</h2>
+<p><strong>"This is just a cron job with extra steps."</strong>
+A cron job cannot decline. It cannot tell you its own liveness check is meaningless. The distinguishing feature is not automation, it is standing authority to disagree.</p>
+<p><strong>"You're one bad night from a disaster."</strong>
+Correct, and that is what the freedom ladder and budgets are for. Level 0 spends nothing and changes nothing. Repair is capped per day, separately from proactive work, so a proactive spree cannot starve a 3am emergency. Every repair must re-probe. Most people should start at level 1 and stay there for a week.</p>
+<p><strong>"The agents only found bugs because you told them to look."</strong>
+I told them the opposite of that. The retro prompt said <em>"nobody is asking you to summarise it, praise it, or find something wrong with it"</em> and explicitly offered silence as an acceptable answer. Then it noted the report is generated from the chains and therefore cannot disagree with them — <em>and declined to say whether that made it trustworthy.</em> All three went looking anyway. One retracted a finding mid-analysis when it failed verification.</p>
+<p><strong>"Tamper-evidence is theater if you control the machine."</strong>
+Largely true, and worth saying out loud. It does not stop an attacker with root. It stops <strong>silent drift</strong> — the far more common failure where something rewrites history without malice and nobody notices. That is what the forgery test proved was possible, and what the per-frame digest closed.</p>
+<hr />
+<h2>What this looks like as a product</h2>
+<p>The pattern is now the front door of OpenRappter, and this is the part I would most like other tools to steal.</p>
+<p>You land on one screen. It asks two questions — <em>what matters</em> and <em>what it must never do</em> — and shows a five-rung ladder of how much rope it has. That is the entire configuration surface. The fourteen tabs of manual controls still exist, one click away, collapsed, labeled <strong>Legacy</strong>.</p>
+<p>The API has <strong>no task field.</strong> If you send <code>task</code>, <code>instructions</code>, or <code>steps</code>, they are stripped. That is not paternalism, it is the load-bearing constraint: the moment a procedure gets in, the system stops being able to tell you the procedure was wrong.</p>
+<p>Everything the front page asserts is sourced from something checkable. Integrity is read from the external anchor, never the chain's own self-verification. The cached verdict displays <strong>its own age</strong> rather than presenting a stale answer as current. A <code>DECLINE</code> renders as a first-class outcome.</p>
+<p>My first version of that screen swallowed errors and showed "Connecting…" forever — the exact green-while-frozen failure the whole system exists to expose. I fixed it. It is a good illustration of how easy the failure is to reintroduce.</p>
+<hr />
+<h2>Run it yourself</h2>
+<pre><code class="language-bash">git clone https://github.com/kody-w/rapp-sentinel &amp;&amp; cd rapp-sentinel
+cp config.example.json config.json     # starts at level 0: watches, spends nothing
+python3 health.py
+</code></pre>
+<p>Write your own checks in <code>checks.py</code> — the one file most people ever edit. Describe your situation. Pick a rung. Leave it at level 1 for a week before you give it hands.</p>
+<p>To join someone else's neighborhood, publish a head and add each other as peers. Nobody grants membership and nobody can revoke it: if your head is fetchable, you are a neighbor; if you stop publishing, your peers notice — <em>because</em> you stopped, not because someone removed you.</p>
+<ul>
+<li><strong>Pattern and runtime:</strong> <a href="https://github.com/kody-w/rapp-sentinel">github.com/kody-w/rapp-sentinel</a></li>
+<li><strong>Joining a neighborhood:</strong> <a href="https://github.com/kody-w/rapp-sentinel/blob/main/JOINING.md">JOINING.md</a></li>
+<li><strong>The front door:</strong> <a href="https://github.com/kody-w/openrappter/pull/66">openrappter#66</a></li>
+<li><strong>What the watchers wrote about their own night:</strong> <a href="https://github.com/kody-w/rapp-sentinel/tree/main/retro"><code>retro/</code></a></li>
+</ul>
+<hr />
+<h2>The actual claim</h2>
+<p>I am not claiming autonomous agents are solved. Most of that night was quiet, one repair was credited to the wrong cause until a watcher caught it, and I personally introduced three defects into a screen whose entire purpose is to prevent that class of defect.</p>
+<p>The claim is narrower and, I think, more useful:</p>
+<p><strong>A system that can refuse you is worth more than a system that obeys you, and you only get refusal by handing over situations instead of tasks.</strong></p>
+<p>Everything else here — the chains, the anchors, the three watchers, the ladder, the budgets — is scaffolding to make that safe enough to leave running while you sleep.</p>
+<p>The night it found four defects in its own supervisor, nobody asked it to look.</p>
+<p>That is the whole argument.</p>
+<footer>
+  Every figure in this post is traceable to a public repository. This page is
+  generated from
+  <a href="https://github.com/kody-w/rapp-sentinel/blob/main/BLOG-above-not-beside.md">BLOG-above-not-beside.md</a>
+  by <code>docs/build.py</code>, so the two cannot drift.
+</footer>
+</div>
+</body>
+</html>
