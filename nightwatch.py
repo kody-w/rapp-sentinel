@@ -46,17 +46,21 @@ def parse(u):
 
 
 def send(text, to):
-    script = '''
-on run argv
-  tell application "Messages"
-    set svc to 1st account whose service type = iMessage
-    send (item 1 of argv) to participant (item 2 of argv) of svc
-  end tell
-end run
-'''
-    p = subprocess.run(["osascript", "-", text, to],
-                       input=script, capture_output=True, text=True, timeout=90)
-    return p.returncode == 0, p.stderr.strip()[:200]
+    """Queue first, then attempt delivery.
+
+    Under launchd, osascript blocks forever on a TCC prompt nobody can see, so
+    a direct send loses the report AND looks like a quiet night. Queueing first
+    means the worst case is a delayed message, never a missing one.
+    """
+    import outbox
+    outbox.enqueue(text, to)
+    if "--queue-only" in sys.argv:
+        # launchd invokes it this way on purpose. Attempting a send from a
+        # background context does not merely fail — it wedges Messages for
+        # everyone, including the contexts that CAN send. Learned by wedging it.
+        return True, "queued (send deferred to a permitted context)"
+    sent, kept, why = outbox.drain()
+    return sent > 0, (why if kept else "")
 
 
 def build(since):

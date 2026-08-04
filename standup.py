@@ -249,6 +249,22 @@ def render(hours=14):
     p.append(f'<p class="sub">Last {hours} hours &middot; generated '
              f'{now:%a %d %b %Y, %H:%M %Z}. Every claim below links to something you can check.</p>')
 
+    # Undelivered alerts first. If texts are not getting out, every other
+    # reassurance on this page is worth less — you would be reading "healthy"
+    # while the thing that is supposed to interrupt you cannot.
+    try:
+        import outbox
+        ob = outbox.status()
+    except Exception:
+        ob = {"pending": 0}
+    if ob.get("pending"):
+        p.append(f'<div class="banner bad"><strong>{ob["pending"]} text(s) undelivered'
+                 f'{" — oldest " + str(int(ob["oldest_minutes"])) + "m" if ob.get("oldest_minutes") else ""}.'
+                 f'</strong> osascript cannot reach Messages from a background context '
+                 f'without Automation permission. Run <code>python3 outbox.py drain</code> '
+                 f'from a terminal, or grant it in System Settings &rarr; Privacy &amp; '
+                 f'Security &rarr; Automation. Until then alerts are queued, not sent.</div>')
+
     # integrity first: if the record can't be trusted, nothing under it matters
     if verified:
         p.append('<div class="banner ok"><strong>Record verified.</strong> All three chains '

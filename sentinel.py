@@ -86,19 +86,21 @@ def log(msg):
 
 
 def notify(cfg, text):
+    """Queue the alert, then try to deliver it.
+
+    Direct osascript hangs under launchd (TCC prompt, background context), so a
+    state-change alert sent that way is silently lost — and silence is exactly
+    what an alert is supposed to break.
+    """
     if not cfg.get("notify"):
         return
-    script = """
-on run argv
-  tell application "Messages"
-    set svc to 1st account whose service type = iMessage
-    send (item 1 of argv) to participant (item 2 of argv) of svc
-  end tell
-end run
-"""
+    to = cfg.get("notify_handle")
+    if not to:
+        return
     try:
-        subprocess.run(["osascript", "-", text, cfg["notify_handle"]],
-                       input=script, capture_output=True, text=True, timeout=60)
+        import outbox
+        outbox.enqueue(text, to)
+        outbox.drain()
     except Exception as e:
         log(f"notify failed: {e}")
 

@@ -7,6 +7,7 @@
   <array>
     <string>/usr/bin/python3</string>
     <string>__DIR__/nightwatch.py</string>
+    <string>--queue-only</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
@@ -15,6 +16,9 @@
   </dict>
   <!-- Every 90 minutes. Often enough to be a play-by-play, rare enough that
        a quiet night does not turn into a muted thread. -->
+  <!-- Must load in the GUI (Aqua) session: osascript driving Messages from a
+       background context hangs forever on a TCC prompt that cannot display. -->
+  <key>LimitLoadToSessionType</key><string>Aqua</string>
   <key>StartInterval</key><integer>5400</integer>
   <key>RunAtLoad</key><false/>
   <key>StandardOutPath</key><string>__DIR__/logs/nightwatch.out.log</string>
