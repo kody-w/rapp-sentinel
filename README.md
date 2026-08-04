@@ -1,4 +1,4 @@
-# sentinel
+# rapp-sentinel
 
 > **Why this exists:** [RAPP and the new way of working: above AI, not beside it](https://kody-w.github.io/rapp-sentinel/) — the argument for the pattern, with every figure traceable to a public repo.
 
