@@ -168,17 +168,44 @@ def summarize(events, commits, art, hours):
     ticks = [e for e in events if e["kind"] == "sentinel.tick"]
     acts = [e for e in events if e["kind"] == "neighbor.acted"]
     crit = [e for e in ticks if e["payload"].get("status") == "critical"]
-    # a repair is a critical tick followed by a healthy one
-    recovered = 0
-    for i in range(1, len(ticks)):
-        if ticks[i - 1]["payload"].get("status") == "critical" and \
-           ticks[i]["payload"].get("status") == "healthy":
-            recovered += 1
+    # A repair is now something the sentinel RECORDS, not something the report
+    # guesses. This used to read "critical tick followed by a healthy one",
+    # which for an intermittent check is a sample of a flapping signal rather
+    # than evidence of an act: copilot showed one of last night's two credited
+    # recoveries was recorded 85 seconds BEFORE the repair finished, by a
+    # different process. The re-probe was the real evidence and it was being
+    # thrown away, while the inference was published.
+    verifs = [e for e in events if e["kind"] == "repair.verified"]
+    recovered = sum(1 for e in verifs if e["payload"].get("landed"))
+    attempted = len([e for e in acts if e["payload"].get("act") == "repair"])
+    # Repairs that predate the chain fix are real and must not vanish from the
+    # report just because the record cannot vouch for them. They are shown with
+    # their provenance stated: a mutable JSON file, not a sealed frame.
+    unsealed = []
+    try:
+        hist = json.loads((HOME / "state" / "escalations.json").read_text())
+        cut = datetime.now(timezone.utc) - timedelta(hours=hours)
+        for h in hist:
+            if h.get("mode") != "repair":
+                continue
+            try:
+                at = datetime.fromisoformat(h["at"])
+                at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+            except Exception:
+                continue
+            if at >= cut and not any(
+                    e["payload"].get("issue") == h.get("key") for e in verifs):
+                unsealed.append({"at": at, "key": h.get("key"),
+                                 "result": h.get("result", "")})
+    except Exception:
+        pass
     return {
         "hours": hours,
         "checks": len(ticks),
         "critical": len(crit),
         "recovered": recovered,
+        "repairs_attempted": attempted,
+        "unsealed_repairs": unsealed,
         "decisions": len(acts),
         "contributed": sum(1 for a in acts if "CONTRIBUTED" in str(a["payload"].get("outcome", ""))),
         "declined": sum(1 for a in acts if "DECLINED" in str(a["payload"].get("outcome", ""))),
@@ -234,6 +261,7 @@ def render(hours=14):
     s = summarize(events, commits, art, hours)
 
     verified = all(v["chain_ok"] for v in roll.values())
+    anchors = NB.check_anchors()
     verdict = json.loads((HOME / "state" / "last_verdict.json").read_text()) \
         if (HOME / "state" / "last_verdict.json").exists() else {"status": "unknown", "summary": ""}
 
@@ -265,11 +293,37 @@ def render(hours=14):
                  f'from a terminal, or grant it in System Settings &rarr; Privacy &amp; '
                  f'Security &rarr; Automation. Until then alerts are queued, not sent.</div>')
 
+    if s.get("unsealed_repairs"):
+        rows = "".join(
+            f'<tr><td>{esc(u["at"].strftime("%H:%M"))}Z</td><td><code>{esc(u["key"])}</code></td>'
+            f'<td>{esc(u["result"][:180])}</td></tr>' for u in s["unsealed_repairs"])
+        p.append('<div class="banner warn"><strong>'
+                 f'{len(s["unsealed_repairs"])} repair(s) recorded OUTSIDE the chain.</strong> '
+                 'These happened and were verified at the time, but they predate the fix that '
+                 'seals repairs into frames — so they live in a mutable JSON file that any '
+                 'process could rewrite, and no neighbor can verify them. '
+                 'Shown because omitting real work is its own dishonesty.'
+                 f'<table class="mini">{rows}</table></div>')
+
     # integrity first: if the record can't be trusted, nothing under it matters
     if verified:
-        p.append('<div class="banner ok"><strong>Record verified.</strong> All three chains '
-                 're-verified from genesis against <code>rapp/1</code> §7.5. Nothing was '
-                 'rewritten.</div>')
+        rev = [k for k, v in anchors.items() if v.get("revised")]
+        if rev:
+            p.append(f'<div class="banner bad"><strong>RECORD REVISED — {esc(rev)}.</strong> '
+                     'A chain verifies clean but no longer reproduces a digest this '
+                     'neighborhood witnessed earlier. An interior frame was rewritten '
+                     'after the fact.</div>')
+        else:
+            p.append('<div class="banner ok"><strong>Record verified.</strong> All three chains '
+                     're-verified from genesis against <code>rapp/1</code> §7.5, and every '
+                     'frame — not just the head — still reproduces the digests the external '
+                     'anchor witnessed. '
+                     '<span class="dim">§7.5 alone would not license that: <code>prev</code> '
+                     'binds the predecessor\'s <code>payload_hash</code>, so a rewritten '
+                     'interior payload perturbs two frames and never reaches the head. '
+                     'openrappter proved it by forging its own DECLINE into a CONTRIBUTE '
+                     'with every guard green. The per-frame digest is what closed it.'
+                     '</span></div>')
     else:
         broken = [k for k, v in roll.items() if not v["chain_ok"]]
         p.append(f'<div class="banner bad"><strong>CHAIN INTEGRITY FAILURE — {esc(broken)}.</strong> '

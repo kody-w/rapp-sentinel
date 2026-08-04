@@ -62,11 +62,32 @@ def probe_watchers():
     try:
         r = subprocess.run(["launchctl", "list"], capture_output=True,
                            text=True, timeout=10)
-        loaded = "com.openrappter.daemon" in (r.stdout or "")
+        pid = None
+        for line in (r.stdout or "").splitlines():
+            if "com.openrappter.daemon" in line:
+                first = line.split("\t")[0].strip()
+                pid = int(first) if first.isdigit() else None
+                loaded = True
+                break
+        else:
+            loaded = False
     except Exception:
-        loaded = False
-    out.append(C.ok("w_openrappter", "daemon loaded") if loaded
-               else C.fail("w_openrappter", "launchd daemon not loaded", critical=False))
+        loaded, pid = False, None
+
+    # `loaded` is a substring of `launchctl list` and nothing more. openrappter
+    # audited its own check and found three jobs on this machine that are loaded
+    # with NO pid — the predicate reports green for a process that is not
+    # running. It is the same defect brainstem already fixed for itself four
+    # lines above (14 "alive" attestations that had never touched /chat), never
+    # carried one function down. A supervisor whose liveness check cannot see a
+    # PID attested through a mid-watch redeploy without flinching.
+    if loaded and pid:
+        out.append(C.ok("w_openrappter", f"daemon running (pid {pid})"))
+    elif loaded:
+        out.append(C.fail("w_openrappter", "daemon loaded but NOT running (no pid)",
+                          critical=False))
+    else:
+        out.append(C.fail("w_openrappter", "launchd daemon not loaded", critical=False))
 
     beat = HOME / "state" / "last_run.json"
     age_m = None

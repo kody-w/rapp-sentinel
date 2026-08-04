@@ -495,10 +495,33 @@ def main():
     (LOGS / f"escalation-{now():%Y%m%d-%H%M%S}.log").write_text(output, encoding="utf-8")
     log(f"escalation finished ({mode}): {verdict_line}")
 
+    # Seal the act into the chain before re-probing. The copilot neighbor found
+    # that the only `neighbor.acted` emit site sat inside `if status ==
+    # "healthy"`, which is precisely when repair cannot run — so the repair arm
+    # was structurally incapable of recording a repair. Its two real fixes lived
+    # only in a mutable JSON file, while the art it did not make was sealed into
+    # a tamper-evident chain.
+    NB.emit("copilot", "neighbor.acted", {
+        "act": mode, "issue": key, "result": verdict_line[:400],
+        "exit_ok": bool(ok), "attempt": rec["attempts"],
+    })
+
     # re-probe: did the repair actually land?
     if mode == "repair":
         after = run_health()
         fixed = set(critical) - set(after["failed"])
+        # The re-probe is the only real evidence a fix landed, and it used to be
+        # written to a log line and thrown away, leaving the report to INFER
+        # repairs from critical->healthy transitions. For an intermittent check
+        # that inference is just a sample of a flapping signal — copilot showed
+        # one of last night's two "recoveries" was recorded 85s BEFORE the
+        # repair it was credited to had finished.
+        NB.emit("copilot", "repair.verified", {
+            "issue": key,
+            "cleared": sorted(fixed),
+            "still_failing": sorted(set(critical) & set(after["failed"])),
+            "landed": bool(fixed),
+        })
         if fixed:
             log(f"verified fixed: {sorted(fixed)}")
             notify(cfg, f"✅ RAPP sentinel repaired: {', '.join(sorted(fixed))}\n{verdict_line[:300]}")

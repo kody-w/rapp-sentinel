@@ -194,6 +194,26 @@ def roll_call(stale_minutes=90):
 ANCHORS = NBHD / "anchors.jsonl"
 
 
+def chain_digest(frames):
+    """A hash over EVERY frame_hash in order, not just the last one.
+
+    The head alone is not enough, and the openrappter neighbor proved it by
+    forging its own memory: `prev` binds the predecessor's *payload_hash*
+    (§7.4), so rewriting an interior payload perturbs exactly that frame and
+    its immediate successor, then stops. It never propagates to the head. The
+    field that would carry it — `prev_wave` — is required to be null off-swarm.
+
+    Reproduced independently: rewrite seq 11's payload, reseal seq 11 and 12,
+    and all 67 frames verify clean under §7.5 with the head byte-identical.
+    The one frame in that chain that recorded a DECLINE could be flipped to
+    "CONTRIBUTED" and every guard stayed green.
+
+    A digest over all frame_hashes has no such blind interior: move any frame
+    and the digest moves, so the external witness sees it.
+    """
+    return rapp.H("rapp/1:wave", {"hashes": [f["frame_hash"] for f in frames]})
+
+
 def anchor_heads():
     """Append every chain's current head to an external, append-only witness.
 
@@ -214,10 +234,28 @@ def anchor_heads():
         if ch:
             rec["heads"][slug] = {"seq": ch[-1]["seq"],
                                   "frame_hash": ch[-1]["frame_hash"],
+                                  "chain_digest": chain_digest(ch),
                                   "stream_id": ids[slug]}
     with open(ANCHORS, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     return rec
+
+
+def anchors_for(slug):
+    """Every anchor record that covered this stream, oldest first."""
+    if not ANCHORS.exists():
+        return []
+    out = []
+    for line in ANCHORS.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            h = json.loads(line).get("heads", {}).get(slug)
+        except Exception:
+            continue
+        if h and "seq" in h:
+            out.append(h)
+    return out
 
 
 def check_anchors():
@@ -245,11 +283,25 @@ def check_anchors():
         ch = read_chain(slug)
         cur = ch[-1]["seq"] if ch else -1
         hashes = {f["frame_hash"] for f in ch}
+        # Re-derive each historical digest over the prefix it covered. A
+        # rewritten interior frame changes its own frame_hash, so every digest
+        # recorded at or after that seq stops reproducing — even though the
+        # chain still verifies and the head never moved.
+        revised_at = None
+        for a in anchors_for(slug):
+            d = a.get("chain_digest")
+            if not d or a["seq"] > cur:
+                continue
+            prefix = ch[:a["seq"] + 1]
+            if len(prefix) == a["seq"] + 1 and chain_digest(prefix) != d:
+                revised_at = a["seq"] if revised_at is None else min(revised_at, a["seq"])
         out[slug] = {
             "witnessed_seq": high["seq"],
             "current_seq": cur,
             "truncated": cur < high["seq"],
             "witnessed_head_present": high["frame_hash"] in hashes or cur > high["seq"],
+            "revised": revised_at is not None,
+            "revised_before_seq": revised_at,
         }
     return out
 
