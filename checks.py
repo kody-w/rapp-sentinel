@@ -194,3 +194,32 @@ def channel_serving():
         if not r["ok"]:
             return r
     return ok("channel", "serving")
+
+
+@check
+def alerts_can_actually_reach_you():
+    """A watchdog that cannot reach you is not watching anything.
+
+    Delivery is the one dependency the rest of this system cannot compensate
+    for: every other check could pass while the alert path is dead, and you
+    would read silence as calm. So a backed-up outbox is a first-class health
+    failure, not a footnote on a dashboard nobody opens at 3am.
+
+    Warn-level on purpose — a stuck queue must not trigger an autonomous repair
+    that then tries to tell you about itself through the same broken channel.
+    """
+    import sys, pathlib as _p
+    sys.path.insert(0, str(_p.Path(__file__).resolve().parent))
+    try:
+        import outbox
+        st = outbox.status()
+    except Exception as e:
+        return fail("alert_delivery", f"outbox unreadable: {e}", critical=False)
+    n, age = st.get("pending", 0), st.get("oldest_minutes")
+    if not n:
+        return ok("alert_delivery", "no queued alerts")
+    if age and age > 180:
+        return fail("alert_delivery",
+                    f"{n} alert(s) undelivered for {age:.0f}m — grant Automation "
+                    f"permission or run `python3 outbox.py drain`", critical=False)
+    return ok("alert_delivery", f"{n} queued, {age:.0f}m old (drains on next check-in)")
