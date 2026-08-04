@@ -1,0 +1,25 @@
+{
+  "schema": "rapp-sentinel-head/1.0",
+  "neighborhood": "your-neighborhood-slug",
+  "utc": "2026-01-01T00:00:00.000Z",
+  "heads": {
+    "openrappter": {
+      "rappid": "rappid:@you/watcher-openrappter-0000",
+      "seq": 42,
+      "frame_hash": "000000000000",
+      "utc": "2026-01-01T00:00:00.000Z"
+    },
+    "brainstem": {
+      "rappid": "rappid:@you/watcher-brainstem-0000",
+      "seq": 42,
+      "frame_hash": "000000000000",
+      "utc": "2026-01-01T00:00:00.000Z"
+    },
+    "copilot": {
+      "rappid": "rappid:@you/watcher-copilot-0000",
+      "seq": 42,
+      "frame_hash": "000000000000",
+      "utc": "2026-01-01T00:00:00.000Z"
+    }
+  }
+}

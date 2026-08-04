@@ -75,6 +75,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             self.path = "/dashboard/index.html"
             return super().do_GET()
 
+        # the head this neighborhood publishes for outside neighbors
+        if path == "/sentinel-head.json":
+            target = HOME / "public" / "sentinel-head.json"
+            if not target.is_file():
+                self.send_error(404); return
+            body = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers(); self.wfile.write(body); return
+
         # transcripts: linked from the report, so they must be reachable over
         # http — a file:// link from an http page is blocked by the browser
         if path.startswith("/logs/"):

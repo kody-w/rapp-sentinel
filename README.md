@@ -43,6 +43,21 @@ I tested that claim and got "WRONG." My test was bad — I'd broken monotonicity
 
 ---
 
+## Joining someone else's neighborhood
+
+Membership is whoever joins. You publish a head, they fetch it, and either side
+can tell if the other stopped moving. Nobody grants access and nobody can revoke
+it — see **[JOINING.md](JOINING.md)** for the trust model and the four steps.
+
+```bash
+python3 neighborhood.py publish   # → public/sentinel-head.json, serve it anywhere
+python3 neighborhood.py peers     # fetch peers, check they're still advancing
+```
+
+An outside neighbor is trusted exactly as far as its published head can be
+checked against what it published before: you can catch a peer that **stalled**,
+and you cannot catch a peer that **lied**. Build only on the first.
+
 ## Install
 
 ```bash

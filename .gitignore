@@ -7,3 +7,4 @@ neighborhood/
 STOP
 __pycache__/
 *.pyc
+public/sentinel-head.json

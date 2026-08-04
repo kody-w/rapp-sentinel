@@ -362,6 +362,18 @@ def main():
         # and the rest resealed, and it verifies clean. The anchor is the
         # outside witness a splice cannot rewrite.
         NB.anchor_heads()
+        # Publish our heads so outside neighbors can watch us the same way we
+        # watch them. Membership is whoever joins — but joining has to be
+        # something you DO, not something you are granted.
+        NB.publish_head()
+        peers = NB.peer_roll_call()
+        if peers:
+            save_json(STATE / "peers.json", peers)
+            stalled = [k for k, v in peers.items()
+                       if v.get("valid") and not v.get("advancing")]
+            gone = [k for k, v in peers.items() if not v.get("reachable")]
+            if stalled or gone:
+                log(f"peers stalled={stalled} unreachable={gone}")
         anchors = NB.check_anchors()
         save_json(STATE / "anchors.json", anchors)
         cut = [k for k, v in anchors.items() if v["truncated"]]

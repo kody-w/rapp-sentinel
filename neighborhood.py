@@ -253,9 +253,121 @@ def check_anchors():
         }
     return out
 
+# ── outside neighbors ───────────────────────────────────────────────────────
+#
+# Membership is whoever joins (rapp-neighborhood-protocol/1.0 §1). A watcher on
+# someone else's machine cannot write to this chain directory and should not be
+# able to — so it joins the way a RAPP channel does: it PUBLISHES a head, and
+# everyone else fetches and verifies it.
+#
+# That keeps the trust model honest. A local neighbor is trusted because you can
+# read its whole chain. A remote neighbor is trusted exactly as far as its
+# published head can be checked against what it published before — which is the
+# same external-anchor argument that fixed truncation locally.
+
+PEERS = NBHD / "peers.json"          # {"slug": "https://.../sentinel-head.json"}
+PUBLIC = HOME / "public"             # what THIS neighborhood publishes outward
+
+
+def peers():
+    try:
+        return json.loads(PEERS.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def publish_head():
+    """Write the head this neighborhood exposes to outsiders.
+
+    Only heads and identities — never payloads. A peer needs enough to detect
+    that you stalled or truncated, and nothing more. Publishing the whole chain
+    would leak whatever your checks happen to name.
+    """
+    PUBLIC.mkdir(exist_ok=True)
+    ids = identities()
+    doc = {
+        "schema": "rapp-sentinel-head/1.0",
+        "neighborhood": NEIGHBORHOOD["slug"],
+        "name": NEIGHBORHOOD["name"],
+        "utc": utc_now(),
+        "heads": {},
+    }
+    for slug in NEIGHBORS:
+        ch = read_chain(slug)
+        if ch:
+            doc["heads"][slug] = {
+                "rappid": ids[slug],
+                "seq": ch[-1]["seq"],
+                "frame_hash": ch[-1]["frame_hash"],
+                "utc": ch[-1]["utc"],
+            }
+    (PUBLIC / "sentinel-head.json").write_text(
+        json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    return doc
+
+
+def fetch_peer(slug, url, timeout=20):
+    """Read one outside neighbor's published head."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            doc = json.loads(r.read().decode())
+    except Exception as e:
+        return {"slug": slug, "url": url, "reachable": False,
+                "detail": f"{type(e).__name__}"}
+    if doc.get("schema") != "rapp-sentinel-head/1.0":
+        return {"slug": slug, "url": url, "reachable": True, "valid": False,
+                "detail": f"unexpected schema {doc.get('schema')!r}"}
+    ages = []
+    for h in doc.get("heads", {}).values():
+        try:
+            t = datetime.strptime(h["utc"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                tzinfo=timezone.utc)
+            ages.append((datetime.now(timezone.utc) - t).total_seconds() / 60)
+        except Exception:
+            pass
+    return {"slug": slug, "url": url, "reachable": True, "valid": True,
+            "neighborhood": doc.get("neighborhood"),
+            "watchers": len(doc.get("heads", {})),
+            "age_minutes": round(min(ages), 1) if ages else None,
+            "heads": {k: v["frame_hash"][:12] for k, v in doc.get("heads", {}).items()}}
+
+
+def peer_roll_call(stale_minutes=90):
+    """Same question asked of outsiders: are you alive, and is your record moving?
+
+    A peer whose published head has not advanced is stalled, and you can see
+    that without trusting anything it says about itself.
+    """
+    seen_path = NBHD / "peers-seen.json"
+    try:
+        seen = json.loads(seen_path.read_text(encoding="utf-8"))
+    except Exception:
+        seen = {}
+
+    out = {}
+    for slug, url in peers().items():
+        info = fetch_peer(slug, url)
+        prev = seen.get(slug, {})
+        if info.get("valid"):
+            same = prev.get("heads") == info["heads"] and prev.get("heads") is not None
+            info["advancing"] = not same
+            info["alive"] = (info.get("age_minutes") is not None
+                             and info["age_minutes"] < stale_minutes)
+            seen[slug] = {"heads": info["heads"], "at": utc_now()}
+        out[slug] = info
+    seen_path.write_text(json.dumps(seen, indent=2) + "\n", encoding="utf-8")
+    return out
+
+
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "anchor":
+    if len(sys.argv) > 1 and sys.argv[1] == "publish":
+        print(json.dumps(publish_head(), indent=2))
+    elif len(sys.argv) > 1 and sys.argv[1] == "peers":
+        print(json.dumps(peer_roll_call(), indent=2))
+    elif len(sys.argv) > 1 and sys.argv[1] == "anchor":
         print(json.dumps(anchor_heads(), indent=2))
     elif len(sys.argv) > 1 and sys.argv[1] == "anchors":
         print(json.dumps(check_anchors(), indent=2))
