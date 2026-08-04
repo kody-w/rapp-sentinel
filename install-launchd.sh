@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# install-launchd.sh — run the sentinel every 15 minutes, surviving reboot.
+set -euo pipefail
+DIR="$(cd "$(dirname "$0")" && pwd)"
+LABEL="com.rapp.neighborhood-watch"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+
+sed "s|__DIR__|$DIR|g; s|__HOME__|$HOME|g" \
+  "$DIR/$LABEL.plist.template" > "$PLIST"
+
+launchctl unload "$PLIST" 2>/dev/null || true
+launchctl load "$PLIST"
+echo "loaded $LABEL — every 15 min"
+echo "  logs:      $DIR/logs/"
+echo "  stop:      touch $DIR/STOP"
+echo "  uninstall: launchctl unload $PLIST && rm $PLIST"

@@ -6,10 +6,10 @@
 # cannot silently stop the watch — the worst it can do is fail loudly.
 set -uo pipefail
 
-export HOME="${HOME:-/Users/kodywildfeuer}"
+export HOME="${HOME:?HOME must be set}"
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$HOME/.local/bin"
 
-cd "$HOME/rapp-sentinel" || exit 1
+cd "$(dirname "$0")" || exit 1
 
 # One tick. Never let a hung child hold the slot forever — launchd will just
 # start the next one on schedule and two overlapping ticks would double-spend.

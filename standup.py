@@ -32,8 +32,18 @@ OUT = HOME / "dashboard"
 OUT.mkdir(exist_ok=True)
 LOGS = HOME / "logs"
 
-REPOS = ["kody-w/rappterbook", "kody-w/rappterverse"]
-COLLECTIVE = "kody-w/public-art-collective"
+def _cfg():
+    p = HOME / "config.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+# Which repos to surface commits from, and (optionally) a commons to show
+# contributions from. Both live in config.json so this file stays generic.
+REPOS = _cfg().get("watch_repos", [])
+COLLECTIVE = _cfg().get("commons_repo", "")
 BOT_AUTHORS = ("rappterbook-bot", "Kody Wildfeuer", "github-actions")
 
 
@@ -93,6 +103,8 @@ def recent_commits(repo, hours):
 
 
 def art_submissions():
+    if not COLLECTIVE:
+        return []
     out = sh(["gh", "api", f"repos/{COLLECTIVE}/contents/submissions/index.json",
               "--jq", ".content"])
     if not out:

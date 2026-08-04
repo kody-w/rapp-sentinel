@@ -47,7 +47,7 @@ DEFAULTS = {
     "issue_cooldown_hours": 4,
     "max_attempts_per_issue": 3,
     "notify": True,
-    "notify_handle": "wildfeuer05@gmail.com",
+    "notify_handle": "",   # set in config.json; empty disables notify
     "copilot_model": "claude-sonnet-4.6",
     "copilot_timeout_s": 900,
     "repo_paths": {

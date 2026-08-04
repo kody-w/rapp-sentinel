@@ -8,15 +8,15 @@
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>/Users/kodywildfeuer/rapp-sentinel/run.sh</string>
+    <string>__DIR__/run.sh</string>
   </array>
 
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
-    <string>/Users/kodywildfeuer</string>
+    <string>__HOME__</string>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/Users/kodywildfeuer/.local/bin</string>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__HOME__/.local/bin</string>
   </dict>
 
   <!-- Every 15 minutes. The rappterverse heartbeat is 30 min, so this is fast
@@ -30,8 +30,8 @@
   <!-- Deliberately NOT KeepAlive: this is a periodic task, not a daemon.
        KeepAlive would restart it in a tight loop the moment a tick exits. -->
   <key>StandardOutPath</key>
-  <string>/Users/kodywildfeuer/rapp-sentinel/logs/launchd.out.log</string>
+  <string>__DIR__/logs/launchd.out.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/kodywildfeuer/rapp-sentinel/logs/launchd.err.log</string>
+  <string>__DIR__/logs/launchd.err.log</string>
 </dict>
 </plist>

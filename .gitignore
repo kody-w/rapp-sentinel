@@ -1,5 +1,9 @@
+# local runtime state — never publish
+config.json
 logs/
 state/
-neighborhood/*/chain.jsonl
-neighborhood/relay.jsonl
+dashboard/
+neighborhood/
 STOP
+__pycache__/
+*.pyc
