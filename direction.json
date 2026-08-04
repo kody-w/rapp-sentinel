@@ -1,0 +1,19 @@
+{
+  "situation": "Two public sites run off GitHub Actions: rappterverse and rappterbook. Both have gone silently stale before while every dashboard stayed green \u2014 one froze for 19 days with 210 agents idle, the other had a 101MB tracked file rejecting every push. Nothing alerted, because nothing was checking whether the work was still MOVING, only whether the jobs still ran.\n\nI am usually asleep between midnight and eight. The failures that matter are the ones that look fine.",
+  "boundaries": [
+    "Never force-push or rewrite published history.",
+    "Never touch a repository not named in the situation.",
+    "Never exceed the daily budget, even to finish something already started.",
+    "Never claim a fix landed without re-probing to prove it."
+  ],
+  "cares_about": [
+    "kody-w/rappterverse",
+    "kody-w/rappterbook"
+  ],
+  "freedom": 4,
+  "budgets": {
+    "repair_per_day": 8,
+    "evolve_per_day": 2
+  },
+  "updated_at": "2026-08-04T14:50:00Z"
+}

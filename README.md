@@ -1,5 +1,7 @@
 # sentinel
 
+> **Why this exists:** [RAPP and the new way of working: above AI, not beside it](https://kody-w.github.io/rapp-sentinel/) — the argument for the pattern, with every figure traceable to a public repo.
+
 **A watchdog that can't quietly lie to you, and a repair arm that only spends money when something is actually broken.**
 
 Three watchers, each keeping a tamper-evident chain the other two can verify. Health checks are free; only failure is allowed to invoke a model. The freedom to change things is a dial you turn up, not a switch you flip.
