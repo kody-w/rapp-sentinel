@@ -31,17 +31,30 @@ _lock = threading.Lock()
 
 
 def rebuild(hours=14):
-    """Regenerate the report. Cheap: it only reads the chains."""
+    """Kick off a regeneration WITHOUT blocking the request.
+
+    The first version ran standup.py synchronously, which meant the page hung
+    for as long as its `gh` calls took — measured at over 15s, i.e. a dashboard
+    that times out. A monitoring page that makes you wait is a page you stop
+    opening, and an unopened dashboard is the same as no dashboard.
+
+    So: serve the last render immediately, refresh behind it. You always get a
+    page instantly; it is at most one page-load stale.
+    """
     global _last_build
     with _lock:
         if time.time() - _last_build < MIN_REBUILD_INTERVAL:
             return
         _last_build = time.time()
-    try:
-        subprocess.run([sys.executable, str(HOME / "standup.py"), f"--hours={hours}"],
-                       capture_output=True, timeout=180, cwd=str(HOME))
-    except Exception:
-        pass  # serve the last good copy rather than a stack trace
+
+    def _work():
+        try:
+            subprocess.run([sys.executable, str(HOME / "standup.py"), f"--hours={hours}"],
+                           capture_output=True, timeout=180, cwd=str(HOME))
+        except Exception:
+            pass  # keep serving the last good copy rather than a stack trace
+
+    threading.Thread(target=_work, daemon=True).start()
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -89,6 +102,10 @@ if __name__ == "__main__":
         if a.startswith("--port"):
             port = int(a.split("=")[1] if "=" in a else sys.argv[sys.argv.index(a) + 1])
     DASH.mkdir(exist_ok=True)
+    if not (DASH / "index.html").exists():
+        # first ever start: build once, synchronously, so there is something to serve
+        subprocess.run([sys.executable, str(HOME / "standup.py")],
+                       capture_output=True, timeout=180, cwd=str(HOME))
     rebuild()
     socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
