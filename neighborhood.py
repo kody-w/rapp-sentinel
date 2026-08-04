@@ -20,15 +20,39 @@ every chain from genesis on every tick, so a stalled *or* tampered watcher is
 detectable by the other two.
 
 CONFORMANCE — stated honestly, per §16:
-  ✅ speaks the §6 twin-chat envelope
-  ✅ supports a §5 transport (local file relay — §18 names local file as a
-     valid relay form; this neighborhood is on-device by design)
+  ✅ builds the §6a twin-chat envelope (the payload layer)
   ✅ uses the §1 vocabulary (Neighbor, twin-chat, kited neighborhood)
+  ⛔ implements NO §5 transport. §5 enumerates a closed set — 5a-http,
+     5a-mcp, 5a-tether, 5a-kite, 5a-cloud, 5b-issues — and a local file is
+     none of them. What §18 names is a *relay* ("an on-device file (local —
+     the default)"), which is where the signed log lives, not a transport.
+     This neighborhood is on-device by design and dials nobody.
   ⛔ does NOT implement the §8 sealed codec (`rapp-sealed/1.0`), therefore
      this does NOT claim full §16 conformance. It rejects `console` kind
      outright rather than pretending to seal it. Everything stays on-device
      and never crosses a network, which is why that is an acceptable trade
      here — but it is a gap, and it is written down rather than glossed.
+  ⛔ does NOT implement the §6 on-relay wrapper. §6 requires that on a relay
+     — and it names "local file" first — the envelope ride inside a signed
+     `rapp-commons-event/1.0` event carrying {from, pub, alg:"ecdsa-p256",
+     ts, kind, body, sig}. That needs ECDSA-P256; rapp.py and this repo are
+     stdlib-only, so `say()` REFUSES rather than writing an unsigned relay
+     line that would look conformant and not be. Same posture as `console`.
+
+INTEGRITY — the two stores are NOT equally trustworthy, and the difference
+matters. Each neighbor's `<slug>/chain.jsonl` is a hash-chained rapp/1 log
+re-verified from genesis by verify(), so it cannot be quietly rewritten. The
+`relay.jsonl` twin-chat log has no such property while it is unsigned, which
+is exactly why say() will not write to it.
+
+Frames follow `rapp/1` exactly, via the vendored reference implementation
+(rapp.py, copied from kody-w/rapp-1 — stdlib only).
+
+NOTE on kind registration: §7.5 step 1 also requires each `kind` be
+registered in the §13 registry, and rapp.py checks grammar only. That is not
+fixable here — §13's registry (rapp-map/ecosystem-spec.json) declares
+"accepted_as_rapp1_registry": false and is an open owner action, so no kind
+in the estate is registered. Inventing one locally is explicitly forbidden.
 
 Frames follow `rapp/1` exactly, via the vendored reference implementation
 (rapp.py, copied from kody-w/rapp-1 — stdlib only).
@@ -44,6 +68,8 @@ HOME = Path(__file__).resolve().parent
 NBHD = HOME / "neighborhood"
 NBHD.mkdir(exist_ok=True)
 IDENTITY = NBHD / "neighbors.json"
+# Reserved for the §6 twin-chat relay. Nothing writes it today: see say() —
+# a conformant relay line needs an ecdsa-p256 signature this repo cannot make.
 RELAY = NBHD / "relay.jsonl"
 
 OWNER = "kody-w"
@@ -139,16 +165,16 @@ def verify(slug):
     return True, f"{len(chain)} frames verified from genesis"
 
 
-def say(from_slug, to_slug, kind, payload):
-    """Put a §6a twin-chat envelope on the local relay.
+def build_envelope(from_slug, to_slug, kind, payload):
+    """Build a §6a twin-chat envelope. Does NOT write it anywhere.
 
-    `console` is refused: §6b makes it sealed-only and this neighborhood has
-    no §8 codec, so accepting it would be a false claim of security.
+    This is the *payload* layer only. Putting it on a relay additionally
+    requires the §6 signing wrapper — see say().
     """
     if kind == "console":
         raise ValueError("console is sealed-only (§6b/§8); this neighborhood has no sealed codec")
     ids = identities()
-    env = {
+    return {
         "schema": "rapp-twin-chat/1.0",
         "from_rappid": ids[from_slug],
         "to_rappid": ids[to_slug],
@@ -158,9 +184,35 @@ def say(from_slug, to_slug, kind, payload):
         "payload": payload,
         "facets": [],
     }
-    with open(RELAY, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(env, ensure_ascii=False) + "\n")
-    return env
+
+
+def say(from_slug, to_slug, kind, payload):
+    """Refused: writing this relay conformantly needs a signature we cannot make.
+
+    §6 ("On-relay form") is explicit that a relay — and it names "local file"
+    first, which is exactly what RELAY is — carries the envelope inside a
+    signed `rapp-commons-event/1.0` wrapper: {schema, from, pub,
+    alg:"ecdsa-p256", ts, kind, body, sig}, sig being an ECDSA-P256 signature
+    over the canonicalized event.
+
+    ECDSA-P256 is not in the stdlib, and rapp.py plus this repo are
+    deliberately stdlib-only. Appending the bare envelope anyway would produce
+    an append-only-looking log that any local process could rewrite
+    undetectably — the precise failure this module exists to catch, and a
+    weaker guarantee than the hash-chained chain.jsonl logs beside it.
+
+    So this refuses, the same way `console` is refused rather than pretended
+    sealed. Use emit() for the record of account; it is chained and verified.
+    Build the unsigned envelope explicitly with build_envelope() if you need
+    the §6a shape in memory for something that never touches a relay.
+    """
+    build_envelope(from_slug, to_slug, kind, payload)  # still enforces §6b console
+    raise NotImplementedError(
+        "refusing to write an unsigned relay record: §6 on-relay form requires a signed "
+        "rapp-commons-event/1.0 wrapper (ecdsa-p256), which needs a non-stdlib crypto "
+        "dependency this repo does not take. Use emit() for the hash-chained record, or "
+        "build_envelope() for an in-memory §6a envelope."
+    )
 
 
 def roll_call(stale_minutes=90):
