@@ -63,8 +63,8 @@ sentinel republishes on every tick, so once it is served it stays current.
   "neighborhood": "your-slug",
   "utc": "2026-08-04T13:44:31.271Z",
   "heads": {
-    "openrappter": { "rappid": "rappid:@you/watcher-…", "seq": 64,
-                     "frame_hash": "1c0ae94a…", "utc": "…" }
+    "openrappter": { "rappid": "rappid:@you/watcher-openrappter:<64hex>", "seq": 64,
+                     "frame_hash": "<64hex>", "utc": "…" }
   }
 }
 ```
@@ -74,15 +74,22 @@ sentinel republishes on every tick, so once it is served it stays current.
 Each side writes the other into `neighborhood/peers.json`:
 
 ```json
-{ "kody-rappter-watch": "https://kody-w.github.io/rapp-sentinel/sentinel-head.json" }
+{ "some-peer": "https://their-host.example/sentinel-head.json" }
 ```
+
+`public/sentinel-head.json` is gitignored (it is live runtime state, not source),
+so it is not served from this repository — each operator serves their own copy at
+their own URL, and you paste that URL here.
 
 ```bash
 python3 neighborhood.py peers          # fetch, validate, judge
 ```
 
 You get back whether each peer is `reachable`, `valid`, `alive` (published
-recently) and `advancing` (its heads moved since you last looked). **`advancing`
+recently) and `advancing` (its heads moved since you last looked). `valid` means
+the document parsed as `rapp-sentinel-head/1.0` **and** every head in it carries a
+conformant rappid (§6.1) and a full 64-hex `frame_hash` (§5) — a peer that
+truncates its hashes is rejected rather than counted as healthy. **`advancing`
 is the one that matters** — a peer serving a stale file forever looks perfectly
 healthy on every other axis, which is precisely the failure this project exists
 to catch.
