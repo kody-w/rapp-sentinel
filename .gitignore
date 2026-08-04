@@ -1,0 +1,5 @@
+logs/
+state/
+neighborhood/*/chain.jsonl
+neighborhood/relay.jsonl
+STOP
