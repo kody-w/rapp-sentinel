@@ -45,9 +45,6 @@ re-verified from genesis by verify(), so it cannot be quietly rewritten. The
 `relay.jsonl` twin-chat log has no such property while it is unsigned, which
 is exactly why say() will not write to it.
 
-Frames follow `rapp/1` exactly, via the vendored reference implementation
-(rapp.py, copied from kody-w/rapp-1 — stdlib only).
-
 NOTE on kind registration: §7.5 step 1 also requires each `kind` be
 registered in the §13 registry, and rapp.py checks grammar only. That is not
 fixable here — §13's registry (rapp-map/ecosystem-spec.json) declares
