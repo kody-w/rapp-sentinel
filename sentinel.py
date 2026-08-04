@@ -304,6 +304,15 @@ def main():
         log("STOP file present — standing down, no checks, no spend.")
         return 0
 
+    def refresh_dashboard():
+        """Rebuild the shift report every tick. It only ever reads the chains,
+        so it can never disagree with the record it renders."""
+        try:
+            subprocess.run([sys.executable, str(HOME / "standup.py"), "--hours=14"],
+                           capture_output=True, timeout=180, cwd=str(HOME))
+        except Exception as e:
+            log(f"dashboard refresh failed: {type(e).__name__}: {e}")
+
     verdict = run_health()
     status = verdict["status"]
     failing = verdict["failed"]
@@ -311,6 +320,7 @@ def main():
     prev_status = prev.get("status")
 
     log(f"status={status} failing={failing or 'none'}")
+    refresh_dashboard()
 
     # own heartbeat, so a stalled sentinel is detectable by the next run,
     # by the brainstem, and by openrappter

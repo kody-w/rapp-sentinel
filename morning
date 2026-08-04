@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# morning — read the overnight shift report.
+# Regenerates from the append-only chains, re-verifying them, then opens it.
+cd "$(dirname "$0")" || exit 1
+/usr/bin/python3 standup.py --hours="${1:-14}" && open dashboard/index.html
