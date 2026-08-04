@@ -220,6 +220,11 @@ Stated plainly, because the whole point is verifiable claims.
 - **A chain proves integrity, not truth.** It proves the record was not
   altered. It cannot prove the record was right. A wrong check verifies just
   as cleanly as a correct one.
+- **And a chain alone does not prove completeness.** When payloads repeat,
+  `prev` links repeat, and an interior frame can be dropped and the remainder
+  resealed — verifying clean. Verification is self-referential; the chain
+  attests to itself. Publish the head hash somewhere outside the chain, or
+  history can be silently shortened. A watcher found this in its own memory.
 - **Level 2 is real write access.** The guardrails are good, not perfect.
   Worktree isolation and the allowlist are what stand between an autonomous
   repair and your uncommitted work.

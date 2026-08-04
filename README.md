@@ -111,9 +111,34 @@ Schedulers are deliberately offset — one on the quarter hour, one at `:07/:37`
 
 Each watcher keeps a [`rapp/1`](https://github.com/kody-w/rapp-1) frame chain: content-addressed, hash-linked, append-only. Every entry commits to the previous one's hash.
 
-A log file can be rewritten to look healthier than it was. A chain can't — alter any past entry and verification fails with a hash mismatch. So *"the watcher says it's fine"* becomes *"the watcher's record verifies from genesis, and here's the head hash."*
+A log file can be rewritten to look healthier than it was. A chain makes that harder — alter any past *payload* and verification fails with a hash mismatch. So *"the watcher says it's fine"* becomes *"the watcher's record verifies from genesis, and here's the head hash."*
 
-One is a claim you trust. The other is a claim you check. It makes a **tampered** watcher exactly as detectable as a **stalled** one — the two ways a watchdog lies to you.
+One is a claim you trust. The other is a claim you check.
+
+### …but a chain alone is not enough, and one of the watchers proved it
+
+An earlier version of this README said a chain "can't be rewritten." **That was
+an overclaim, and the brainstem watcher caught it by reading its own memory.**
+
+Its liveness frames carry byte-identical payloads, so `prev` — which links the
+predecessor's `payload_hash` — is *the same value* on 14 of 19 links. Which means
+an interior frame can be **deleted, the successors resealed, and the whole chain
+still verifies.** I tested it: dropped a frame, recomputed, 19 frames verify
+clean. History can be silently *shortened*, even though it cannot be silently
+*edited*.
+
+The root cause is that verification is **self-referential** — the chain attests
+to itself, so there is no outside witness a splice has to agree with.
+
+The watcher's own repair was the right one: **publish the head hash externally.**
+An outside anchor is something a splice cannot rewrite, because it does not live
+in the chain. `neighborhood.py` now writes `neighborhood/anchors.jsonl` and the
+morning report shows head-vs-anchor.
+
+So the honest version of the claim:
+
+> A chain makes tampering *detectable*. An external anchor makes truncation
+> detectable. Neither makes the record *true* — only unaltered.
 
 ---
 

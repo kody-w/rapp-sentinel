@@ -354,6 +354,19 @@ def main():
                         {"alive": bool(c["ok"]), "by": "sentinel", "detail": c["detail"]})
         roll = NB.roll_call()
         save_json(STATE / "roll_call.json", roll)
+
+        # Witness every head outside the chains. A chain cannot detect its own
+        # truncation — when payloads repeat, an interior frame can be dropped
+        # and the rest resealed, and it verifies clean. The anchor is the
+        # outside witness a splice cannot rewrite.
+        NB.anchor_heads()
+        anchors = NB.check_anchors()
+        save_json(STATE / "anchors.json", anchors)
+        cut = [k for k, v in anchors.items() if v["truncated"]]
+        if cut:
+            log(f"TRUNCATION DETECTED: {cut}")
+            notify(cfg, f"🔴 Neighborhood Watch: chain truncation on {cut}. "
+                        f"A watcher's history is shorter than what was witnessed.")
         dead = [k for k, v in roll.items() if not v["alive"] and v["frames"] > 0]
         broken = [k for k, v in roll.items() if not v["chain_ok"]]
         if dead:

@@ -191,9 +191,75 @@ def roll_call(stale_minutes=90):
     return out
 
 
+ANCHORS = NBHD / "anchors.jsonl"
+
+
+def anchor_heads():
+    """Append every chain's current head to an external, append-only witness.
+
+    A chain cannot detect its own truncation. When payloads repeat, `prev`
+    repeats too, so an interior frame can be dropped, the successors resealed,
+    and the result verifies clean — the brainstem neighbor found exactly this
+    in its own memory, and it was reproducible: drop a frame, recompute, 19
+    frames verify.
+
+    The fix is not more hashing inside the chain. It is a witness OUTSIDE it.
+    Once a head is recorded here, a later splice has to disagree with something
+    it does not control.
+    """
+    ids = identities()
+    rec = {"utc": utc_now(), "heads": {}}
+    for slug in NEIGHBORS:
+        ch = read_chain(slug)
+        if ch:
+            rec["heads"][slug] = {"seq": ch[-1]["seq"],
+                                  "frame_hash": ch[-1]["frame_hash"],
+                                  "stream_id": ids[slug]}
+    with open(ANCHORS, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return rec
+
+
+def check_anchors():
+    """Compare each chain against the oldest anchor that covers it.
+
+    A truncated chain shows up as a head whose seq went BACKWARDS, or a seq we
+    once witnessed that the chain can no longer produce.
+    """
+    if not ANCHORS.exists():
+        return {}
+    seen = {}
+    for line in ANCHORS.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        for slug, h in r.get("heads", {}).items():
+            prev = seen.get(slug)
+            if prev is None or h["seq"] > prev["seq"]:
+                seen[slug] = h
+    out = {}
+    for slug, high in seen.items():
+        ch = read_chain(slug)
+        cur = ch[-1]["seq"] if ch else -1
+        hashes = {f["frame_hash"] for f in ch}
+        out[slug] = {
+            "witnessed_seq": high["seq"],
+            "current_seq": cur,
+            "truncated": cur < high["seq"],
+            "witnessed_head_present": high["frame_hash"] in hashes or cur > high["seq"],
+        }
+    return out
+
 if __name__ == "__main__":
     import sys
-    if len(sys.argv) > 1 and sys.argv[1] == "roll-call":
+    if len(sys.argv) > 1 and sys.argv[1] == "anchor":
+        print(json.dumps(anchor_heads(), indent=2))
+    elif len(sys.argv) > 1 and sys.argv[1] == "anchors":
+        print(json.dumps(check_anchors(), indent=2))
+    elif len(sys.argv) > 1 and sys.argv[1] == "roll-call":
         print(json.dumps(roll_call(), indent=2))
     else:
         print(json.dumps({"neighbors": identities(),
