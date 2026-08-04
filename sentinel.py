@@ -378,8 +378,17 @@ def main():
     if status == "healthy":
         if level >= 3:
             hist = load_json(STATE / "escalations.json", [])
-            okb, used = within_budget(hist, cfg)
             issues = load_json(STATE / "issues.json", {})
+            # Evolve gets its OWN, smaller budget and must never eat into the
+            # capacity repair needs. Overnight this is the difference between
+            # "it made art all night" and "a real failure at 3am got skipped
+            # because the budget was gone".
+            cutoff = now() - timedelta(hours=24)
+            recent_evolve = [h for h in hist
+                             if datetime.fromisoformat(h["at"]) > cutoff
+                             and h.get("mode") == "evolve"]
+            ev_cap = int(cfg.get("daily_evolve_budget", 2))
+            okb, used = len(recent_evolve) < ev_cap, len(recent_evolve)
             # evolve is rate-limited by the same machinery as repair, and takes
             # one neighbor per pass in rotation so no single one dominates
             order = list(NB.NEIGHBORS)
@@ -387,7 +396,7 @@ def main():
             slug = order[turn["i"] % len(order)]
             allowed, why = issue_allowed(issues, f"evolve:{slug}", cfg)
             if not okb:
-                log(f"evolve skipped — budget exhausted ({used})")
+                log(f"evolve skipped — evolve budget spent ({used}/{ev_cap}); repair capacity untouched")
             elif not allowed:
                 log(f"evolve skipped for {slug}: {why}")
             else:
