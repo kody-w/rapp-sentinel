@@ -546,6 +546,20 @@ def alerts_can_actually_reach_you():
     except Exception as e:
         return fail("alert_delivery", f"outbox unreadable: {e}", critical=False)
     n, age = st.get("pending", 0), st.get("oldest_minutes")
+    last = st.get("last_drain") or {}
+    why = (last.get("why") or "").strip()
+
+    # A drain that failed already knows which failure it was. Waiting 180
+    # minutes to mention it wastes the one piece of information that says what
+    # to do about it: an osascript timeout is a TCC/launchd problem and will
+    # send fine interactively, while "exited 0 but chat.db recorded no SENT
+    # message" means the message was rejected and will fail the same way
+    # everywhere. Still warn-level -- a stuck queue must not trigger a repair
+    # that tries to report itself through the same broken channel.
+    if n and why:
+        return fail("alert_delivery",
+                    f"{n} alert(s) queued; last drain failed: {why[:150]}",
+                    critical=False)
     if not n:
         return ok("alert_delivery", "no queued alerts")
     if age and age > 180:

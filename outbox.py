@@ -162,16 +162,52 @@ def drain(limit=20):
     kept = pending[sent:]
     QUEUE.write_text("".join(json.dumps(m, ensure_ascii=False) + "\n" for m in kept),
                      encoding="utf-8")
+    _record_drain(sent, len(kept), why)
     return sent, len(kept), why
+
+
+LAST_DRAIN = QUEUE.parent / "outbox-last-drain.json"
+
+
+def _record_drain(sent, kept, why):
+    """Keep the reason the alert path failed.
+
+    drain() has always known which failure it hit and returned it to whoever
+    called it, so the reason died with the process. alert_delivery then saw a
+    queue depth and an age, and stayed quiet for 180 minutes before saying
+    anything -- while the very first failed drain already knew.
+
+    The two failures need opposite responses and are indistinguishable by depth:
+    an osascript timeout is a TCC/launchd problem that will send fine from an
+    interactive context, while "exited 0 but chat.db recorded no SENT message"
+    means the message was genuinely rejected and will fail the same way
+    everywhere.
+    """
+    try:
+        LAST_DRAIN.parent.mkdir(parents=True, exist_ok=True)
+        LAST_DRAIN.write_text(json.dumps({
+            "at": now(), "sent": sent, "kept": kept, "why": why or "",
+        }, ensure_ascii=False) + "\n", encoding="utf-8")
+    except Exception:
+        pass          # bookkeeping must never break a drain
+
+
+def last_drain():
+    try:
+        return json.loads(LAST_DRAIN.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def status():
     pending = _pending()
+    last = last_drain()
+    base = {"last_drain": last}
     if not pending:
-        return {"pending": 0, "oldest_minutes": None}
+        return {**base, "pending": 0, "oldest_minutes": None}
     oldest = min(datetime.fromisoformat(m["at"]) for m in pending)
     age = (datetime.now(timezone.utc) - oldest).total_seconds() / 60
-    return {"pending": len(pending), "oldest_minutes": round(age, 1)}
+    return {**base, "pending": len(pending), "oldest_minutes": round(age, 1)}
 
 
 if __name__ == "__main__":
