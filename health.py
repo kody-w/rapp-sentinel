@@ -41,6 +41,36 @@ def _brainstem_answers_turns():
         return C.fail("w_brainstem", f"/chat unreachable: {type(e).__name__}", critical=False)
 
 
+def _port_owner_supervised_by_launchd(port):
+    """Who holds `port`, and is launchd its parent?
+
+    The last resort when no known label matches. A label can be renamed by an
+    installer; a process holding the port with PPID 1 is the daemon itself,
+    supervised, whatever anyone decided to call the job.
+
+    Returns (supervised_pid, parent_pid_or_holder):
+      (pid, ppid)   — held and supervised
+      (None, pid)   — held, but by something launchd did not start, so nothing
+                      will restart it when it dies
+      (None, None)  — nothing is listening
+    """
+    try:
+        r = subprocess.run(["lsof", "-ti", f":{port}"], capture_output=True,
+                           text=True, timeout=10)
+        pids = [p for p in (r.stdout or "").split() if p.isdigit()]
+        if not pids:
+            return None, None
+        holder = pids[0]
+        p = subprocess.run(["ps", "-o", "ppid=", "-p", holder],
+                           capture_output=True, text=True, timeout=10)
+        ppid = (p.stdout or "").strip()
+        if ppid == "1":
+            return int(holder), 1
+        return None, int(holder)
+    except Exception:
+        return None, None
+
+
 def probe_watchers():
     """The watchers watching the watchmen.
 
@@ -59,35 +89,62 @@ def probe_watchers():
     # had ever touched /chat.
     out.append(_brainstem_answers_turns())
 
+    # Which launchd label the openrappter daemon carries is an INSTALLATION
+    # detail, not a fact about the software. This machine's job is
+    # `com.openrappter.gateway`; the hardcoded string below was
+    # `com.openrappter.daemon`, so the check reported "not loaded" for a daemon
+    # that was running, supervised, and answering — the precise false negative
+    # this loop exists to prevent, in the loop's own code, on its third audit.
+    #
+    # Two lessons already learned in this function, applied here:
+    #   - a label is not evidence (brainstem's 14 "alive" attestations)
+    #   - loaded is not running (the pid check four lines down)
+    # A third follows from both: ABSENT IS NOT ABSENT. Before declaring the
+    # daemon missing, look for the thing itself — a process holding the gateway
+    # port whose parent is launchd is supervised, whatever the job is called.
+    LABELS = ("com.openrappter.daemon", "com.openrappter.gateway")
     try:
         r = subprocess.run(["launchctl", "list"], capture_output=True,
                            text=True, timeout=10)
         pid = None
+        loaded = False
         for line in (r.stdout or "").splitlines():
-            if "com.openrappter.daemon" in line:
+            if any(lbl in line for lbl in LABELS):
                 first = line.split("\t")[0].strip()
-                pid = int(first) if first.isdigit() else None
                 loaded = True
-                break
-        else:
-            loaded = False
+                if first.isdigit():
+                    pid = int(first)
+                    break  # a running job wins over a merely-loaded one
     except Exception:
         loaded, pid = False, None
 
-    # `loaded` is a substring of `launchctl list` and nothing more. openrappter
-    # audited its own check and found three jobs on this machine that are loaded
-    # with NO pid — the predicate reports green for a process that is not
-    # running. It is the same defect brainstem already fixed for itself four
-    # lines above (14 "alive" attestations that had never touched /chat), never
-    # carried one function down. A supervisor whose liveness check cannot see a
-    # PID attested through a mid-watch redeploy without flinching.
     if loaded and pid:
         out.append(C.ok("w_openrappter", f"daemon running (pid {pid})"))
-    elif loaded:
-        out.append(C.fail("w_openrappter", "daemon loaded but NOT running (no pid)",
-                          critical=False))
     else:
-        out.append(C.fail("w_openrappter", "launchd daemon not loaded", critical=False))
+        # No positive PID from the registry — but the registry's opinion is not
+        # the last word, and on this machine it is demonstrably wrong: the
+        # gateway job lists a PID of `-` while a node process holding :18790
+        # runs with PPID 1. Both remaining branches therefore ask the same
+        # question, because the failure they distinguish is different:
+        #   supervised    → healthy, launchctl simply is not attributing it
+        #   unsupervised  → running, but nothing will restart it when it dies
+        #   absent        → genuinely not there
+        supervised_pid, parent = _port_owner_supervised_by_launchd(18790)
+        if supervised_pid:
+            note = "label loaded but launchctl reports no pid" if loaded \
+                else f"no label in {LABELS}"
+            out.append(C.ok("w_openrappter",
+                            f"daemon running under launchd (pid {supervised_pid}) — {note}"))
+        elif parent:
+            out.append(C.fail("w_openrappter",
+                              f"gateway port held by pid {parent} whose parent is not "
+                              "launchd — running UNSUPERVISED, nothing will restart it",
+                              critical=False))
+        elif loaded:
+            out.append(C.fail("w_openrappter", "daemon loaded but NOT running (no pid)",
+                              critical=False))
+        else:
+            out.append(C.fail("w_openrappter", "launchd daemon not loaded", critical=False))
 
     # The in-tree anchor file cannot testify about its own truncation. Compare
     # it to the high-water mark kept outside the repository.
