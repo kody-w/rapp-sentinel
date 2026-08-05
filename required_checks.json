@@ -5,6 +5,7 @@
   "required": [
     "alert_delivery",
     "channel",
+    "eco_sweep",
     "rb_content_moving",
     "rb_json_parses",
     "rb_public_surface",

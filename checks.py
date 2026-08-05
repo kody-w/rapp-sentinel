@@ -193,7 +193,8 @@ def ecosystem_not_silently_broken():
         # declared" -- a green light for a check that could not run. Caught by
         # importing it. A declaration we cannot read is a finding, not a calm.
         return fail("eco_sweep",
-                    f"cannot read cares_about: {type(e).__name__}: {e}")
+                    f"cannot read cares_about: {type(e).__name__}: {e}",
+                    critical=False)
     repos = [r for r in declared if r not in DEEPLY_CHECKED]
     if not repos:
         return ok("eco_sweep", "no additional repositories declared")
@@ -211,7 +212,13 @@ def ecosystem_not_silently_broken():
     if broken:
         detail = "; ".join(f"{r.split('/')[-1]}: {', '.join(w)}"
                            for r, w in sorted(broken.items()))
-        return fail("eco_sweep", f"100% failing in {len(broken)} repo(s) -- {detail}")
+        # WARN, not CRITICAL. fail() defaults to critical, and critical is what
+        # invokes the repair arm -- which knows rappterverse and rappterbook and
+        # nothing about the other nine. A breadth check should make a problem
+        # visible, not point an autonomous repairer at a repository whose
+        # conventions it has never seen. Escalating these is a human's call.
+        return fail("eco_sweep", f"100% failing in {len(broken)} repo(s) -- {detail}",
+                    critical=False)
     note = f"{len(repos)} additional repositories swept, none 100% failing"
     if unreachable:
         note += f" ({len(unreachable)} unreachable: " + \
