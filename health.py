@@ -41,6 +41,110 @@ def _brainstem_answers_turns():
         return C.fail("w_brainstem", f"/chat unreachable: {type(e).__name__}", critical=False)
 
 
+# Which labels this daemon might carry. A hint, not a requirement: the verdict
+# below is decided by which job claims the PID holding the port, so an
+# installation using some other label still gets the right answer as long as it
+# is listed here or the port check falls through honestly.
+_OPENRAPPTER_LABELS = (
+    "com.openrappter.rapptertwo",
+    "com.openrappter.gateway",
+    "com.openrappter.daemon",
+)
+
+
+def _listening_pid(port):
+    """The PID LISTENING on `port`, or None.
+
+    `lsof -ti :PORT` alone is wrong: it matches any socket on that port,
+    including CLIENTS. Asked about a live gateway it has returned a browser that
+    merely had the dashboard open.
+    """
+    try:
+        r = subprocess.run(["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
+                           capture_output=True, text=True, timeout=10)
+        for tok in (r.stdout or "").split():
+            if tok.isdigit():
+                return tok
+    except Exception:
+        pass
+    return None
+
+
+def _launchd_owner(pid):
+    """Which launchd job, in ANY domain, claims `pid` — or None.
+
+    ASK LAUNCHD, and ask BOTH DOMAINS. `launchctl list` enumerates the USER
+    domain only, so it cannot see a system LaunchDaemon. Measured on the machine
+    this was reported from:
+
+        launchctl list com.openrappter.daemon      -> NOT FOUND
+        launchctl list com.openrappter.gateway     -> found, and NOT running
+        launchctl list com.openrappter.rapptertwo  -> NOT FOUND
+
+        launchctl print system/com.openrappter.rapptertwo
+            path  = /Library/LaunchDaemons/com.openrappter.rapptertwo.plist
+            state = running        pid = 70231
+        lsof -ti :18790 -sTCP:LISTEN  ->  70231
+
+    Do not infer supervision from PPID 1 — an orphan is reparented to launchd
+    and is indistinguishable that way — nor from XPC_SERVICE_NAME, which is
+    inherited from whatever spawned the process rather than proof of the job
+    that did.
+    """
+    if not pid:
+        return None
+    try:
+        uid = str(os.getuid())
+    except Exception:
+        uid = "501"
+    for label in _OPENRAPPTER_LABELS:
+        for target in ("system/" + label, "gui/" + uid + "/" + label):
+            try:
+                r = subprocess.run(["launchctl", "print", target],
+                                   capture_output=True, text=True, timeout=10)
+                if r.returncode != 0:
+                    continue
+                for line in (r.stdout or "").splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("pid = "):
+                        claimed = stripped[6:].strip()
+                        if claimed.isdigit() and claimed == str(pid):
+                            return target
+            except Exception:
+                continue
+    return None
+
+
+def _openrappter_supervision():
+    """Is the openrappter daemon running, and does launchd own it?
+
+    The previous predicate searched `launchctl list` for one hardcoded label and
+    called its absence "launchd daemon not loaded". On the machine this was
+    reported from that is a false alarm: the daemon is running, supervised by a
+    system LaunchDaemon the query cannot see, and the sentinel reported it as
+    down.
+
+    That is the defect this file already fixed for the brainstem four functions
+    up — 14 "alive" attestations that had never touched /chat — repeated one
+    function down. A label is not evidence. What serves the port is.
+    """
+    pid = _listening_pid(18790)
+    if not pid:
+        return C.fail("w_openrappter", "nothing is LISTENING on :18790",
+                      critical=False)
+
+    owner = _launchd_owner(pid)
+    if owner:
+        return C.ok("w_openrappter", f"{owner} owns pid {pid}")
+
+    # Serving, but nothing claims it. Say that, and do not call it an orphan:
+    # that claim has been made from PPID and from XPC_SERVICE_NAME and was wrong
+    # both times. A watcher that guesses is worse than one that admits the gap.
+    return C.ok("w_openrappter",
+                f"serving :18790 (pid {pid}); no launchd job claims it — "
+                "supervision UNVERIFIED, not disproved")
+
+
 def probe_watchers():
     """The watchers watching the watchmen.
 
@@ -59,35 +163,7 @@ def probe_watchers():
     # had ever touched /chat.
     out.append(_brainstem_answers_turns())
 
-    try:
-        r = subprocess.run(["launchctl", "list"], capture_output=True,
-                           text=True, timeout=10)
-        pid = None
-        for line in (r.stdout or "").splitlines():
-            if "com.openrappter.daemon" in line:
-                first = line.split("\t")[0].strip()
-                pid = int(first) if first.isdigit() else None
-                loaded = True
-                break
-        else:
-            loaded = False
-    except Exception:
-        loaded, pid = False, None
-
-    # `loaded` is a substring of `launchctl list` and nothing more. openrappter
-    # audited its own check and found three jobs on this machine that are loaded
-    # with NO pid — the predicate reports green for a process that is not
-    # running. It is the same defect brainstem already fixed for itself four
-    # lines above (14 "alive" attestations that had never touched /chat), never
-    # carried one function down. A supervisor whose liveness check cannot see a
-    # PID attested through a mid-watch redeploy without flinching.
-    if loaded and pid:
-        out.append(C.ok("w_openrappter", f"daemon running (pid {pid})"))
-    elif loaded:
-        out.append(C.fail("w_openrappter", "daemon loaded but NOT running (no pid)",
-                          critical=False))
-    else:
-        out.append(C.fail("w_openrappter", "launchd daemon not loaded", critical=False))
+    out.append(_openrappter_supervision())
 
     # The in-tree anchor file cannot testify about its own truncation. Compare
     # it to the high-water mark kept outside the repository.
