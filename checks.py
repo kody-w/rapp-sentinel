@@ -277,25 +277,47 @@ def ecosystem_not_silently_broken():
             # Streak, not lifetime ratio. A workflow with one old success and
             # eight straight failures since is broken, and the ratio test called
             # it healthy.
-            bad = workflows_currently_broken(repo, limit=20, streak=4)
+            #
+            # No explicit limit: the default is the reviewed one. #25 raised it
+            # to 100 and this call site kept passing 20, so the fix never took
+            # effect in production and the blindness it was written for was
+            # still live. A caller that re-states a default silently owns it.
+            bad = workflows_currently_broken(repo, streak=4)
         except Exception:
             unreachable.append(repo)
             continue
         if bad is None:
             continue                      # no run history: no signal
         if bad:
-            broken[repo] = sorted(bad)
+            broken[repo] = bad
     if broken:
         _write_coverage_receipt(declared, repos, unreachable)
-        detail = "; ".join(f"{r.split('/')[-1]}: {', '.join(w)}"
-                           for r, w in sorted(broken.items()))
+        # "failed 20 of 22" and "I saw 2 runs and both failed" are different
+        # claims. The first is a defect; the second is a prompt to look. Merging
+        # them is what let an under-sampled healthy workflow (rapp-map's spine)
+        # read as a third broken one.
+        confirmed, thin = {}, {}
+        for r, wfs in broken.items():
+            for name, meta in wfs.items():
+                target = thin if (isinstance(meta, dict)
+                                  and meta.get("insufficient_window")) else confirmed
+                target.setdefault(r, []).append(name)
+        parts = []
+        if confirmed:
+            parts.append("red streak in %d repo(s) -- " % len(confirmed) + "; ".join(
+                f"{r.split('/')[-1]}: {', '.join(sorted(w))}"
+                for r, w in sorted(confirmed.items())))
+        if thin:
+            parts.append("too few runs to judge -- " + "; ".join(
+                f"{r.split('/')[-1]}: {', '.join(sorted(w))}"
+                for r, w in sorted(thin.items())))
+        detail = " | ".join(parts)
         # WARN, not CRITICAL. fail() defaults to critical, and critical is what
         # invokes the repair arm -- which knows rappterverse and rappterbook and
         # nothing about the other nine. A breadth check should make a problem
         # visible, not point an autonomous repairer at a repository whose
         # conventions it has never seen. Escalating these is a human's call.
-        return fail("eco_sweep", f"red streak in {len(broken)} repo(s) -- {detail}",
-                    critical=False)
+        return fail("eco_sweep", detail, critical=False)
     _write_coverage_receipt(declared, repos, unreachable)
     note = f"{len(repos)} additional repositories swept, none on a red streak"
     if unreachable:
