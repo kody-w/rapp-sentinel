@@ -173,6 +173,34 @@ def declared_repos():
     return [r for r in (d.get("cares_about") or []) if "/" in r]
 
 
+def _write_coverage_receipt(declared, swept, unreachable):
+    """Record which repositories were actually examined this tick.
+
+    An outside watcher needs to verify coverage, and its first attempt did it by
+    grepping this file for repository literals. That worked only while the list
+    was hardcoded -- the moment the sweep started reading cares_about at
+    RUNTIME, which is the better design, every swept repository became invisible
+    to the grep and the guard reported nine false positives.
+
+    A guard that cries wolf is worse than no guard, because it teaches you to
+    scroll past it. So coverage is now evidenced by behaviour instead of by
+    source text: this is a receipt for what was looked at, written by the code
+    that looked.
+    """
+    try:
+        (HOME / "state").mkdir(exist_ok=True)
+        (HOME / "state" / "coverage.json").write_text(json.dumps({
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "declared": sorted(declared),
+            "deep": sorted(DEEPLY_CHECKED),
+            "swept": sorted(swept),
+            "unreachable": sorted(unreachable),
+            "examined": sorted(set(swept) | (set(declared) & DEEPLY_CHECKED)),
+        }, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass          # a receipt is evidence, never a reason to fail a check
+
+
 @check
 def ecosystem_not_silently_broken():
     """A generic sweep over every declared repository.
@@ -210,6 +238,7 @@ def ecosystem_not_silently_broken():
         if bad:
             broken[repo] = sorted(bad)
     if broken:
+        _write_coverage_receipt(declared, repos, unreachable)
         detail = "; ".join(f"{r.split('/')[-1]}: {', '.join(w)}"
                            for r, w in sorted(broken.items()))
         # WARN, not CRITICAL. fail() defaults to critical, and critical is what
@@ -219,6 +248,7 @@ def ecosystem_not_silently_broken():
         # conventions it has never seen. Escalating these is a human's call.
         return fail("eco_sweep", f"100% failing in {len(broken)} repo(s) -- {detail}",
                     critical=False)
+    _write_coverage_receipt(declared, repos, unreachable)
     note = f"{len(repos)} additional repositories swept, none 100% failing"
     if unreachable:
         note += f" ({len(unreachable)} unreachable: " + \
