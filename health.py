@@ -89,6 +89,22 @@ def probe_watchers():
     else:
         out.append(C.fail("w_openrappter", "launchd daemon not loaded", critical=False))
 
+    # The in-tree anchor file cannot testify about its own truncation. Compare
+    # it to the high-water mark kept outside the repository.
+    try:
+        import neighborhood as NB
+        led = NB.check_external_ledger()
+        if led["status"] == "disputed":
+            out.append(C.fail("w_anchor_ledger", led["detail"], critical=True))
+        elif led["status"] == "unreadable":
+            out.append(C.fail("w_anchor_ledger",
+                              f"external ledger unreadable: {led['detail']}"))
+        else:
+            out.append(C.ok("w_anchor_ledger", led["detail"]))
+    except Exception as e:
+        out.append(C.fail("w_anchor_ledger",
+                          f"ledger check raised {type(e).__name__}: {e}"))
+
     beat = HOME / "state" / "last_run.json"
     age_m = None
     if beat.exists():
@@ -105,6 +121,55 @@ def probe_watchers():
     return out
 
 
+def check_completeness(results):
+    """The registry enumerates; this REQUIRES.
+
+    all_checks() returns whatever decorators happened to run. That makes a
+    check impossible to notice the absence of: delete one @check line and the
+    verdict still reads "healthy - all checks passing", because a check that
+    never ran cannot report that it did not run.
+
+    This is not hypothetical. Removing the decorator from
+    rb_workflows_never_succeed silently dropped `rb_wf_starved` - the check
+    written specifically because its absence had already cost five days - and
+    nothing in the output changed except a count nobody compares.
+
+    So the expected ids are committed to required_checks.json and compared
+    here. Extra ids are reported, never failed: a new check should not be able
+    to break the loop before someone lists it.
+
+    Honest limit: this check cannot detect its own removal. That is what an
+    external watcher is for, and rapp-overwatch does exactly this comparison
+    from outside.
+    """
+    # Include our own id: this check is running, so it ran. Computing `ran`
+    # purely from results-so-far made the completeness check report ITSELF
+    # missing the moment it was listed as required - the exact blind spot it
+    # was written to close, reproduced inside the fix for it.
+    ran = {c.get("id") for c in results if c.get("id")} | {"w_checks_complete"}
+    manifest = HOME / "required_checks.json"
+    if not manifest.exists():
+        return C.fail("w_checks_complete", "required_checks.json is missing",
+                      critical=True)
+    try:
+        required = set(json.loads(manifest.read_text(encoding="utf-8"))["required"])
+    except Exception as e:
+        return C.fail("w_checks_complete",
+                      f"required_checks.json unreadable: {type(e).__name__}: {e}",
+                      critical=True)
+
+    missing = sorted(required - ran)
+    if missing:
+        return C.fail("w_checks_complete",
+                      f"{len(missing)} required check(s) did not run: "
+                      + ", ".join(missing), critical=True)
+    unlisted = sorted(ran - required)
+    detail = f"all {len(required)} required checks ran"
+    if unlisted:
+        detail += f"; {len(unlisted)} unlisted: {', '.join(unlisted)}"
+    return C.ok("w_checks_complete", detail)
+
+
 def main():
     results = []
     for fn in C.all_checks():
@@ -117,6 +182,8 @@ def main():
             results.append(C.fail(fn.__name__,
                                   f"check raised {type(e).__name__}: {e}", critical=False))
     results += probe_watchers()
+    # Last, so it can see every id the run actually produced.
+    results.append(check_completeness(results))
 
     failed = [c for c in results if not c["ok"]]
     crit = [c for c in failed if c["severity"] == C.CRITICAL]

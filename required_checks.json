@@ -1,0 +1,24 @@
+{
+  "_why": "A registry that only ENUMERATES cannot notice something missing. all_checks() returns whatever decorators happened to run, so one lost @check line removes a check while the verdict still reads 'healthy - all checks passing'. Demonstrated: deleting the decorator on rb_workflows_never_succeed dropped rb_wf_starved and changed nothing else about the output. This file is the REQUIRED set; w_checks_complete compares it against what actually ran and fails critically on a gap.",
+  "_adding_a_check": "Add its id here in the same commit. Ids that run but are not listed are reported as 'unlisted' WITHOUT failing, so a new check never breaks the loop before you catch up.",
+  "_removing_a_check": "Delete its id here deliberately, in a commit that says why. Retiring a check should be a decision with a diff, not an accident.",
+  "required": [
+    "alert_delivery",
+    "channel",
+    "rb_content_moving",
+    "rb_json_parses",
+    "rb_public_surface",
+    "rb_shards",
+    "rb_wf_starved",
+    "rb_workflows",
+    "rv_pr_queue",
+    "rv_validation",
+    "rv_world_merging",
+    "sites",
+    "w_anchor_ledger",
+    "w_brainstem",
+    "w_checks_complete",
+    "w_openrappter",
+    "w_sentinel_fresh"
+  ]
+}
