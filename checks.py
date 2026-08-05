@@ -23,6 +23,7 @@ platforms this pattern was built for. Delete it and write your own.
 """
 
 import json
+import pathlib as _pathlib
 import subprocess
 import urllib.error
 import urllib.request
@@ -147,9 +148,75 @@ def workflows_never_succeeding(repo, limit=40, ignore=()):
 # ── your checks ── everything below here is an example. Replace it.
 # ══════════════════════════════════════════════════════════════════════════
 
+HOME = _pathlib.Path(__file__).resolve().parent
+
 RV = "kody-w/rappterverse"
 RB = "kody-w/rappterbook"
+
+# The repositories with bespoke checks. Everything else declared in
+# direction.json gets the generic sweep below, which is weaker but is the
+# difference between "watched shallowly" and "not watched at all".
+DEEPLY_CHECKED = {RV, RB}
 CHANNEL = "https://kody-w.github.io/rappvision-field-notes"
+
+
+def declared_repos():
+    """What direction.json says this sentinel cares about.
+
+    Read at runtime on purpose. Before this existed, `cares_about` was consumed
+    by NO code and `watch_repos` only by the dashboard, so the declared scope
+    and the real scope could drift apart indefinitely and did: the list named
+    two repositories while the ecosystem had grown past twenty. Adding a name
+    now adds a check, which is the only way a declaration means anything.
+    """
+    d = json.loads((HOME / "direction.json").read_text(encoding="utf-8"))
+    return [r for r in (d.get("cares_about") or []) if "/" in r]
+
+
+@check
+def ecosystem_not_silently_broken():
+    """A generic sweep over every declared repository.
+
+    Deliberately shallow: it asks only whether a repository's workflows fail
+    EVERY time, which is the signal that already caught a real outage on
+    rappterbook. Depth per repository does not scale; noticing that a
+    load-bearing repository has been red for a week does.
+
+    Repositories with no workflow history are not a finding. Absence of runs is
+    absence of evidence, and failing on it would train everyone to ignore this.
+    """
+    try:
+        declared = declared_repos()
+    except Exception as e:
+        # The first version wrapped this in a bare except returning [], so an
+        # undefined name made the sweep report "no additional repositories
+        # declared" -- a green light for a check that could not run. Caught by
+        # importing it. A declaration we cannot read is a finding, not a calm.
+        return fail("eco_sweep",
+                    f"cannot read cares_about: {type(e).__name__}: {e}")
+    repos = [r for r in declared if r not in DEEPLY_CHECKED]
+    if not repos:
+        return ok("eco_sweep", "no additional repositories declared")
+    broken, unreachable = {}, []
+    for repo in repos:
+        try:
+            bad = workflows_failing_every_run(repo, limit=15)
+        except Exception:
+            unreachable.append(repo)
+            continue
+        if bad is None:
+            continue                      # no run history: no signal
+        if bad:
+            broken[repo] = sorted(bad)
+    if broken:
+        detail = "; ".join(f"{r.split('/')[-1]}: {', '.join(w)}"
+                           for r, w in sorted(broken.items()))
+        return fail("eco_sweep", f"100% failing in {len(broken)} repo(s) -- {detail}")
+    note = f"{len(repos)} additional repositories swept, none 100% failing"
+    if unreachable:
+        note += f" ({len(unreachable)} unreachable: " + \
+                ", ".join(r.split("/")[-1] for r in unreachable) + ")"
+    return ok("eco_sweep", note)
 
 
 @check

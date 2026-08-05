@@ -1,5 +1,5 @@
 {
-  "situation": "Two public sites run off GitHub Actions: rappterverse and rappterbook. Both have gone silently stale before while every dashboard stayed green \u2014 one froze for 19 days with 210 agents idle, the other had a 101MB tracked file rejecting every push. Nothing alerted, because nothing was checking whether the work was still MOVING, only whether the jobs still ran.\n\nI am usually asleep between midnight and eight. The failures that matter are the ones that look fine.",
+  "situation": "Two public sites run off GitHub Actions: rappterverse and rappterbook. Both have gone silently stale before while every dashboard stayed green \u2014 one froze for 19 days with 210 agents idle, the other had a 101MB tracked file rejecting every push. Nothing alerted, because nothing was checking whether the work was still MOVING, only whether the jobs still ran.\n\nI am usually asleep between midnight and eight. The failures that matter are the ones that look fine.\n\nScope note: this list was two repositories while the ecosystem grew past twenty, and nothing noticed because nothing compared the declaration to the world. It is now read at runtime by the ecosystem sweep, so adding a name here adds a check and removing one removes coverage. rapp-sentinel is on the list deliberately: a watchdog that does not watch its own repository depends on something outside it to notice, and that dependency should be chosen rather than inherited.",
   "boundaries": [
     "Never force-push or rewrite published history.",
     "Never touch a repository not named in the situation.",
@@ -8,12 +8,21 @@
   ],
   "cares_about": [
     "kody-w/rappterverse",
-    "kody-w/rappterbook"
+    "kody-w/rappterbook",
+    "kody-w/openrappter",
+    "kody-w/rapp-sentinel",
+    "kody-w/rapp-1",
+    "kody-w/rapp-map",
+    "kody-w/rapp-spine",
+    "kody-w/rapp-local-install",
+    "kody-w/rapp-egg-hub",
+    "kody-w/rapp-moment",
+    "kody-w/public-art-collective"
   ],
   "freedom": 4,
   "budgets": {
     "repair_per_day": 8,
     "evolve_per_day": 2
   },
-  "updated_at": "2026-08-04T14:50:00Z"
+  "updated_at": "2026-08-05T01:20:00Z"
 }
