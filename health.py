@@ -59,28 +59,62 @@ def _listening_pid(port):
         return None
 
 
-def _launchd_attributed_pid(labels):
-    """The PID launchd itself claims for one of `labels`, or None.
+def _launchd_owner(listening_pid, labels):
+    """Which launchd job, in ANY domain, claims `listening_pid` — or None.
 
-    ASK LAUNCHD. Do not infer supervision from PPID 1.
+    ASK LAUNCHD. Do not infer supervision from PPID 1: a process whose parent
+    has exited is reparented to launchd and is indistinguishable that way. Nor
+    from XPC_SERVICE_NAME, which is inherited from whatever spawned the process
+    rather than proof of the job that did.
 
-    The first version of this patch did exactly that, and it was wrong: a
-    process whose parent has exited is reparented to launchd and is
-    indistinguishable from a supervised one by PPID alone. On the machine this
-    was written against, an orphaned daemon left over from a hand-start held the
-    port all evening while `launchctl list com.openrappter.gateway` showed no
-    PID at all and LastExitStatus 256 — the job had never run, and nothing would
-    have restarted the thing serving traffic. PPID said 1 the whole time.
+    AND ASK BOTH DOMAINS. The first version of this patch used
+    `launchctl list <label>`, which enumerates the USER domain only. On the
+    machine it was written against, that could not see the job that actually
+    owned the port:
+
+        launchctl list com.openrappter.daemon      -> NOT FOUND
+        launchctl list com.openrappter.gateway     -> found, and NOT running
+                                                      (runs=27, last exit 1)
+        launchctl list com.openrappter.rapptertwo  -> NOT FOUND
+
+        launchctl print system/com.openrappter.rapptertwo
+            path  = /Library/LaunchDaemons/com.openrappter.rapptertwo.plist
+            type  = LaunchDaemon
+            state = running
+            pid   = 70231
+        lsof -ti :18790 -sTCP:LISTEN  ->  70231
+
+    The only label the query COULD see was a stale user-domain LaunchAgent for
+    the same port that can never bind. So the check reached a defensible verdict
+    ("serving, so healthy") by a route that could never produce the right one,
+    and could never name the supervisor — which is the thing a sentinel is for.
+
+    Matching on the PID rather than on the label's existence is what makes this
+    installation-agnostic: whichever job claims the process holding the port is
+    the answer, whatever it is called and wherever it lives.
     """
+    if not listening_pid:
+        return None
+    try:
+        uid = str(os.getuid())
+    except Exception:
+        uid = "501"
+    targets = []
     for label in labels:
+        targets.append("system/" + label)
+        targets.append("gui/" + uid + "/" + label)
+    for target in targets:
         try:
-            r = subprocess.run(["launchctl", "list", label],
+            r = subprocess.run(["launchctl", "print", target],
                                capture_output=True, text=True, timeout=10)
+            if r.returncode != 0:
+                continue
             for line in (r.stdout or "").splitlines():
-                if '"PID"' in line:
-                    digits = "".join(ch for ch in line if ch.isdigit())
-                    if digits:
-                        return digits
+                stripped = line.strip()
+                if stripped.startswith("pid = "):
+                    digits = stripped[6:].strip()
+                    if digits.isdigit() and digits == str(listening_pid):
+                        return target
         except Exception:
             continue
     return None
@@ -117,7 +151,8 @@ def probe_watchers():
     # A third follows from both: ABSENT IS NOT ABSENT. Before declaring the
     # daemon missing, look for the thing itself — a process holding the gateway
     # port whose parent is launchd is supervised, whatever the job is called.
-    LABELS = ("com.openrappter.daemon", "com.openrappter.gateway")
+    LABELS = ("com.openrappter.rapptertwo", "com.openrappter.gateway",
+              "com.openrappter.daemon")
     try:
         r = subprocess.run(["launchctl", "list"], capture_output=True,
                            text=True, timeout=10)
@@ -145,9 +180,10 @@ def probe_watchers():
         #   unsupervised  → running, but nothing will restart it when it dies
         #   absent        → genuinely not there
         listening = _listening_pid(18790)
-        attributed = _launchd_attributed_pid(LABELS)
-        if listening and attributed and listening == attributed:
-            out.append(C.ok("w_openrappter", f"daemon running under launchd (pid {listening})"))
+        owner = _launchd_owner(listening, LABELS)
+        if listening and owner:
+            out.append(C.ok("w_openrappter",
+                            f"{owner} owns pid {listening}"))
         elif listening:
             # DO NOT call this an orphan. That claim was made here twice and was
             # wrong twice: first from PPID 1 (an orphan is reparented to launchd
