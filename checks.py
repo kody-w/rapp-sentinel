@@ -113,6 +113,40 @@ def workflows_failing_every_run(repo, limit=30, ignore=()):
             if v["total"] >= 2 and v["fail"] == v["total"]}
 
 
+def workflows_currently_broken(repo, limit=20, streak=4, ignore=()):
+    """Workflows whose most recent `streak` runs ALL failed.
+
+    `workflows_failing_every_run` requires fail == total, so a single old
+    success makes a workflow invisible no matter how long it has been red since.
+    Found by listing the watched repositories by hand: rapp-spine's "Verify
+    Spine" was 12/15 failed with the eight most recent all failing, and the
+    sweep called the repository clean.
+
+    "Broken since forever" and "broken since Tuesday" are the same outage. What
+    separates a real failure from a flake is not the lifetime ratio, it is
+    whether it is failing NOW and has been for a while -- a streak on the newest
+    runs, not a count over all of them.
+
+    gh returns runs newest-first; this relies on that ordering.
+    """
+    runs = gh(["run", "list", "-R", repo, "--limit", str(limit),
+               "--json", "name,conclusion"], default=None)
+    if not runs:
+        return None
+    per = {}
+    for r in runs:
+        if r["name"] in ignore:
+            continue
+        per.setdefault(r["name"], []).append(r.get("conclusion"))
+    out = {}
+    for name, concl in per.items():
+        recent = concl[:streak]
+        if len(recent) >= streak and all(c == "failure" for c in recent):
+            out[name] = {"streak": len(recent), "of": len(concl),
+                         "failed": sum(1 for c in concl if c == "failure")}
+    return out
+
+
 def workflows_never_succeeding(repo, limit=40, ignore=()):
     """Workflows with recent runs but not one success.
 
@@ -229,7 +263,10 @@ def ecosystem_not_silently_broken():
     broken, unreachable = {}, []
     for repo in repos:
         try:
-            bad = workflows_failing_every_run(repo, limit=15)
+            # Streak, not lifetime ratio. A workflow with one old success and
+            # eight straight failures since is broken, and the ratio test called
+            # it healthy.
+            bad = workflows_currently_broken(repo, limit=20, streak=4)
         except Exception:
             unreachable.append(repo)
             continue
@@ -246,10 +283,10 @@ def ecosystem_not_silently_broken():
         # nothing about the other nine. A breadth check should make a problem
         # visible, not point an autonomous repairer at a repository whose
         # conventions it has never seen. Escalating these is a human's call.
-        return fail("eco_sweep", f"100% failing in {len(broken)} repo(s) -- {detail}",
+        return fail("eco_sweep", f"red streak in {len(broken)} repo(s) -- {detail}",
                     critical=False)
     _write_coverage_receipt(declared, repos, unreachable)
-    note = f"{len(repos)} additional repositories swept, none 100% failing"
+    note = f"{len(repos)} additional repositories swept, none on a red streak"
     if unreachable:
         note += f" ({len(unreachable)} unreachable: " + \
                 ", ".join(r.split("/")[-1] for r in unreachable) + ")"
