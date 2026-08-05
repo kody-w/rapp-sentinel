@@ -539,5 +539,32 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:
-        log(f"sentinel crashed: {type(e).__name__}: {e}")
+        # A crash used to be silent in every way that matters: the message went
+        # to a log file nobody tails, last_run.json kept its old timestamp, and
+        # the only staleness check (w_sentinel_fresh) lives INSIDE the process
+        # that just died. Verified by breaking checks.py: exit 1, heartbeat
+        # frozen at the previous tick, no notification of any kind.
+        #
+        # So the crash path now does the two things the healthy path does:
+        # records that it happened, and says so out loud.
+        detail = f"{type(e).__name__}: {e}"
+        log(f"sentinel crashed: {detail}")
+        try:
+            save_json(STATE / "last_run.json", {
+                "at": now().isoformat(timespec="seconds"),
+                "status": "crashed",
+                "failed": ["sentinel_tick"],
+                "summary": f"tick raised {detail}"[:400],
+            })
+        except Exception as inner:
+            log(f"could not record the crash heartbeat: {inner}")
+        try:
+            # enqueue(), not send(): the queue survives a delivery path that is
+            # itself broken, which is the likeliest thing to be broken here.
+            # Routed through notify() so it still honours cfg["notify"] -- an
+            # earlier draft called outbox directly and would have texted from
+            # any copy of this repo with notifications deliberately turned off.
+            notify(config(), f"\U0001F534 RAPP sentinel CRASHED: {detail}"[:600])
+        except Exception as inner:
+            log(f"could not queue the crash alert: {inner}")
         sys.exit(1)

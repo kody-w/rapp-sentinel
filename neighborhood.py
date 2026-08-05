@@ -287,7 +287,71 @@ def anchor_heads():
                                   "stream_id": ids[slug]}
     with open(ANCHORS, "a", encoding="utf-8") as fh:
         fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    _update_external_ledger(rec)
     return rec
+
+
+# The anchor file defeats a chain splice because it lives outside the chain.
+# It does NOT defeat a splice of itself, because it lives inside the directory
+# it attests. Demonstrated on a copy: drop six frames from a chain, remove the
+# matching heads from anchors.jsonl, and roll-call reports "102 frames verified
+# from genesis" with truncated=false. Both files moved together, so nothing
+# disagreed with anything.
+#
+# So the high-water mark is also kept OUTSIDE the repository, where a working
+# tree edit, a git checkout, or an agent rewriting files in its own checkout
+# cannot reach it. This is a ratchet, not a vault: same machine, same user, so
+# a determined actor with shell access can still edit both. It closes the
+# accident and the in-tree rewrite, which are the cases that actually happen.
+# Scoped to THIS install. The path is part of the key because the ledger lives
+# outside the repository and would otherwise be shared by every checkout on the
+# machine: a fresh clone has no chains, so it would read the live install's
+# high-water mark and report every stream as vanished. Caught before shipping,
+# by cloning the repo and running the check in it.
+_INSTALL_KEY = rapp.H("rapp/1:install", {"path": str(HOME)})[:16]
+EXTERNAL_LEDGER = Path.home() / "Library" / "Application Support" / \
+    "rapp-sentinel" / f"anchor-ledger-{_INSTALL_KEY}.json"
+
+
+def _update_external_ledger(rec):
+    """Remember the highest seq ever witnessed per stream. Never decreases."""
+    try:
+        EXTERNAL_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        led = {}
+        if EXTERNAL_LEDGER.exists():
+            led = json.loads(EXTERNAL_LEDGER.read_text(encoding="utf-8"))
+        for slug, h in (rec.get("heads") or {}).items():
+            prev = led.get(slug) or {}
+            if h.get("seq", -1) >= prev.get("seq", -1):
+                led[slug] = {"seq": h["seq"], "frame_hash": h["frame_hash"],
+                             "utc": rec.get("utc")}
+        EXTERNAL_LEDGER.write_text(json.dumps(led, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        # Never let bookkeeping break a tick. The check below reports a missing
+        # ledger on its own terms.
+        pass
+
+
+def check_external_ledger():
+    """Do the in-tree anchors still cover every seq the outside ledger saw?"""
+    if not EXTERNAL_LEDGER.exists():
+        return {"status": "absent", "detail": "no external ledger yet"}
+    try:
+        led = json.loads(EXTERNAL_LEDGER.read_text(encoding="utf-8"))
+    except Exception as e:
+        return {"status": "unreadable", "detail": f"{type(e).__name__}: {e}"}
+    disputes = []
+    for slug, remembered in led.items():
+        ch = read_chain(slug)
+        cur = ch[-1]["seq"] if ch else None
+        if cur is None:
+            disputes.append(f"{slug}: chain gone (ledger saw seq {remembered['seq']})")
+        elif cur < remembered.get("seq", -1):
+            disputes.append(f"{slug}: head {cur} < ledger high-water "
+                            f"{remembered['seq']}")
+    return {"status": "disputed" if disputes else "ok",
+            "detail": "; ".join(disputes) or f"{len(led)} streams at or above high-water",
+            "disputes": disputes}
 
 
 def anchors_for(slug):
