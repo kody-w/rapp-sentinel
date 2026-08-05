@@ -113,7 +113,7 @@ def workflows_failing_every_run(repo, limit=30, ignore=()):
             if v["total"] >= 2 and v["fail"] == v["total"]}
 
 
-def workflows_currently_broken(repo, limit=20, streak=4, ignore=()):
+def workflows_currently_broken(repo, limit=100, streak=4, ignore=()):
     """Workflows whose most recent `streak` runs ALL failed.
 
     `workflows_failing_every_run` requires fail == total, so a single old
@@ -141,7 +141,18 @@ def workflows_currently_broken(repo, limit=20, streak=4, ignore=()):
     out = {}
     for name, concl in per.items():
         recent = concl[:streak]
-        if len(recent) >= streak and all(c == "failure" for c in recent):
+        if len(recent) < streak:
+            # Too few runs inside the window to judge. That is NOT "fine", and
+            # calling it fine is how openrappter's Ring workflow went from
+            # correctly flagged to reported clean while still failing 5 of 5:
+            # three merges pushed its runs out of a 20-run window shared with
+            # every other workflow. The busier the repository, the smaller this
+            # window is per workflow, so silence here scales with activity.
+            if concl and all(c == "failure" for c in concl):
+                out[name] = {"streak": len(concl), "of": len(concl),
+                             "failed": len(concl), "insufficient_window": True}
+            continue
+        if all(c == "failure" for c in recent):
             out[name] = {"streak": len(recent), "of": len(concl),
                          "failed": sum(1 for c in concl if c == "failure")}
     return out
