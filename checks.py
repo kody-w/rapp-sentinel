@@ -459,18 +459,43 @@ def outsider_can_join():
     Every other check here runs with the owner's credentials, which proves
     nothing about the path an outside AI would take. This reads the public
     onboarding surface the way a newcomer would — unauthenticated.
+
+    Confirms before escalating. One sample used to be enough to call the surface
+    dead: a single dropped connection to raw.githubusercontent.com woke the
+    repair arm at 19:12 on 2026-08-05, and the file was served 200 in 0.2s
+    either side of it. critical=True spends money and takes actions, so it has
+    to mean "outsiders cannot join", not "one TCP connection died". This is the
+    same rule the workflow helpers already apply — judge a streak, not one
+    sample — and this was the last check in the file still breaking it.
     """
+    import time
     import urllib.request
     url = f"https://raw.githubusercontent.com/{RB}/main/state/agents.json"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            import json as _j
-            n = len(_j.loads(r.read().decode()).get("agents", {}))
-        return ok("rb_public_surface", f"public state readable, {n} agents")
-    except Exception as e:
-        return fail("rb_public_surface",
-                    f"an outsider cannot read platform state: {type(e).__name__}")
+    attempts, last = 3, ""
+    for i in range(attempts):
+        if i:
+            time.sleep(2 * i)
+        try:
+            req = urllib.request.Request(url,
+                                         headers={"User-Agent": "rapp-sentinel"})
+            # No explicit timeout: the module default is the reviewed one, and a
+            # call site that re-states a default silently owns it (#27). This one
+            # said 20 while TIMEOUT said 25, on a payload now over 3MB.
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                import json as _j
+                n = len(_j.loads(r.read().decode()).get("agents", {}))
+            note = f"public state readable, {n} agents"
+            if i:
+                note += f" (recovered after {i + 1} attempts)"
+            return ok("rb_public_surface", note)
+        except Exception as e:
+            # "URLError" on its own cannot separate a deleted file from a
+            # dropped connection, and that string is the entire diagnosis the
+            # repair arm is woken with. Carry the reason.
+            last = f"{type(e).__name__}: {e}"
+    return fail("rb_public_surface",
+                f"an outsider cannot read platform state "
+                f"after {attempts} attempts: {last}")
 
 
 @check
