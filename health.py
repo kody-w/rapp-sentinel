@@ -41,34 +41,48 @@ def _brainstem_answers_turns():
         return C.fail("w_brainstem", f"/chat unreachable: {type(e).__name__}", critical=False)
 
 
-def _port_owner_supervised_by_launchd(port):
-    """Who holds `port`, and is launchd its parent?
+def _listening_pid(port):
+    """The process LISTENing on `port`, or None.
 
-    The last resort when no known label matches. A label can be renamed by an
-    installer; a process holding the port with PPID 1 is the daemon itself,
-    supervised, whatever anyone decided to call the job.
-
-    Returns (supervised_pid, parent_pid_or_holder):
-      (pid, ppid)   — held and supervised
-      (None, pid)   — held, but by something launchd did not start, so nothing
-                      will restart it when it dies
-      (None, None)  — nothing is listening
+    `-sTCP:LISTEN` is not optional. Without it lsof matches any socket on the
+    port, including CLIENTS — on the machine this was written against it
+    returned a browser that merely had a connection open, and called it the
+    daemon.
     """
     try:
-        r = subprocess.run(["lsof", "-ti", f":{port}"], capture_output=True,
-                           text=True, timeout=10)
-        pids = [p for p in (r.stdout or "").split() if p.isdigit()]
-        if not pids:
-            return None, None
-        holder = pids[0]
-        p = subprocess.run(["ps", "-o", "ppid=", "-p", holder],
+        r = subprocess.run(["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
                            capture_output=True, text=True, timeout=10)
-        ppid = (p.stdout or "").strip()
-        if ppid == "1":
-            return int(holder), 1
-        return None, int(holder)
+        pids = [p for p in (r.stdout or "").split() if p.isdigit()]
+        return pids[0] if pids else None
     except Exception:
-        return None, None
+        return None
+
+
+def _launchd_attributed_pid(labels):
+    """The PID launchd itself claims for one of `labels`, or None.
+
+    ASK LAUNCHD. Do not infer supervision from PPID 1.
+
+    The first version of this patch did exactly that, and it was wrong: a
+    process whose parent has exited is reparented to launchd and is
+    indistinguishable from a supervised one by PPID alone. On the machine this
+    was written against, an orphaned daemon left over from a hand-start held the
+    port all evening while `launchctl list com.openrappter.gateway` showed no
+    PID at all and LastExitStatus 256 — the job had never run, and nothing would
+    have restarted the thing serving traffic. PPID said 1 the whole time.
+    """
+    for label in labels:
+        try:
+            r = subprocess.run(["launchctl", "list", label],
+                               capture_output=True, text=True, timeout=10)
+            for line in (r.stdout or "").splitlines():
+                if '"PID"' in line:
+                    digits = "".join(ch for ch in line if ch.isdigit())
+                    if digits:
+                        return digits
+        except Exception:
+            continue
+    return None
 
 
 def probe_watchers():
@@ -129,16 +143,14 @@ def probe_watchers():
         #   supervised    → healthy, launchctl simply is not attributing it
         #   unsupervised  → running, but nothing will restart it when it dies
         #   absent        → genuinely not there
-        supervised_pid, parent = _port_owner_supervised_by_launchd(18790)
-        if supervised_pid:
-            note = "label loaded but launchctl reports no pid" if loaded \
-                else f"no label in {LABELS}"
-            out.append(C.ok("w_openrappter",
-                            f"daemon running under launchd (pid {supervised_pid}) — {note}"))
-        elif parent:
+        listening = _listening_pid(18790)
+        attributed = _launchd_attributed_pid(LABELS)
+        if listening and attributed and listening == attributed:
+            out.append(C.ok("w_openrappter", f"daemon running under launchd (pid {listening})"))
+        elif listening:
             out.append(C.fail("w_openrappter",
-                              f"gateway port held by pid {parent} whose parent is not "
-                              "launchd — running UNSUPERVISED, nothing will restart it",
+                              f"pid {listening} is serving :18790 but launchd does not claim "
+                              "it — ORPHAN, nothing will restart it when it dies",
                               critical=False))
         elif loaded:
             out.append(C.fail("w_openrappter", "daemon loaded but NOT running (no pid)",
