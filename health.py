@@ -12,6 +12,7 @@ Exit code is always 0; the verdict is the payload, not the status.
 """
 
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -148,10 +149,21 @@ def probe_watchers():
         if listening and attributed and listening == attributed:
             out.append(C.ok("w_openrappter", f"daemon running under launchd (pid {listening})"))
         elif listening:
-            out.append(C.fail("w_openrappter",
-                              f"pid {listening} is serving :18790 but launchd does not claim "
-                              "it — ORPHAN, nothing will restart it when it dies",
-                              critical=False))
+            # DO NOT call this an orphan. That claim was made here twice and was
+            # wrong twice: first from PPID 1 (an orphan is reparented to launchd
+            # and looks identical), then from XPC_SERVICE_NAME (inherited from
+            # whatever spawned it, not proof of the job that did). On the machine
+            # this was written against the daemon reliably came back within five
+            # seconds of being killed, four times running, while launchctl
+            # attributed it to nothing.
+            #
+            # A check that cannot determine something should say so. Reporting
+            # "orphan" with confidence would be the third wrong answer, and the
+            # loop's whole premise is that a watcher which guesses is worse than
+            # one that admits the gap.
+            out.append(C.ok("w_openrappter",
+                            f"serving :18790 (pid {listening}); launchd attributes it to no "
+                            "known label — supervision UNVERIFIED, not disproved"))
         elif loaded:
             out.append(C.fail("w_openrappter", "daemon loaded but NOT running (no pid)",
                               critical=False))
@@ -173,6 +185,27 @@ def probe_watchers():
     except Exception as e:
         out.append(C.fail("w_anchor_ledger",
                           f"ledger check raised {type(e).__name__}: {e}"))
+
+    # A launchd job that runs and exits non-zero forever is not a daemon, it is
+    # a spinning wheel. This one cannot win the runtime lock another process
+    # already holds, so every one of its starts dies on arrival — and because it
+    # is `loaded`, every naive check calls it healthy.
+    for label in LABELS:
+        try:
+            r = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                               capture_output=True, text=True, timeout=10)
+            txt = r.stdout or ""
+            if "state = not running" in txt and "last exit code = 0" not in txt:
+                code = next((l.split("=")[-1].strip() for l in txt.splitlines()
+                             if "last exit code" in l), "?")
+                runs = next((l.split("=")[-1].strip() for l in txt.splitlines()
+                             if l.strip().startswith("runs =")), "?")
+                out.append(C.fail(f"w_launchd_{label.split('.')[-1]}",
+                                  f"{label}: {runs} starts, all exiting {code} — "
+                                  "a job that can never come up",
+                                  critical=False))
+        except Exception:
+            pass
 
     beat = HOME / "state" / "last_run.json"
     age_m = None
