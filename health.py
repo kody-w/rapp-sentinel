@@ -222,7 +222,22 @@ def check_completeness(results):
     # purely from results-so-far made the completeness check report ITSELF
     # missing the moment it was listed as required - the exact blind spot it
     # was written to close, reproduced inside the fix for it.
-    ran = {c.get("id") for c in results if c.get("id")} | {"w_checks_complete"}
+    # A duplicate id would let a check stop running while this stayed green: the
+    # verdict would carry two entries, `ran` is a set, and the id would still be
+    # present -- supplied by the other function. There are none today, which is
+    # exactly when it is cheap to make impossible.
+    seen = {}
+    for c in results:
+        cid = c.get("id")
+        if not cid:
+            continue
+        who = c.get("produced_by", "?")
+        if cid in seen and seen[cid] != who:
+            return C.fail("w_checks_complete",
+                          f"duplicate check id {cid!r} emitted by {seen[cid]} and {who}",
+                          critical=True)
+        seen[cid] = who
+    ran = set(seen) | {"w_checks_complete"}
     manifest = HOME / "required_checks.json"
     if not manifest.exists():
         return C.fail("w_checks_complete", "required_checks.json is missing",
@@ -251,15 +266,29 @@ def main():
     for fn in C.all_checks():
         try:
             r = fn()
-            results.append(r if isinstance(r, dict) else
-                           C.fail(fn.__name__, "check returned a non-result", critical=False))
+            r = r if isinstance(r, dict) else C.fail(
+                fn.__name__, "check returned a non-result", critical=False)
         except Exception as e:
             # a check that throws is a broken check, not a broken platform
-            results.append(C.fail(fn.__name__,
-                                  f"check raised {type(e).__name__}: {e}", critical=False))
-    results += probe_watchers()
+            r = C.fail(fn.__name__, f"check raised {type(e).__name__}: {e}", critical=False)
+        # Nine of twelve ids do not match their function name -- rb_wf_starved
+        # comes from rb_workflows_never_succeed, rv_pr_queue from queue_draining.
+        # That is why the missing-check defect in #15 was invisible: nothing in
+        # the output connected the two names. The runner already holds fn, so it
+        # can say so without checks.py knowing anything about it.
+        r.setdefault("produced_by", fn.__name__)
+        results.append(r)
+    # The watcher probes are built inline rather than through the registry, so
+    # they carry no function of their own. Naming their producer anyway keeps
+    # every line in the verdict traceable, and gives the duplicate-id guard
+    # below something real to compare.
+    for r in probe_watchers():
+        r.setdefault("produced_by", "probe_watchers")
+        results.append(r)
     # Last, so it can see every id the run actually produced.
-    results.append(check_completeness(results))
+    completeness = check_completeness(results)
+    completeness.setdefault("produced_by", "check_completeness")
+    results.append(completeness)
 
     failed = [c for c in results if not c["ok"]]
     crit = [c for c in failed if c["severity"] == C.CRITICAL]
