@@ -58,9 +58,14 @@ def send(text, to):
         # launchd invokes it this way on purpose. Attempting a send from a
         # background context does not merely fail — it wedges Messages for
         # everyone, including the contexts that CAN send. Learned by wedging it.
-        return True, "queued (send deferred to a permitted context)"
+        #
+        # "queued" is its own outcome, not a kind of "sent". Returning True here
+        # made the log say sent=True for a message deliberately not sent, which
+        # is the same shape as #32 and #34: reporting success for something that
+        # had not happened.
+        return "queued", "send deferred to a permitted context"
     sent, kept, why = outbox.drain()
-    return sent > 0, (why if kept else "")
+    return ("sent" if sent > 0 else "failed"), (why if kept else "")
 
 
 def build(since):
@@ -172,13 +177,18 @@ def main():
         print(text)
         return 0
 
-    ok, err = send(text, to)
-    print(f"sent={ok} to={to}" + (f" err={err}" if err else ""))
-    if ok:
+    outcome, reason = send(text, to)
+    print(f"{outcome}=1 to={to}" + (f" reason={reason}" if reason else ""))
+    # "queued" advances the mark as well as "sent": a queued message WILL be
+    # delivered by the next permitted context, and not advancing would make the
+    # following run re-report the same window.
+    if outcome in ("queued", "sent"):
         STATE.mkdir(exist_ok=True)
         MARK.write_text(json.dumps(
             {"at": datetime.now(timezone.utc).isoformat(timespec="seconds")}) + "\n")
-    return 0 if ok else 1
+    # Exit 0 for queued as well as sent -- launchd would otherwise record a
+    # failure for the path that is working exactly as designed.
+    return 0 if outcome in ("queued", "sent") else 1
 
 
 if __name__ == "__main__":
