@@ -84,9 +84,15 @@ case("rv_validation: gate workflow not present", True,
      lambda: (setattr(checks, "gh", lambda a, default=None: []),
               setattr(checks, "active_workflows", lambda r: ["Other"])),
      checks.action_gate_accepting)
+# The check now requests createdAt as well (#52), so a realistic fixture must
+# carry it. A run with no timestamp is correctly unjudgeable, not healthy.
+_FRESH = __import__("datetime").datetime.now(
+    __import__("datetime").timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
 case("rv_validation: CONTROL runs exist, passing", True,
      lambda: setattr(checks, "gh",
-                     lambda a, default=None: [{"conclusion": "success"}] * 10),
+                     lambda a, default=None: [{"conclusion": "success",
+                                               "createdAt": _FRESH}] * 10),
      checks.action_gate_accepting)
 
 bad = 0

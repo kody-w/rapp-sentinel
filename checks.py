@@ -378,7 +378,7 @@ def world_still_merging():
 @check
 def action_gate_accepting():
     runs = gh(["run", "list", "-R", RV, "--workflow", "Validate Agent Action",
-               "--limit", "10", "--json", "conclusion"], default=[]) or []
+               "--limit", "10", "--json", "conclusion,createdAt"], default=[]) or []
     if not runs:
         # "no recent runs" was reported as ok while the id claims the gate is
         # ACCEPTING. A gate with no runs is stopped. Distinguish deleted from
@@ -410,8 +410,31 @@ def action_gate_accepting():
         return fail("rv_validation",
                     f"{len(runs)} runs in flight, none concluded yet",
                     critical=False)
+    # A ratio over a window that ENDED hours ago is not a live reading. During
+    # the 2026-08-06 outage the gate ran every ~30min, stopped for 4.6h, and
+    # this reported "5/10 validations passing" -- which reads as "rejecting
+    # half the work" when the truth was "not running at all". Two different
+    # problems. Without createdAt the check could not tell them apart, so a
+    # gate stopped for days holding 10 stale successes would have reported
+    # "10/10 validations passing" indefinitely, at full confidence (#52).
+    #
+    # #43 resolved an EMPTY window; this resolves a STALE one. Runs exist, so
+    # that logic is never reached.
+    newest = max((r.get("createdAt") or "" for r in decided), default="")
+    age_h = hours_since(newest) if newest else None
+    if age_h is None:
+        return fail("rv_validation", "gate runs carry no timestamps",
+                    critical=False)
+    if age_h >= 3:
+        # ~30min cadence; 3h is 6x headroom, the same reasoning as
+        # rv_world_merging. Non-critical: a stopped gate during a GitHub
+        # outage is not this repository's defect, and #50 already classifies
+        # rv_validation as GITHUB_DEPENDENT so no repair budget is spent.
+        return fail("rv_validation",
+                    f"gate has not run in {age_h:.1f}h - stopped, not rejecting",
+                    critical=False)
     good = sum(1 for r in decided if r.get("conclusion") == "success")
-    d = f"{good}/{len(decided)} validations passing"
+    d = f"{good}/{len(decided)} validations passing ({age_h:.1f}h old)"
     return (ok("rv_validation", d) if good >= len(decided) * 0.6
             else fail("rv_validation", d))
 
