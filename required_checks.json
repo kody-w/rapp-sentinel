@@ -9,6 +9,7 @@
     "rb_content_moving",
     "rb_json_parses",
     "rb_public_surface",
+    "rb_rollup_coverage",
     "rb_shards",
     "rb_wf_starved",
     "rb_workflows",
