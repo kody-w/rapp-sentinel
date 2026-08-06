@@ -390,9 +390,30 @@ def action_gate_accepting():
         if "Validate Agent Action" in names:
             return fail("rv_validation", "gate workflow is active but has zero runs")
         return ok("rv_validation", "gate workflow not present")
-    good = sum(1 for r in runs if r.get("conclusion") == "success")
-    d = f"{good}/{len(runs)} validations passing"
-    return ok("rv_validation", d) if good >= len(runs) * 0.6 else fail("rv_validation", d)
+    # A queued or in-progress run has not validated anything yet: gh reports it
+    # with an empty conclusion. Dividing by every run in the window puts those
+    # non-verdicts in the denominator, so "the gate is busy" reads as "the gate
+    # is rejecting work". That is what paged the repair arm during the
+    # 2026-08-06 Actions outage -- 5 successes, 3 runs killed at "Set up job"
+    # before the validator existed, and 2 still queued -- reported as
+    # "5/10 validations passing" with a critical severity aimed at a repository
+    # that had done nothing wrong.
+    #
+    # Every other helper here already judges explicit conclusions only
+    # (workflows_currently_broken, workflows_never_succeeding); this was the one
+    # place that divided by runs it had no verdict for.
+    decided = [r for r in runs if r.get("conclusion")]
+    if not decided:
+        # Absence of a verdict is not a rejection (#43), but it is not health
+        # either. Non-critical: this is visible without pointing the repair arm
+        # at a repository where there is nothing to repair.
+        return fail("rv_validation",
+                    f"{len(runs)} runs in flight, none concluded yet",
+                    critical=False)
+    good = sum(1 for r in decided if r.get("conclusion") == "success")
+    d = f"{good}/{len(decided)} validations passing"
+    return (ok("rv_validation", d) if good >= len(decided) * 0.6
+            else fail("rv_validation", d))
 
 
 @check
