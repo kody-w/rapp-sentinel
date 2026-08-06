@@ -113,6 +113,24 @@ def workflows_failing_every_run(repo, limit=30, ignore=()):
             if v["total"] >= 2 and v["fail"] == v["total"]}
 
 
+def active_workflows(repo):
+    """Names of workflows that EXIST and are active on `repo`.
+
+    Absence of run history is ambiguous on its own. A repo with no workflows
+    has nothing to report; a repo whose workflows exist but have stopped
+    running is stalled. Nothing else in this file could tell those apart, so
+    three checks reported "no run history" as healthy and would have stayed
+    green forever if a workflow were deleted, disabled, or had its trigger
+    broken (#43).
+
+    Returns None when the workflow list itself cannot be read, so callers can
+    say "unknown" instead of quietly assuming health.
+    """
+    wf = gh(["api", f"repos/{repo}/actions/workflows", "--jq",
+             '[.workflows[] | select(.state=="active") | .name]'], default=None)
+    return wf if isinstance(wf, list) else None
+
+
 def workflows_currently_broken(repo, limit=100, streak=4, ignore=()):
     """Workflows whose most recent `streak` runs ALL failed.
 
@@ -348,7 +366,16 @@ def action_gate_accepting():
     runs = gh(["run", "list", "-R", RV, "--workflow", "Validate Agent Action",
                "--limit", "10", "--json", "conclusion"], default=[]) or []
     if not runs:
-        return ok("rv_validation", "no recent runs")
+        # "no recent runs" was reported as ok while the id claims the gate is
+        # ACCEPTING. A gate with no runs is stopped. Distinguish deleted from
+        # stalled before deciding (#43).
+        names = active_workflows(RV)
+        if names is None:
+            return fail("rv_validation", "no runs and workflow list unreadable",
+                        critical=False)
+        if "Validate Agent Action" in names:
+            return fail("rv_validation", "gate workflow is active but has zero runs")
+        return ok("rv_validation", "gate workflow not present")
     good = sum(1 for r in runs if r.get("conclusion") == "success")
     d = f"{good}/{len(runs)} validations passing"
     return ok("rv_validation", d) if good >= len(runs) * 0.6 else fail("rv_validation", d)
@@ -368,7 +395,15 @@ def queue_draining():
 def workflows_healthy():
     broken = workflows_failing_every_run(RB)
     if broken is None:
-        return ok("rb_workflows", "no run history")
+        # Empty history is not health. Ask whether anything is SUPPOSED to run.
+        names = active_workflows(RB)
+        if names is None:
+            return fail("rb_workflows", "no run history and workflow list unreadable",
+                        critical=False)
+        if names:
+            return fail("rb_workflows",
+                        f"{len(names)} active workflows produced no runs at all")
+        return ok("rb_workflows", "no workflows defined")
     return (ok("rb_workflows", "all green") if not broken
             else fail("rb_workflows", "100% failing: " + ", ".join(sorted(broken))))
 
@@ -383,7 +418,14 @@ def rb_workflows_never_succeed():
     """
     stuck = workflows_never_succeeding(RB)
     if stuck is None:
-        return ok("rb_wf_starved", "no run history")
+        names = active_workflows(RB)
+        if names is None:
+            return fail("rb_wf_starved", "no run history and workflow list unreadable",
+                        critical=False)
+        if names:
+            return fail("rb_wf_starved",
+                        f"{len(names)} active workflows produced no runs at all")
+        return ok("rb_wf_starved", "no workflows defined")
     if not stuck:
         return ok("rb_wf_starved", "every workflow has at least one success")
     detail = ", ".join(f"{n} ({v['cancelled']}/{v['total']} cancelled)"
