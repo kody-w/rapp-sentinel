@@ -289,7 +289,7 @@ def ecosystem_not_silently_broken():
     repos = [r for r in declared if r not in DEEPLY_CHECKED]
     if not repos:
         return ok("eco_sweep", "no additional repositories declared")
-    broken, unreachable = {}, []
+    broken, unreachable, no_history = {}, [], []
     for repo in repos:
         try:
             # Streak, not lifetime ratio. A workflow with one old success and
@@ -305,11 +305,25 @@ def ecosystem_not_silently_broken():
             unreachable.append(repo)
             continue
         if bad is None:
-            continue                      # no run history: no signal
+            # One repo without run history is absence of evidence, as the
+            # docstring says. EVERY repo without it is a dead instrument
+            # wearing the same clothes, and the old code could not tell them
+            # apart -- it reported "N repositories swept, none on a red
+            # streak" after sweeping nothing (#45).
+            no_history.append(repo)
+            continue
         if bad:
             broken[repo] = bad
+    # The receipt is the only artifact proving coverage, so write it whether
+    # or not anything is broken. It used to be written only inside `if broken`,
+    # which skipped it precisely when coverage was zero.
+    _write_coverage_receipt(declared, repos, unreachable)
+    if len(repos) > 1 and len(no_history) == len(repos):
+        return fail("eco_sweep",
+                    f"swept {len(repos)} repos and every one returned no run "
+                    f"history - instrument likely dead, not an all-clear",
+                    critical=False)
     if broken:
-        _write_coverage_receipt(declared, repos, unreachable)
         # "failed 20 of 22" and "I saw 2 runs and both failed" are different
         # claims. The first is a defect; the second is a prompt to look. Merging
         # them is what let an under-sampled healthy workflow (rapp-map's spine)
@@ -386,8 +400,11 @@ def queue_draining():
     """679 PRs once piled up behind a broken gate. A queue that only grows is
     the same failure as a dead queue, and neither shows up as an error."""
     n = gh(["api", "--paginate", f"repos/{RV}/pulls?state=open&per_page=100",
-            "--jq", "length"], default=0)
-    n = n if isinstance(n, int) else 0
+            "--jq", "length"], default=None)
+    if not isinstance(n, int):
+        # default=0 made a dead API indistinguishable from an empty queue, and
+        # an empty queue is the healthiest possible reading (#45).
+        return fail("rv_pr_queue", "cannot read the PR queue", critical=False)
     return ok("rv_pr_queue", f"{n} open PRs") if n < 40 else fail("rv_pr_queue", f"{n} open PRs")
 
 
@@ -445,21 +462,29 @@ def rb_served_json_parses():
     """
     import json as _j
     import urllib.request
-    bad = []
-    for name in ("stats", "agents", "channels", "trending", "social_graph"):
+    bad, parsed = [], 0
+    names = ("stats", "agents", "channels", "trending", "social_graph")
+    for name in names:
         url = f"https://raw.githubusercontent.com/{RB}/main/state/{name}.json"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
             with urllib.request.urlopen(req, timeout=25) as r:
                 _j.loads(r.read().decode("utf-8"))
+            parsed += 1
         except _j.JSONDecodeError as e:
             bad.append(f"{name} ({str(e)[:40]})")
         except Exception:
             # Reachability is a different check's job; only parseability here.
             pass
-    return (ok("rb_json_parses", "served state parses")
-            if not bad else
-            fail("rb_json_parses", "unparseable: " + ", ".join(bad)))
+    if bad:
+        return fail("rb_json_parses", "unparseable: " + ", ".join(bad))
+    if parsed == 0:
+        # Every fetch failed, so nothing was examined and "served state parses"
+        # was a claim about the empty set -- true and worthless (#45).
+        return fail("rb_json_parses",
+                    f"read none of {len(names)} state files - cannot judge "
+                    f"parseability", critical=False)
+    return ok("rb_json_parses", f"served state parses ({parsed}/{len(names)})")
 
 
 @check
