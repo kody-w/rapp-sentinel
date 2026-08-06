@@ -426,30 +426,47 @@ def rb_content_moving():
 
     This check exists because its absence cost five days. Every workflow on
     rappterbook reported success every ~2.5 hours from Jul 30 to Aug 4 while
-    the fleet produced ZERO posts — three separate failures each degraded to a
+    the fleet produced ZERO posts - three separate failures each degraded to a
     no-op and exited 0. `rb_workflows` said "all green" the entire time,
     because it only ever asked whether jobs were FAILING.
 
-    rv_world_merging already had the right shape for the sibling platform:
-    measure output, not exit codes. This is that check, for content.
+    It first measured GitHub Discussion recency. That proxy was invalidated on
+    2026-08-06: discussions are now seeded by human engagement (upvote /
+    downvote / comment), not by fleet output, so discussion silence became a
+    CORRECT state. Keeping the old assertion would have failed the platform
+    for behaving as designed - and the cheapest way to turn it green would
+    have been to generate filler posts, which is exactly what the policy
+    exists to prevent. A check satisfiable by degrading the product is worse
+    than no check.
+
+    So it now measures the layer that must keep moving regardless of human
+    traffic: the roll-up that materializes state for the static site.
+    `materialized_at` proves Compute Trending ran AND wrote output rather than
+    merely exiting 0, and `total_posts_analyzed` is the content counter behind
+    the site.
     """
-    q = ('{repository(owner:"%s",name:"%s"){discussions(first:1,'
-         'orderBy:{field:CREATED_AT,direction:DESC}){nodes{createdAt}}}}'
-         % tuple(RB.split("/")))
-    data = gh(["api", "graphql", "-f", f"query={q}"], default=None)
-    try:
-        newest = data["data"]["repository"]["discussions"]["nodes"][0]["createdAt"]
-    except Exception:
-        return fail("rb_content_moving", "cannot read discussion timestamps")
+    import json as _j
+    import urllib.request
     from datetime import datetime, timezone
+    url = f"https://raw.githubusercontent.com/{RB}/main/state/trending.json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            meta = _j.loads(r.read().decode("utf-8")).get("_meta", {})
+        stamp = meta.get("materialized_at") or meta["last_updated"]
+        posts = int(meta.get("total_posts_analyzed", 0))
+    except Exception as e:
+        return fail("rb_content_moving", f"cannot read roll-up state ({str(e)[:40]})")
     age_h = (datetime.now(timezone.utc)
-             - datetime.fromisoformat(newest.replace("Z", "+00:00"))).total_seconds() / 3600
-    # The fleet posts several times a day when healthy. A day of silence is a
-    # real signal; the historical freeze ran to 120 hours.
-    return (ok("rb_content_moving", f"newest post {age_h:.1f}h ago")
-            if age_h < 24 else
-            fail("rb_content_moving",
-                 f"no new posts in {age_h:.1f}h — workflows may be green and idle"))
+             - datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds() / 3600
+    # Compute Trending runs every ~3-4h and each run commits. Observed worst
+    # content gap over 24h was 7.6h; 12h leaves headroom without hiding a stall.
+    if age_h >= 12:
+        return fail("rb_content_moving",
+                    f"roll-up stale {age_h:.1f}h - green workflows may be idle")
+    if posts <= 0:
+        return fail("rb_content_moving", "roll-up reports zero posts analyzed")
+    return ok("rb_content_moving", f"roll-up {age_h:.1f}h old, {posts} posts")
 
 
 @check
