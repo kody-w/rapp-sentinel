@@ -115,7 +115,11 @@ def run_health():
 
 def within_budget(hist, cfg):
     cutoff = now() - timedelta(hours=24)
-    recent = [h for h in hist if datetime.fromisoformat(h["at"]) > cutoff]
+    # Skipped entries record a decision NOT to spend a model, so they must not
+    # consume the budget they exist to protect (#50). Counting them would let
+    # an 8-hour GitHub outage exhaust the day without a single repair attempt.
+    recent = [h for h in hist
+              if datetime.fromisoformat(h["at"]) > cutoff and not h.get("skipped")]
     return len(recent) < cfg["daily_escalation_budget"], len(recent)
 
 
@@ -162,6 +166,38 @@ Investigate the failure and report the root cause and the exact fix you would
 apply. Do NOT edit files, commit, push, or trigger workflows. Read logs, read
 code, run read-only commands only.
 """
+
+
+# Checks that CANNOT pass while GitHub Actions or Pages is down. Every one of
+# them measures something GitHub runs on our behalf, so during an outage their
+# failure is a report about GitHub, not about us (#50).
+GITHUB_DEPENDENT = {
+    "rv_validation", "rv_world_merging", "rv_pr_queue",
+    "rb_workflows", "rb_wf_starved", "rb_shards",
+    "rb_content_moving", "rb_rollup_coverage", "eco_sweep",
+}
+
+
+def github_degraded():
+    """Components in outage, using the same source as the gh_status check.
+
+    Returns [] when GitHub is healthy AND when the status page cannot be read.
+    Unreachable must not imply "outage", or an unreachable status page would
+    silently disable escalation entirely -- trading a noisy failure for a
+    silent one, which is the trade this repo exists to refuse.
+    """
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            "https://www.githubstatus.com/api/v2/components.json",
+            headers={"User-Agent": "rapp-sentinel"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            comps = json.loads(r.read().decode("utf-8")).get("components", [])
+    except Exception:
+        return []
+    return [c["name"] for c in comps
+            if c.get("name") in ("Actions", "Pages")
+            and c.get("status") in ("major_outage", "partial_outage")]
 
 
 def escalate(cfg, verdict, failing, mode):
@@ -459,6 +495,30 @@ def main():
         return 0
 
     hist = load_json(STATE / "escalations.json", [])
+
+    # Before spending budget, ask whose outage this is. During today's incident
+    # (2026-08-06, Actions + Pages major_outage) this fired four times in four
+    # hours -- the first 32 seconds after GitHub opened the incident -- and
+    # returned BLOCKED, PARTIAL, BLOCKED, UNKNOWN. Never FIXED, because there
+    # was nothing here to fix. Each spawned `copilot --allow-all` against the
+    # real repositories.
+    #
+    # Only skip when EVERY failing critical is explainable by the outage. A
+    # real defect that happens during an outage must still escalate, or this
+    # trades a noisy failure for a silent one (#50).
+    external = [c for c in critical if c in GITHUB_DEPENDENT]
+    if len(external) == len(critical):
+        degraded = github_degraded()
+        if degraded:
+            log(f"skipping escalation: {', '.join(degraded)} in outage and all "
+                f"failing criticals ({', '.join(sorted(critical))}) depend on it")
+            hist.append({"at": now().isoformat(timespec="seconds"),
+                         "key": ",".join(sorted(critical)),
+                         "result": f"SKIPPED — external outage: {', '.join(degraded)}",
+                         "skipped": True})
+            save_json(STATE / "escalations.json", hist)
+            return 0
+
     okb, used = within_budget(hist, cfg)
     if not okb:
         log(f"daily escalation budget exhausted ({used}/{cfg['daily_escalation_budget']})")
