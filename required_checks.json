@@ -6,6 +6,7 @@
     "alert_delivery",
     "channel",
     "eco_sweep",
+    "gh_status",
     "rb_content_moving",
     "rb_json_parses",
     "rb_public_surface",

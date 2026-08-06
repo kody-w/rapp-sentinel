@@ -647,6 +647,58 @@ def derived_data_regenerating():
 
 
 @check
+def github_status_operational():
+    """Distinguish OUR outage from GitHub's.
+
+    2026-08-06 18:10Z: the sentinel went critical with two true positives --
+    rappterverse state had not merged in 3h and the validation gate was
+    failing 5/10. Both real. Neither ours. GitHub Actions and Pages were in
+    major outage, and the failed runs said so plainly:
+
+        Failed to resolve action download info. Error: Service Unavailable
+        ##[error]The HTTP request timed out after 00:01:40.
+
+    Three unrelated workflows failed in the same window -- Validate Agent
+    Action, PII Scan, Regression Tests -- which is not three coincidental
+    bugs. The shape was visible and no check looked at it, so attribution
+    required a human reading raw run logs.
+
+    That distinction decides the response. "The gate is broken" is a defect
+    to fix; "Actions is down" is a wait. The neighborhood has a repair arm
+    that takes actions and spends money, and pointing it at an external
+    outage aims it at a problem that does not exist here.
+
+    Warn-level on purpose: this must never wake anyone, but it has to appear
+    in the SAME report as the reds it explains.
+    """
+    import json as _j
+    import urllib.request
+    watched = ("Actions", "Pages", "API Requests", "Webhooks")
+    url = "https://www.githubstatus.com/api/v2/components.json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            comps = _j.loads(r.read().decode("utf-8")).get("components", [])
+    except Exception as e:
+        # Fail closed. Reporting "all operational" about a source we could not
+        # read is the blind-green mistake (#45).
+        return fail("gh_status", f"cannot read GitHub status ({type(e).__name__})",
+                    critical=False)
+    seen = {c.get("name"): c.get("status") for c in comps
+            if c.get("name") in watched}
+    if not seen:
+        return fail("gh_status", "status page listed none of the watched components",
+                    critical=False)
+    bad = {n: s for n, s in seen.items() if s != "operational"}
+    return (ok("gh_status", f"{len(seen)} components operational")
+            if not bad else
+            fail("gh_status",
+                 "GitHub degraded: " + ", ".join(f"{n} {s}" for n, s in sorted(bad.items()))
+                 + " - external, not ours",
+                 critical=False))
+
+
+@check
 def sites_up():
     for cid, url in (("rv_site", "https://kody-w.github.io/rappterverse/"),
                      ("rb_site", "https://kody-w.github.io/rappterbook/")):
