@@ -516,6 +516,62 @@ def outsider_can_join():
 
 
 @check
+def rb_rollup_covers_corpus():
+    """A fresh timestamp over a frozen quantity is still an outage.
+
+    rb_content_moving (#39) replaced a stale discussion-recency proxy with a
+    roll-up freshness assertion, and shipped green while the roll-up had been
+    frozen for 37 hours: `materialized_at` advanced on every run, so the
+    freshness arm passed, and `total_posts_analyzed` sat at 11634 across ten
+    consecutive materializations. Compute Trending reported success for all
+    ten. See rappterbook#20887.
+
+    Alarming on a frozen COUNT would repeat the mistake #39 fixed: under the
+    engagement-triggered discussion policy, the corpus legitimately plateaus
+    when nobody engages, so a growth-rate rule would fail the platform for
+    behaving correctly.
+
+    Coverage is policy-proof. When the platform is quiet, the analyzed count
+    and the real corpus hold still TOGETHER and the ratio stays 1.0. The ratio
+    only falls when the roll-up is computing the site's rankings from
+    materially less than the platform contains -- which is true today, because
+    scrape_discussions.py caps the scrape at 8000 while 15754 discussions
+    exist, discarding the OLDEST ones (the scrape is CREATED_AT DESC).
+    """
+    import json as _j
+    import urllib.request
+    url = f"https://raw.githubusercontent.com/{RB}/main/state/trending.json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
+        with urllib.request.urlopen(req, timeout=25) as r:
+            meta = _j.loads(r.read().decode("utf-8")).get("_meta", {})
+        analyzed = int(meta.get("total_posts_analyzed", 0))
+    except Exception as e:
+        return fail("rb_rollup_coverage", f"cannot read roll-up state ({str(e)[:40]})")
+    q = ('{repository(owner:"%s",name:"%s")'
+         '{discussions{totalCount}}}' % tuple(RB.split("/")))
+    data = gh(["api", "graphql", "-f", f"query={q}"], default=None)
+    try:
+        actual = int(data["data"]["repository"]["discussions"]["totalCount"])
+    except Exception:
+        return fail("rb_rollup_coverage", "cannot read corpus size")
+    if actual <= 0:
+        return fail("rb_rollup_coverage", "corpus reports zero discussions")
+    pct = 100.0 * analyzed / actual
+    # Quiet platform => both numbers hold still together => pct stays ~100.
+    # 90% absorbs materialization lag without hiding a structural shortfall.
+    # Warn, not critical: the shortfall is real but the remedy (scrape scope
+    # and API cost) is an owner decision, tracked in rappterbook#20887. Same
+    # treatment eco_sweep gives a known red that is blocked on a human. A
+    # nightly page nobody can act on trains people to ignore the channel.
+    return (ok("rb_rollup_coverage", f"{pct:.1f}% ({analyzed}/{actual})")
+            if pct >= 90 else
+            fail("rb_rollup_coverage",
+                 f"site computed from {pct:.1f}% of corpus ({analyzed}/{actual})",
+                 critical=False))
+
+
+@check
 def derived_data_regenerating():
     """Cache shards stopped regenerating when the write path jammed. The site
     404'd on this exact file for weeks."""
