@@ -812,24 +812,46 @@ def github_status_operational():
                  critical=False))
 
 
+def _fanout(cid, probes):
+    """Report a multi-URL probe under ONE id: `cid`, on every path.
+
+    These checks are registered in required_checks.json under the id they
+    return when everything is up. Returning the per-URL result directly on
+    failure meant the required id was absent EXACTLY when the platform was
+    broken, so w_checks_complete -- whose critical means "a check was deleted"
+    -- fired instead. A transient GitHub Pages 503 on one URL therefore
+    escalated a warn into the one alarm reserved for the registry losing a
+    check. Two unrelated failures, one signal, and the more serious one
+    crying wolf.
+
+    The per-URL id stays in the detail: which URL failed is the actionable
+    part, and losing it to fix the id would trade one blind spot for another.
+    """
+    for sub, url in probes:
+        r = url_check(sub, url)
+        if not r["ok"]:
+            # Carry the sub-probe's severity rather than assuming warn, so a
+            # probe later marked critical cannot be silently downgraded here.
+            return fail(cid, f"{sub} {r['detail']}",
+                        critical=r["severity"] == CRITICAL)
+    return None
+
+
 @check
 def sites_up():
-    for cid, url in (("rv_site", "https://kody-w.github.io/rappterverse/"),
-                     ("rb_site", "https://kody-w.github.io/rappterbook/")):
-        r = url_check(cid, url)
-        if not r["ok"]:
-            return r
-    return ok("sites", "both serving")
+    return _fanout("sites", (
+        ("rv_site", "https://kody-w.github.io/rappterverse/"),
+        ("rb_site", "https://kody-w.github.io/rappterbook/"),
+    )) or ok("sites", "both serving")
 
 
 @check
 def channel_serving():
-    for cid, path in (("ch_home", "/"), ("ch_json", "/rappvision/channel.json"),
-                      ("ch_feed", "/feed.xml")):
-        r = url_check(cid, CHANNEL + path)
-        if not r["ok"]:
-            return r
-    return ok("channel", "serving")
+    return _fanout("channel", (
+        ("ch_home", CHANNEL + "/"),
+        ("ch_json", CHANNEL + "/rappvision/channel.json"),
+        ("ch_feed", CHANNEL + "/feed.xml"),
+    )) or ok("channel", "serving")
 
 
 @check
