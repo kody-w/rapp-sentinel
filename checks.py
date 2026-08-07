@@ -375,6 +375,12 @@ def world_still_merging():
             else fail("rv_world_merging", f"last merge {h:.1f}h ago"))
 
 
+# Consecutive newest failures before the gate counts as rejecting work. The
+# gate runs on roughly a 30min cadence, so 4 in a row is ~2h of refusing
+# everything -- the same order of patience as the 3h staleness bar below.
+GATE_STREAK = 4
+
+
 @check
 def action_gate_accepting():
     runs = gh(["run", "list", "-R", RV, "--workflow", "Validate Agent Action",
@@ -435,8 +441,43 @@ def action_gate_accepting():
                     critical=False)
     good = sum(1 for r in decided if r.get("conclusion") == "success")
     d = f"{good}/{len(decided)} validations passing ({age_h:.1f}h old)"
-    return (ok("rv_validation", d) if good >= len(decided) * 0.6
-            else fail("rv_validation", d))
+    # A streak on the newest runs, not a ratio over the whole window. This is
+    # the rule workflows_currently_broken already applies to every other
+    # repository here: "what separates a real failure from a flake is not the
+    # lifetime ratio, it is whether it is failing NOW".
+    #
+    # eco_sweep learned that in one direction -- a ratio let ONE old success
+    # hide eight straight failures. This is the same error with the opposite
+    # sign: a ratio lets five old failures hide five straight successes.
+    #
+    # Live, 2026-08-06: the gate failed 5 runs during the GitHub Actions outage
+    # (15:41-17:48Z -- jobs dying at "Set up job", and run 31118968285 marked
+    # failure while its own `validate` AND `validation-gate` jobs both
+    # SUCCEEDED), then recovered and passed 5 in a row. Reported as
+    # "5/10 validations passing" at CRITICAL, which woke the repair arm against
+    # a gate that was at that moment accepting everything put in front of it.
+    # The window was fresh, so #52's staleness guard could not catch it: the
+    # runs were recent, the failures were simply over.
+    #
+    # gh returns runs newest-first, but this verdict now DEPENDS on that order,
+    # so sort on the timestamps we already fetched rather than trusting it.
+    newest_first = [r.get("conclusion") for r in
+                    sorted(decided, key=lambda r: r.get("createdAt") or "",
+                           reverse=True)]
+    if (len(newest_first) >= GATE_STREAK
+            and all(c == "failure" for c in newest_first[:GATE_STREAK])):
+        return fail("rv_validation",
+                    f"gate rejecting work: newest {GATE_STREAK} runs all "
+                    f"failed ({d})")
+    if good < len(decided) * 0.6:
+        # Real failures in the window, but the gate is passing NOW. Visible,
+        # not a page -- the same treatment eco_sweep and rb_rollup_coverage
+        # give a finding a human should see but the repair arm cannot act on.
+        # Self-clears as the burst ages out of the window.
+        return fail("rv_validation",
+                    f"{d} - failures are behind us, newest run "
+                    f"{newest_first[0]}", critical=False)
+    return ok("rv_validation", d)
 
 
 @check
