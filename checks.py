@@ -203,8 +203,37 @@ def workflows_never_succeeding(repo, limit=40, ignore=()):
             d["ok"] += 1
         elif r.get("conclusion") == "cancelled":
             d["cancelled"] += 1
-    return {n: v for n, v in per.items()
-            if v["total"] >= 3 and v["ok"] == 0 and v["cancelled"] > 0}
+    candidates = {n: v for n, v in per.items()
+                  if v["total"] >= 3 and v["ok"] == 0 and v["cancelled"] > 0}
+    if not candidates:
+        return {}
+    # Confirm each candidate against a wider lookback FOR THAT WORKFLOW.
+    #
+    # The narrow window is counted in repo-wide runs, not time. On rappterbook
+    # 40 runs span ~7.7h and are shared by 23 workflows, so 22 of them get 3 or
+    # fewer runs -- meaning the `total >= 3` bar is cleared at exactly the
+    # point the sample becomes a single thin time-slice. After the 2026-08-06
+    # Actions outage this reported "never succeeded: Overseer (cloud fallback)"
+    # on 3 outage-window runs, while that workflow had 5 successes just outside
+    # it. The busier the repo, the narrower the window in wall-clock time and
+    # the thinner the per-workflow evidence (#56).
+    #
+    # A workflow recovering from an incident is not a starved workflow. The
+    # original case this check was written for -- static-api cancelled 3/3,
+    # never once completed -- still fires, because a wider lookback finds no
+    # success there either.
+    confirmed = {}
+    for name, v in candidates.items():
+        wide = gh(["run", "list", "-R", repo, "--workflow", name,
+                   "--limit", "30", "--json", "conclusion"], default=None)
+        if wide is None:
+            # Cannot widen: keep the candidate rather than silently clearing it.
+            v["unconfirmed"] = True
+            confirmed[name] = v
+            continue
+        if not any(r.get("conclusion") == "success" for r in wide):
+            confirmed[name] = v
+    return confirmed
 
 
 # ══════════════════════════════════════════════════════════════════════════
