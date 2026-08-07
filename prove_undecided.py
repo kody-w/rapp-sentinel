@@ -22,6 +22,8 @@ here it is absence of a verdict being read as rejection. Same error, opposite
 sign.
 """
 import sys
+from datetime import datetime, timedelta, timezone
+
 import checks
 
 R = dict(aw=checks.active_workflows, gh=checks.gh)
@@ -60,9 +62,29 @@ def feed(runs):
 
 
 def concl(*pairs):
+    """Build a newest-first run list.
+
+    Every run carries a createdAt, descending from now. Without them this whole
+    file quietly stopped testing #47: #53 added a staleness guard that returns
+    "gate runs carry no timestamps" before any ratio is computed, and these
+    fixtures only ever set `conclusion`. 7 of 11 cases went red and the other 4
+    passed for the wrong reason -- they expected a failure and got one, from a
+    branch they were not written to exercise. A fixture that cannot reach the
+    code under test is a dead instrument, same as any other.
+    """
     out = []
     for state, n in pairs:
-        out += [{"conclusion": state}] * n
+        # A distinct dict per run. `[{...}] * n` aliases ONE dict n times, so
+        # stamping createdAt below would give every run the same timestamp.
+        out += [{"conclusion": state} for _ in range(n)]
+    stamp = datetime.now(timezone.utc)
+    for i, r in enumerate(out):
+        # One minute apart, so a full 10-run window stays well inside the 3h
+        # staleness bar #53 added. Staleness is prove_validation_staleness.py's
+        # subject; here it must never be what a case is measuring, the same way
+        # feed() pins the workflow present so #43's branch is never in play.
+        r["createdAt"] = (stamp - timedelta(minutes=i)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
     return out
 
 
@@ -77,7 +99,7 @@ case("queued runs alone cannot fail a gate that never failed", True,
      lambda: feed(concl(("", 8), ("success", 2))),
      checks.action_gate_accepting)
 case("null conclusion is treated the same as empty string", True,
-     lambda: feed([{"conclusion": None}] * 8 + [{"conclusion": "success"}] * 2),
+     lambda: feed(concl((None, 8), ("success", 2))),
      checks.action_gate_accepting)
 
 # ── absence of any verdict is visible, but is not a page ────────────────────
@@ -97,9 +119,10 @@ case("CONTROL all passing is ok", True,
 case("CONTROL exactly at the 0.6 bar is ok", True,
      lambda: feed(concl(("success", 6), ("failure", 4))),
      checks.action_gate_accepting)
-case("CONTROL just under the 0.6 bar fails", False,
+case("CONTROL under the 0.6 bar still fails once the burst has cleared, "
+     "but only as a warn", False,
      lambda: feed(concl(("success", 5), ("failure", 5))),
-     checks.action_gate_accepting)
+     checks.action_gate_accepting, want_severity=checks.WARN)
 
 # ── #43 must not regress: absence of runs is still not health ───────────────
 case("REGRESSION #43 gate active with zero runs still fails", False,
@@ -111,6 +134,18 @@ case("REGRESSION #43 gate workflow not present is ok", True,
      lambda: (setattr(checks, "gh", lambda a, default=None: []),
               setattr(checks, "active_workflows", lambda r: ["Other"])),
      checks.action_gate_accepting)
+
+# ── the guard that would have caught this file dying ────────────────────────
+# Every case above is written to exercise the verdict logic #47 is about. When
+# #53 added the staleness guard, these fixtures stopped reaching that logic
+# entirely -- and the file went on printing a score, 4 of whose passes were
+# accidents. A suite that cannot reach the code it names is a dead instrument.
+# Assert reachability explicitly so the next early return fails loudly here
+# instead of quietly turning this file into decoration.
+_dead = [n for _, n, _, _, _, d in CASES if "carry no timestamps" in d]
+CASES.append((not _dead, "no case short-circuits before the verdict logic",
+              True, not _dead, checks.WARN,
+              "; ".join(_dead)[:52] if _dead else "all cases reached it"))
 
 bad = 0
 for good, name, want, got, sev, detail in CASES:
