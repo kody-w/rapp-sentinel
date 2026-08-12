@@ -95,10 +95,37 @@ def url_check(cid, url, critical=False):
     return ok(cid, url) if s == 200 else fail(cid, f"HTTP {s} — {url}", critical)
 
 
+class _Sentinel:
+    def __init__(self, name):
+        self._name = name
+
+    def __repr__(self):
+        return self._name
+
+
+# "I could not read the run history" is not "this repo has never run anything".
+# gh() returns its default on ANY failure -- non-zero exit, timeout, unparseable
+# stdout -- so `if not runs: return None` made a blind instrument and a genuinely
+# empty repository the same value, and the callers below turned that value into a
+# claim ABOUT THE REPOSITORY: "30 active workflows produced no runs at all",
+# critical, which pages the repair arm. rappterbook has 40,000 runs; the sentence
+# was false every time a read merely failed, and it fired on 2026-08-10 and
+# 2026-08-12 with no runs missing either time.
+#
+# Same error the rest of this file has already been taught four times: #45 (a
+# dead PR API read as an empty queue), prove_blind_green (a dead instrument must
+# never read as green), #51 (do not spend repair budget on outages), #58 (a URL
+# outage is not a missing check). Absence still pages (#43) -- but only absence
+# we actually observed.
+UNREADABLE = _Sentinel("UNREADABLE")
+
+
 def workflows_failing_every_run(repo, limit=30, ignore=()):
     """Workflows that failed EVERY recent run. Ignores single flakes."""
     runs = gh(["run", "list", "-R", repo, "--limit", str(limit),
                "--json", "name,conclusion"], default=None)
+    if runs is None:
+        return UNREADABLE
     if not runs:
         return None
     per = {}
@@ -191,6 +218,8 @@ def workflows_never_succeeding(repo, limit=40, ignore=()):
     """
     runs = gh(["run", "list", "-R", repo, "--limit", str(limit),
                "--json", "name,conclusion"], default=None)
+    if runs is None:
+        return UNREADABLE
     if not runs:
         return None
     per = {}
@@ -525,6 +554,9 @@ def queue_draining():
 @check
 def workflows_healthy():
     broken = workflows_failing_every_run(RB)
+    if broken is UNREADABLE:
+        # Blind, not broken. Say so at warn: the repair arm cannot fix a read.
+        return fail("rb_workflows", "cannot read run history", critical=False)
     if broken is None:
         # Empty history is not health. Ask whether anything is SUPPOSED to run.
         names = active_workflows(RB)
@@ -548,6 +580,8 @@ def rb_workflows_never_succeed():
     check stayed green.
     """
     stuck = workflows_never_succeeding(RB)
+    if stuck is UNREADABLE:
+        return fail("rb_wf_starved", "cannot read run history", critical=False)
     if stuck is None:
         names = active_workflows(RB)
         if names is None:
