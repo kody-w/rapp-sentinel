@@ -423,7 +423,18 @@ def world_still_merging():
     merged since July 13th. 'The site returns 200' would never have caught it."""
     commits = gh(["api", f"repos/{RV}/commits?per_page=20", "--jq",
                   '[.[] | {msg:(.commit.message|split("\\n")[0]), d:.commit.committer.date}]'],
-                 default=[]) or []
+                 default=None)
+    # A history we could not READ is not a world that stopped. `default=[]` made
+    # a failed read and a frozen platform the same value, and the line below
+    # states that value as a fact about the platform -- the one sentence this
+    # sentinel exists to say. On 2026-08-13T18:30Z it said it while PR #6365 was
+    # nine minutes old and all twenty commits in the window were merges; the
+    # same tick could not read rappterverse's workflow list either. Warn, so a
+    # blind instrument never reads green (prove_blind_green) and never spends
+    # repair budget on an outage (#51). Observed absence still pages, below.
+    if commits is None:
+        return fail("rv_world_merging", "cannot read commit history",
+                    critical=False)
     merges = [c for c in commits if c["msg"].startswith("[state] apply PR")]
     if not merges:
         return fail("rv_world_merging", "no state merges in the last 20 commits")
@@ -442,7 +453,15 @@ GATE_STREAK = 4
 @check
 def action_gate_accepting():
     runs = gh(["run", "list", "-R", RV, "--workflow", "Validate Agent Action",
-               "--limit", "10", "--json", "conclusion,createdAt"], default=[]) or []
+               "--limit", "10", "--json", "conclusion,createdAt"], default=None)
+    # Same conflation as rv_world_merging above: an unreadable run list fell
+    # through to the zero-runs branch and, whenever the workflow list happened
+    # to read fine, paged "gate workflow is active but has zero runs". On
+    # 2026-08-13 both reads failed together so it landed on the honest wording
+    # below; had only this one failed it would have been a false critical.
+    if runs is None:
+        return fail("rv_validation", "cannot read gate run history",
+                    critical=False)
     if not runs:
         # "no recent runs" was reported as ok while the id claims the gate is
         # ACCEPTING. A gate with no runs is stopped. Distinguish deleted from
