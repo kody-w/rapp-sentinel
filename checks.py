@@ -678,19 +678,54 @@ def rb_content_moving():
     `materialized_at` proves Compute Trending ran AND wrote output rather than
     merely exiting 0, and `total_posts_analyzed` is the content counter behind
     the site.
+
+    Fetching that roll-up is not the same as judging it. One sample used to be
+    enough to page: on 2026-08-14T14:29Z a single SSL handshake timeout against
+    raw.githubusercontent.com reported "cannot read roll-up state" at CRITICAL
+    and woke the repair arm, while `rb_rollup_coverage` read THE SAME URL
+    successfully in THE SAME TICK and the roll-up was 0.6h old. Nothing had
+    stopped moving; one TCP connection died.
+
+    So the read is retried before it is believed, exactly as `outsider_can_join`
+    already does against this host, and an exhausted read is warn -- it means we
+    do not know whether content moved, which is not a repair the repair arm can
+    perform (#45, #51, #58, #59, #60). A roll-up that is served but does not say
+    when it was materialized is a different claim -- we read it and it is wrong
+    -- and still pages. Bytes that parse are `rb_json_parses`' job, not this one.
     """
     import json as _j
+    import time
     import urllib.request
     from datetime import datetime, timezone
     url = f"https://raw.githubusercontent.com/{RB}/main/state/trending.json"
+    attempts, meta, last = 3, None, ""
+    for i in range(attempts):
+        if i:
+            time.sleep(2 * i)
+        try:
+            req = urllib.request.Request(url,
+                                         headers={"User-Agent": "rapp-sentinel"})
+            # No explicit timeout: the module default is the reviewed one, and a
+            # call site that re-states a default silently owns it (#27).
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                meta = _j.loads(r.read().decode("utf-8")).get("_meta", {})
+            break
+        except Exception as e:
+            # "URLError" alone cannot separate a deleted roll-up from a dropped
+            # connection, and that string is the whole diagnosis the repair arm
+            # is woken with. Carry the reason.
+            last = f"{type(e).__name__}: {e}"
+    if meta is None:
+        return fail("rb_content_moving",
+                    f"cannot read roll-up state after {attempts} attempts: "
+                    f"{last[:80]}", critical=False)
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            meta = _j.loads(r.read().decode("utf-8")).get("_meta", {})
         stamp = meta.get("materialized_at") or meta["last_updated"]
         posts = int(meta.get("total_posts_analyzed", 0))
     except Exception as e:
-        return fail("rb_content_moving", f"cannot read roll-up state ({str(e)[:40]})")
+        return fail("rb_content_moving",
+                    f"roll-up served without a materialization stamp "
+                    f"({type(e).__name__}: {str(e)[:40]})")
     age_h = (datetime.now(timezone.utc)
              - datetime.fromisoformat(stamp.replace("Z", "+00:00"))).total_seconds() / 3600
     # Compute Trending runs every ~3-4h and each run commits. Observed worst
