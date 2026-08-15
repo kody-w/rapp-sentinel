@@ -182,6 +182,79 @@ class ServeRoutePolicyTests(unittest.TestCase):
                 self.assertEqual(b"", body)
 
 
+class SparseWorkflowSweepTests(unittest.TestCase):
+    def test_failed_sparse_workflow_cannot_fall_out_of_shared_window(self):
+        shared = [
+            {"name": "CI", "conclusion": "success"}
+            for _ in range(100)
+        ]
+        release = [
+            {"conclusion": "failure"},
+            {"conclusion": "failure"},
+            {"conclusion": "success"},
+            {"conclusion": "success"},
+        ]
+
+        def fake_gh(args, default=None):
+            if args[:2] == ["api", "repos/kody-w/openrappter/actions/workflows"]:
+                return ["CI", "Release"]
+            if "--workflow" in args:
+                self.assertEqual("Release", args[args.index("--workflow") + 1])
+                return release
+            return shared
+
+        with mock.patch.object(checks, "gh", side_effect=fake_gh):
+            result = checks.workflows_currently_broken(
+                "kody-w/openrappter", streak=4)
+
+        self.assertEqual(2, result["Release"]["streak"])
+        self.assertEqual(4, result["Release"]["of"])
+        self.assertTrue(result["Release"]["insufficient_window"])
+        self.assertTrue(result["Release"]["sparse"])
+
+    def test_sparse_workflow_with_latest_success_is_not_flagged(self):
+        shared = [{"name": "CI", "conclusion": "success"}] * 100
+
+        def fake_gh(args, default=None):
+            if args[:2] == ["api", "repos/kody-w/openrappter/actions/workflows"]:
+                return ["CI", "Release"]
+            if "--workflow" in args:
+                return [
+                    {"conclusion": "success"},
+                    {"conclusion": "failure"},
+                ]
+            return shared
+
+        with mock.patch.object(checks, "gh", side_effect=fake_gh):
+            result = checks.workflows_currently_broken(
+                "kody-w/openrappter", streak=4)
+
+        self.assertNotIn("Release", result)
+
+    def test_sparse_detail_reports_newest_failure_streak(self):
+        with mock.patch.object(
+                checks, "declared_repos",
+                return_value=["kody-w/openrappter"]), \
+                mock.patch.object(checks, "DEEPLY_CHECKED", set()), \
+                mock.patch.object(
+                    checks, "workflows_currently_broken",
+                    return_value={
+                        "Release": {
+                            "streak": 2,
+                            "of": 4,
+                            "failed": 2,
+                            "insufficient_window": True,
+                            "sparse": True,
+                        },
+                    }), \
+                mock.patch.object(checks, "_write_coverage_receipt"):
+            result = checks.ecosystem_not_silently_broken()
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Release (newest 2 failed; 4 runs inspected)",
+                      result["detail"])
+
+
 class OutboxAttachmentTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
