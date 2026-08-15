@@ -1,4 +1,10 @@
+import http.client
+import json
+import socketserver
+import subprocess
+import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -6,8 +12,10 @@ from pathlib import Path
 from unittest import mock
 
 import checks
+import health
 import nightwatch
 import outbox
+import serve
 import standup
 
 
@@ -61,20 +69,114 @@ class PortableReportTests(unittest.TestCase):
             self.assertTrue((root / "shared" / token_names.pop()).is_file())
 
 
+class ServeRoutePolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.root = root
+        (root / "dashboard").mkdir(parents=True, exist_ok=True)
+        (root / "logs").mkdir(parents=True, exist_ok=True)
+        (root / "public").mkdir(parents=True, exist_ok=True)
+        (root / "state" / "shared-reports").mkdir(parents=True, exist_ok=True)
+        (root / "state").mkdir(parents=True, exist_ok=True)
+        (root / "dashboard" / "index.html").write_text(
+            "<html><body>dashboard ok</body></html>", encoding="utf-8")
+        (root / "logs" / "decision.log").write_text(
+            "decision transcript", encoding="utf-8")
+        (root / "public" / "sentinel-head.json").write_text(
+            '{"schema":"rapp-sentinel-head/1.0"}', encoding="utf-8")
+        (root / "state" / "private.json").write_text("{}", encoding="utf-8")
+        self.shared_name = "tokenized-report.html"
+        (root / "state" / "shared-reports" / self.shared_name).write_text(
+            "<html>shared</html>", encoding="utf-8")
+
+        self.old = (serve.HOME, serve.DASH, serve.LOGS, serve.SHARED_REPORTS)
+        serve.HOME = root
+        serve.DASH = root / "dashboard"
+        serve.LOGS = root / "logs"
+        serve.SHARED_REPORTS = root / "state" / "shared-reports"
+        self.rebuild_patcher = mock.patch.object(serve, "rebuild")
+        self.rebuild = self.rebuild_patcher.start()
+
+        socketserver.TCPServer.allow_reuse_address = True
+        self.httpd = socketserver.TCPServer(("127.0.0.1", 0), serve.Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(
+            target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=3)
+        self.rebuild_patcher.stop()
+        serve.HOME, serve.DASH, serve.LOGS, serve.SHARED_REPORTS = self.old
+        self.temp.cleanup()
+
+    def _request(self, method, path):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request(method, path)
+            resp = conn.getresponse()
+            body = resp.read()
+            return resp.status, dict(resp.getheaders()), body
+        finally:
+            conn.close()
+
+    def test_private_routes_require_loopback_for_get_and_head(self):
+        not_loopback = mock.Mock()
+        not_loopback.is_loopback = False
+        with mock.patch.object(
+                serve.ipaddress, "ip_address", return_value=not_loopback):
+            for method in ("GET", "HEAD"):
+                for path in ("/", "/logs/decision.log", "/state/private.json",
+                             "/sentinel-head.json"):
+                    status, _, _ = self._request(method, path)
+                    self.assertEqual(404, status, f"{method} {path}")
+
+    def test_shared_tokenized_report_allows_get_and_head(self):
+        not_loopback = mock.Mock()
+        not_loopback.is_loopback = False
+        with mock.patch.object(
+                serve.ipaddress, "ip_address", return_value=not_loopback):
+            for method in ("GET", "HEAD"):
+                status, headers, body = self._request(
+                    method, f"/share/{self.shared_name}")
+                self.assertEqual(200, status, method)
+                self.assertEqual("text/html; charset=utf-8",
+                                 headers["Content-Type"])
+                self.assertEqual("private, no-store", headers["Cache-Control"])
+                self.assertEqual(b"" if method == "HEAD" else b"<html>shared</html>",
+                                 body)
+
+    def test_loopback_dashboard_still_serves(self):
+        for method in ("GET", "HEAD"):
+            status, _, body = self._request(method, "/")
+            self.assertEqual(200, status, method)
+            if method == "GET":
+                self.assertIn(b"dashboard ok", body)
+            else:
+                self.assertEqual(b"", body)
+
+
 class OutboxAttachmentTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.old = (
-            outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS)
+            outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
+            outbox.LOCK, outbox.DRAIN_LOCK)
         outbox.QUEUE = root / "outbox.jsonl"
         outbox.SENT = root / "sent.jsonl"
         outbox.LAST_DRAIN = root / "last.json"
         outbox.REPORTS = root / "reports"
+        outbox.LOCK = root / "outbox.lock"
+        outbox.DRAIN_LOCK = root / "outbox-drain.lock"
         outbox.REPORTS.mkdir()
 
     def tearDown(self):
-        outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS = self.old
+        (outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
+         outbox.LOCK, outbox.DRAIN_LOCK) = self.old
         self.temp.cleanup()
 
     def test_drain_passes_attachment_and_cleans_generated_snapshot(self):
@@ -113,6 +215,39 @@ class OutboxAttachmentTests(unittest.TestCase):
             script.index("set attachmentFile to (POSIX file attachmentPath) as alias"),
             script.index('tell application "Messages"', script.index("repeat with")),
         )
+
+    def test_drain_keeps_enqueue_from_another_process(self):
+        outbox.enqueue("first", "recipient")
+        cmd = "\n".join([
+            "import outbox",
+            "from pathlib import Path",
+            f"outbox.QUEUE = Path({str(outbox.QUEUE)!r})",
+            f"outbox.SENT = Path({str(outbox.SENT)!r})",
+            f"outbox.LAST_DRAIN = Path({str(outbox.LAST_DRAIN)!r})",
+            f"outbox.REPORTS = Path({str(outbox.REPORTS)!r})",
+            f"outbox.LOCK = Path({str(outbox.LOCK)!r})",
+            f"outbox.DRAIN_LOCK = Path({str(outbox.DRAIN_LOCK)!r})",
+            "outbox.enqueue('late', 'recipient')",
+        ])
+
+        injected = {"done": False}
+
+        def fake_send(_text, _to, _attachments=None):
+            if not injected["done"]:
+                injected["done"] = True
+                subprocess.run(
+                    [sys.executable, "-c", cmd],
+                    check=True,
+                    cwd=str(Path(outbox.__file__).resolve().parent),
+                )
+            return True, ""
+
+        with mock.patch.object(outbox, "_send", side_effect=fake_send):
+            sent, kept, why = outbox.drain(limit=1)
+
+        self.assertEqual((1, 1, ""), (sent, kept, why))
+        pending = outbox._pending()
+        self.assertEqual(["late"], [m["text"] for m in pending])
 
 
 class MeaningfulActivityTests(unittest.TestCase):
@@ -216,6 +351,29 @@ class RappterbookDerivedTruthTests(unittest.TestCase):
         with mock.patch.object(checks, "public_json", side_effect=documents):
             result = checks.rb_derived_state_tells_the_truth()
         self.assertTrue(result["ok"])
+
+
+class CompletenessRegressionTests(unittest.TestCase):
+    def test_missing_required_check_still_fails_critical(self):
+        required = json.loads(
+            (health.HOME / "required_checks.json").read_text(encoding="utf-8")
+        )["required"]
+        self.assertIn("w_checks_complete", required)
+        self.assertGreater(len(required), 1)
+
+        missing = next(cid for cid in required if cid != "w_checks_complete")
+        results = [{
+            "id": cid,
+            "ok": True,
+            "severity": checks.WARN,
+            "detail": "",
+            "produced_by": "test",
+        } for cid in required if cid not in {missing, "w_checks_complete"}]
+
+        verdict = health.check_completeness(results)
+        self.assertFalse(verdict["ok"])
+        self.assertEqual(checks.CRITICAL, verdict["severity"])
+        self.assertIn(missing, verdict["detail"])
 
 
 class MessageContentTests(unittest.TestCase):

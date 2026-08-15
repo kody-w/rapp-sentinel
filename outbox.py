@@ -31,6 +31,9 @@ import time
 import subprocess
 import sys
 import zipfile
+import fcntl
+import os
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -40,6 +43,8 @@ STATE.mkdir(exist_ok=True)
 QUEUE = STATE / "outbox.jsonl"
 SENT = STATE / "outbox-sent.jsonl"
 REPORTS = STATE / "reports"
+LOCK = STATE / "outbox.lock"
+DRAIN_LOCK = STATE / "outbox-drain.lock"
 
 SEND_TIMEOUT = 25   # a hang is the failure mode; fail fast and leave it queued
 
@@ -85,20 +90,50 @@ def _prepare_attachment(raw):
     return archive
 
 
+@contextmanager
+def _locked(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _queue_lines_unlocked():
+    if not QUEUE.exists():
+        return []
+    return [line for line in QUEUE.read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+
+
+def _rewrite_queue_unlocked(lines):
+    """Atomic rewrite so appenders never lose their writes."""
+    QUEUE.parent.mkdir(parents=True, exist_ok=True)
+    data = "".join(line + "\n" for line in lines)
+    tmp = QUEUE.with_name(f"{QUEUE.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    try:
+        tmp.write_text(data, encoding="utf-8")
+        os.replace(tmp, QUEUE)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def enqueue(text, to, attachments=None):
     """Never blocks, never raises. A queued message is a kept message."""
     paths = [str(_prepare_attachment(p)) for p in (attachments or [])]
-    with open(QUEUE, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps({"at": now(), "to": to, "text": text,
-                             "attachments": paths},
-                            ensure_ascii=False) + "\n")
+    line = json.dumps({
+        "at": now(), "to": to, "text": text, "attachments": paths
+    }, ensure_ascii=False)
+    with _locked(LOCK):
+        with open(QUEUE, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
 
 
 def _pending():
-    if not QUEUE.exists():
-        return []
-    return [json.loads(l) for l in QUEUE.read_text(encoding="utf-8").splitlines()
-            if l.strip()]
+    with _locked(LOCK):
+        return [json.loads(line) for line in _queue_lines_unlocked()]
 
 
 CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
@@ -225,28 +260,41 @@ def _cleanup_attachments(message):
 def drain(limit=20):
     """Send what is queued. Stops at the first failure — if this context cannot
     send one message it cannot send any, and retrying just burns time."""
-    pending = _pending()
-    if not pending:
-        return 0, 0, "empty"
+    with _locked(DRAIN_LOCK):
+        with _locked(LOCK):
+            snapshot_lines = _queue_lines_unlocked()
+        if not snapshot_lines:
+            return 0, 0, "empty"
+        pending = [json.loads(line) for line in snapshot_lines]
 
-    sent, why = 0, ""
-    for i, m in enumerate(pending):
-        if sent >= limit:
-            break
-        ok, err = _send(m["text"], m["to"], m.get("attachments"))
-        if not ok:
-            why = err
-            break
-        sent += 1
-        with open(SENT, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps({**m, "sent_at": now()}, ensure_ascii=False) + "\n")
-        _cleanup_attachments(m)
+        sent, why = 0, ""
+        for m in pending:
+            if sent >= limit:
+                break
+            ok, err = _send(m["text"], m["to"], m.get("attachments"))
+            if not ok:
+                why = err
+                break
+            sent += 1
+            with open(SENT, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({**m, "sent_at": now()}, ensure_ascii=False) + "\n")
+            _cleanup_attachments(m)
 
-    kept = pending[sent:]
-    QUEUE.write_text("".join(json.dumps(m, ensure_ascii=False) + "\n" for m in kept),
-                     encoding="utf-8")
-    _record_drain(sent, len(kept), why)
-    return sent, len(kept), why
+        with _locked(LOCK):
+            current_lines = _queue_lines_unlocked()
+            if current_lines[:len(snapshot_lines)] == snapshot_lines:
+                # Keep unsent snapshot entries plus anything appended in parallel.
+                kept_lines = (snapshot_lines[sent:]
+                              + current_lines[len(snapshot_lines):])
+                _rewrite_queue_unlocked(kept_lines)
+            else:
+                # Another writer changed queue shape unexpectedly; preserve
+                # current queue to avoid dropping anything.
+                kept_lines = current_lines
+                _rewrite_queue_unlocked(kept_lines)
+
+        _record_drain(sent, len(kept_lines), why)
+        return sent, len(kept_lines), why
 
 
 LAST_DRAIN = QUEUE.parent / "outbox-last-drain.json"
