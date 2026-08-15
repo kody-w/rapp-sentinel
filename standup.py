@@ -308,10 +308,10 @@ def render(hours=14):
     if ob.get("pending"):
         p.append(f'<div class="banner bad"><strong>{ob["pending"]} text(s) undelivered'
                  f'{" — oldest " + str(int(ob["oldest_minutes"])) + "m" if ob.get("oldest_minutes") else ""}.'
-                 f'</strong> osascript cannot reach Messages from a background context '
-                 f'without Automation permission. Run <code>python3 outbox.py drain</code> '
-                 f'from a terminal, or grant it in System Settings &rarr; Privacy &amp; '
-                 f'Security &rarr; Automation. Until then alerts are queued, not sent.</div>')
+                 f'</strong> The persistent Aqua-session outbox drainer has not cleared '
+                 f'the queue. Run <code>python3 outbox.py drain</code> from a terminal '
+                 f'and inspect <code>logs/outbox-drain.err.log</code>. Until then alerts '
+                 f'are queued, not sent.</div>')
 
     if s.get("unsealed_repairs"):
         rows = "".join(
