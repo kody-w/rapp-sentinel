@@ -504,8 +504,6 @@ def world_is_meaningfully_active():
     if len(recent) >= 20 and actor_count < 3:
         findings.append(
             f"only {actor_count} actor(s) in the last {len(recent)} actions")
-    if len(recent) >= 20 and type_count < 2:
-        findings.append(f"only {type_count} action type(s)")
     if recent and signatures:
         signature, count = signatures.most_common(1)[0]
         if len(recent) >= 20 and count / len(recent) >= 0.9:

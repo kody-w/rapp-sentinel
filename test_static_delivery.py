@@ -150,6 +150,23 @@ class MeaningfulActivityTests(unittest.TestCase):
             result = checks.world_is_meaningfully_active()
         self.assertTrue(result["ok"])
 
+    def test_single_type_bulk_phase_with_many_actors_passes(self):
+        fresh = datetime.now(timezone.utc).isoformat()
+        actions = [{
+            "agentId": f"teacher-{index:03d}",
+            "type": "teach",
+            "data": {"studentId": f"student-{index:03d}", "skill": "art"},
+        } for index in range(100)]
+        documents = [
+            ({"actions": actions, "_meta": {"lastUpdate": fresh}}, ""),
+            ({"messages": [{"id": "new"}], "_meta": {"lastUpdate": fresh}}, ""),
+            ({"agents": [], "_meta": {"lastUpdate": fresh}}, ""),
+        ]
+        with mock.patch.object(checks, "public_json", side_effect=documents):
+            result = checks.world_is_meaningfully_active()
+        self.assertTrue(result["ok"])
+        self.assertIn("50 actors, 1 action types", result["detail"])
+
     def test_old_duplicate_queue_fails_below_depth_threshold(self):
         old = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
         prs = [
