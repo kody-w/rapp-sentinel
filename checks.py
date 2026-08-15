@@ -300,6 +300,13 @@ def public_json(repo, path, attempts=2):
     return None, last
 
 
+def real_posts_analyzed(meta):
+    """Real discussion count, excluding explicitly synthetic sidecars."""
+    return int(
+        meta.get("real_posts_analyzed",
+                 meta.get("total_posts_analyzed", 0)) or 0)
+
+
 def declared_repos():
     """What direction.json says this sentinel cares about.
 
@@ -825,7 +832,7 @@ def rb_content_moving():
                     f"{last[:80]}", critical=False)
     try:
         stamp = meta.get("materialized_at") or meta["last_updated"]
-        posts = int(meta.get("total_posts_analyzed", 0))
+        posts = real_posts_analyzed(meta)
     except Exception as e:
         return fail("rb_content_moving",
                     f"roll-up served without a materialization stamp "
@@ -865,8 +872,7 @@ def rb_derived_state_tells_the_truth():
                     critical=False)
 
     reported_posts = int(stats.get("total_posts") or 0)
-    analyzed_posts = int(
-        (trending.get("_meta") or {}).get("total_posts_analyzed") or 0)
+    analyzed_posts = real_posts_analyzed(trending.get("_meta") or {})
     summary = analytics.get("summary") or {}
     total_comments = int(summary.get("total_comments") or 0)
     reply_rate = float(summary.get("reply_rate_pct") or 0)
@@ -964,9 +970,8 @@ def rb_rollup_covers_corpus():
     Coverage is policy-proof. When the platform is quiet, the analyzed count
     and the real corpus hold still TOGETHER and the ratio stays 1.0. The ratio
     only falls when the roll-up is computing the site's rankings from
-    materially less than the platform contains -- which is true today, because
-    scrape_discussions.py caps the scrape at 8000 while 15754 discussions
-    exist, discarding the OLDEST ones (the scrape is CREATED_AT DESC).
+    materially less than the platform contains. `real_posts_analyzed` is used
+    when present so synthetic sidecar posts do not inflate corpus coverage.
     """
     import json as _j
     import urllib.request
@@ -975,7 +980,7 @@ def rb_rollup_covers_corpus():
         req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
         with urllib.request.urlopen(req, timeout=25) as r:
             meta = _j.loads(r.read().decode("utf-8")).get("_meta", {})
-        analyzed = int(meta.get("total_posts_analyzed", 0))
+        analyzed = real_posts_analyzed(meta)
     except Exception as e:
         return fail("rb_rollup_coverage", f"cannot read roll-up state ({str(e)[:40]})")
     q = ('{repository(owner:"%s",name:"%s")'
