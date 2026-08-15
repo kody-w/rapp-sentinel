@@ -257,6 +257,11 @@ def _cleanup_attachments(message):
             pass
 
 
+def _append_sent(message):
+    with open(SENT, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({**message, "sent_at": now()}, ensure_ascii=False) + "\n")
+
+
 def drain(limit=20):
     """Send what is queued. Stops at the first failure — if this context cannot
     send one message it cannot send any, and retrying just burns time."""
@@ -268,6 +273,7 @@ def drain(limit=20):
         pending = [json.loads(line) for line in snapshot_lines]
 
         sent, why = 0, ""
+        sent_messages = []
         for m in pending:
             if sent >= limit:
                 break
@@ -275,11 +281,15 @@ def drain(limit=20):
             if not ok:
                 why = err
                 break
+            try:
+                _append_sent(m)
+            except OSError as e:
+                why = f"sent ledger write failed: {type(e).__name__}: {e}"
+                break
             sent += 1
-            with open(SENT, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps({**m, "sent_at": now()}, ensure_ascii=False) + "\n")
-            _cleanup_attachments(m)
+            sent_messages.append(m)
 
+        cleanup_after_commit = []
         with _locked(LOCK):
             current_lines = _queue_lines_unlocked()
             if current_lines[:len(snapshot_lines)] == snapshot_lines:
@@ -287,11 +297,15 @@ def drain(limit=20):
                 kept_lines = (snapshot_lines[sent:]
                               + current_lines[len(snapshot_lines):])
                 _rewrite_queue_unlocked(kept_lines)
+                cleanup_after_commit = list(sent_messages)
             else:
                 # Another writer changed queue shape unexpectedly; preserve
                 # current queue to avoid dropping anything.
                 kept_lines = current_lines
                 _rewrite_queue_unlocked(kept_lines)
+
+        for message in cleanup_after_commit:
+            _cleanup_attachments(message)
 
         _record_drain(sent, len(kept_lines), why)
         return sent, len(kept_lines), why
