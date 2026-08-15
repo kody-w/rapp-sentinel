@@ -54,6 +54,11 @@ DEFAULTS = {
         "rappterverse": str(Path.home() / "Documents/GitHub/rappterverse"),
         "rappterbook": str(Path.home() / "Documents/GitHub/rappterbook"),
     },
+    "contribution_targets": [
+        "https://github.com/kody-w/public-art-collective",
+        "https://github.com/kody-w/rappterbook",
+        "https://github.com/kody-w/rappterverse",
+    ],
 }
 
 
@@ -99,7 +104,15 @@ def notify(cfg, text):
         return
     try:
         import outbox
-        outbox.enqueue(text, to)
+        attachments = []
+        try:
+            import standup
+            attachments = [standup.portable_snapshot(rebuild=False)]
+        except Exception as e:
+            log(f"static report generation failed: {type(e).__name__}: {e}")
+        suffix = ("\n\nStatic HTML report attached." if attachments
+                  else "\n\nStatic HTML report generation failed; alert preserved.")
+        outbox.enqueue(text + suffix, to, attachments)
         outbox.drain()
     except Exception as e:
         log(f"notify failed: {e}")
@@ -172,9 +185,9 @@ code, run read-only commands only.
 # them measures something GitHub runs on our behalf, so during an outage their
 # failure is a report about GitHub, not about us (#50).
 GITHUB_DEPENDENT = {
-    "rv_validation", "rv_world_merging", "rv_pr_queue",
+    "rv_validation", "rv_world_merging", "rv_meaningful_activity", "rv_pr_queue",
     "rb_workflows", "rb_wf_starved", "rb_shards",
-    "rb_content_moving", "rb_rollup_coverage", "eco_sweep",
+    "rb_content_moving", "rb_derived_truth", "rb_rollup_coverage", "eco_sweep",
 }
 
 
@@ -218,10 +231,12 @@ Repo checkouts (may be stale — always fetch origin/main before reading):
 
 Check id meanings:
   rv_world_merging  rappterverse stopped merging [state] apply PR commits
+  rv_meaningful_activity commits continue but the world lacks fresh, diverse activity
   rv_validation     the Validate Agent Action gate is rejecting work
   rv_pr_queue       the action PR queue is backing up instead of draining
   rb_workflows      listed workflows failed every recent run
   rb_shards         derived cache shards stopped regenerating
+  rb_derived_truth  published counters or engagement analytics disagree
   ch_*              the RAPP Vision channel is not serving
   w_*               a watcher (brainstem / openrappter / this sentinel) is down
 
@@ -266,12 +281,14 @@ WHERE YOU ARE
 
 Everything the neighborhood watches is currently healthy. Nothing is on fire.
 
-SOMETHING YOU BELONG TO
-Your operator is a member of a public commons at
-https://github.com/kody-w/public-art-collective — a standalone public RAPP
-neighborhood. Read its README and its existing submissions yourself to learn
-what membership there involves and what members do. Do not take my word for
-any of it; the repo is the authority, not this prompt.
+PLACES YOU MAY CONTRIBUTE
+{contribution_targets}
+
+These include the existing public-art commons and the two platforms this
+neighborhood keeps alive. Read each target's own instructions and public
+participation path. Choose at most ONE place and ONE contribution this turn.
+Repairs stay in the repair path; this is participation, not owner maintenance.
+Do not take this prompt's description as authority — each repository is.
 
 HARD CONSTRAINTS
 1. NEVER work in an existing checkout. Use a fresh `git worktree` or a clone in
@@ -309,6 +326,8 @@ def evolve(cfg, slug):
         nb_purpose=NB.NEIGHBORHOOD["purpose"],
         peers=", ".join(f"{k} ({'alive' if v['alive'] else 'stale'})"
                         for k, v in roll.items() if k != slug),
+        contribution_targets="\n".join(
+            f"  - {target}" for target in cfg.get("contribution_targets", [])),
     )
     # One model, the best available, for every neighbor. Differences between
     # neighbors must come from role, memory and vantage — not from which
