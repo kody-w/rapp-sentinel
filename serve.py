@@ -12,7 +12,7 @@ Tokenized static snapshots under /share/ are the sole exception. The server
 binds all private interfaces so a phone can read one unguessable frozen report;
 all dashboard, log, and public-head routes still reject non-loopback clients.
 
-  python3 serve.py            # http://localhost:8787
+  python3 serve.py            # http://localhost:9797
   python3 serve.py --port N
 """
 
@@ -67,25 +67,38 @@ class Handler(http.server.SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=str(HOME), **kw)
 
-    def do_GET(self):
+    def _send_file(self, target, content_type, *, send_body=True,
+                   cache_control=None, allow_origin=None):
+        if not target.is_file():
+            self.send_error(404)
+            return
+        body = target.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        if cache_control:
+            self.send_header("Cache-Control", cache_control)
+        if allow_origin:
+            self.send_header("Access-Control-Allow-Origin", allow_origin)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if send_body:
+            self.wfile.write(body)
+
+    def _serve(self, *, send_body):
         path = self.path.split("?")[0]
         client = ipaddress.ip_address(self.client_address[0])
 
         if path.startswith("/share/"):
             target = (SHARED_REPORTS / path.removeprefix("/share/")).resolve()
             if (SHARED_REPORTS.resolve() not in target.parents
-                    or target.suffix != ".html"
-                    or not target.is_file()):
+                    or target.suffix != ".html"):
                 self.send_error(404)
                 return
-            body = target.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "private, no-store")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+            return self._send_file(
+                target, "text/html; charset=utf-8",
+                cache_control="private, no-store",
+                send_body=send_body,
+            )
 
         if not client.is_loopback:
             self.send_error(404)
@@ -100,36 +113,38 @@ class Handler(http.server.SimpleHTTPRequestHandler):
                     pass
             rebuild(hours)
             self.path = "/dashboard/index.html"
-            return super().do_GET()
+            if send_body:
+                return super().do_GET()
+            return super().do_HEAD()
 
         # the head this neighborhood publishes for outside neighbors
         if path == "/sentinel-head.json":
             target = HOME / "public" / "sentinel-head.json"
-            if not target.is_file():
-                self.send_error(404); return
-            body = target.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers(); self.wfile.write(body); return
+            return self._send_file(
+                target, "application/json",
+                allow_origin="*",
+                send_body=send_body,
+            )
 
         # transcripts: linked from the report, so they must be reachable over
         # http — a file:// link from an http page is blocked by the browser
         if path.startswith("/logs/"):
             target = (HOME / path.lstrip("/")).resolve()
-            if LOGS.resolve() not in target.parents or not target.is_file():
+            if LOGS.resolve() not in target.parents:
                 self.send_error(404)
                 return
-            body = target.read_bytes()
-            self.send_response(200)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
+            return self._send_file(
+                target, "text/plain; charset=utf-8", send_body=send_body)
 
-        return super().do_GET()
+        if send_body:
+            return super().do_GET()
+        return super().do_HEAD()
+
+    def do_GET(self):
+        self._serve(send_body=True)
+
+    def do_HEAD(self):
+        self._serve(send_body=False)
 
     def log_message(self, *a):
         pass  # a watchdog that spams its own log is not helping
