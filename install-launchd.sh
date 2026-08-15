@@ -30,3 +30,14 @@ sed "s|__DIR__|$DIR|g; s|__HOME__|$HOME|g" "$DIR/$NLABEL.plist.template" > "$NPL
 launchctl unload "$NPLIST" 2>/dev/null || true
 launchctl load "$NPLIST"
 echo "loaded $NLABEL — texts a play-by-play every 90 min"
+
+# Messages automation is safe from the logged-in Aqua session, but nightwatch
+# itself stays queue-only so a hidden TCC prompt can never wedge report
+# generation. This short, serialized job owns delivery of everything queued.
+OLABEL="com.rapp.outbox-drain"
+OPLIST="$HOME/Library/LaunchAgents/$OLABEL.plist"
+sed "s|__DIR__|$DIR|g; s|__HOME__|$HOME|g" \
+  "$DIR/$OLABEL.plist.template" > "$OPLIST"
+launchctl unload "$OPLIST" 2>/dev/null || true
+launchctl load "$OPLIST"
+echo "loaded $OLABEL — drains queued iMessage reports every 5 min"

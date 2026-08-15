@@ -1,5 +1,6 @@
 import http.client
 import json
+import plistlib
 import socketserver
 import subprocess
 import sys
@@ -67,6 +68,28 @@ class PortableReportTests(unittest.TestCase):
             token_names = {url.rsplit("/", 1)[-1] for url in urls}
             self.assertEqual(1, len(token_names))
             self.assertTrue((root / "shared" / token_names.pop()).is_file())
+
+    def test_outbox_launchd_drainer_contract(self):
+        root = Path(__file__).resolve().parent
+        payload = plistlib.loads(
+            (root / "com.rapp.outbox-drain.plist.template").read_bytes())
+        self.assertEqual("com.rapp.outbox-drain", payload["Label"])
+        self.assertEqual(
+            ["/usr/bin/python3", "__DIR__/outbox.py", "drain"],
+            payload["ProgramArguments"],
+        )
+        self.assertEqual("Aqua", payload["LimitLoadToSessionType"])
+        self.assertTrue(payload["RunAtLoad"])
+        self.assertLessEqual(payload["StartInterval"], 300)
+        self.assertIn("outbox-drain.out.log", payload["StandardOutPath"])
+        self.assertIn("outbox-drain.err.log", payload["StandardErrorPath"])
+
+    def test_install_script_loads_outbox_drainer(self):
+        root = Path(__file__).resolve().parent
+        script = (root / "install-launchd.sh").read_text(encoding="utf-8")
+        self.assertIn('OLABEL="com.rapp.outbox-drain"', script)
+        self.assertIn('$DIR/$OLABEL.plist.template', script)
+        self.assertIn('launchctl load "$OPLIST"', script)
 
 
 class ServeRoutePolicyTests(unittest.TestCase):

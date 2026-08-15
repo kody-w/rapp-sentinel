@@ -1154,6 +1154,8 @@ def alerts_can_actually_reach_you():
         return ok("alert_delivery", "no queued alerts")
     if age and age > 180:
         return fail("alert_delivery",
-                    f"{n} alert(s) undelivered for {age:.0f}m — grant Automation "
-                    f"permission or run `python3 outbox.py drain`", critical=False)
-    return ok("alert_delivery", f"{n} queued, {age:.0f}m old (drains on next check-in)")
+                    f"{n} alert(s) undelivered for {age:.0f}m — persistent "
+                    f"outbox drainer stalled; run `python3 outbox.py drain`",
+                    critical=False)
+    return ok("alert_delivery",
+              f"{n} queued, {age:.0f}m old (persistent drain within 5 min)")

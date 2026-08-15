@@ -75,6 +75,11 @@ cp config.example.json config.json    # start at level 0
 ./morning                             # read the overnight shift report
 ```
 
+The installer also loads an Aqua-session outbox drainer every five minutes.
+Background reporters remain queue-only; the drainer is the single serialized
+process allowed to drive Messages, so reports survive both producer failures
+and reboot without waiting for a terminal command.
+
 ---
 
 ## Write your checks
