@@ -44,17 +44,24 @@ SEND_TIMEOUT = 25   # a hang is the failure mode; fail fast and leave it queued
 
 APPLESCRIPT = '''
 on run argv
+  set messageText to item 1 of argv
+  set recipientHandle to item 2 of argv
   tell application "Messages"
     set svc to 1st account whose service type = iMessage
-    set recipient to participant (item 2 of argv) of svc
-    if (item 1 of argv) is not "" then
-      send (item 1 of argv) to recipient
+    set recipient to participant recipientHandle of svc
+    if messageText is not "" then
+      send messageText to recipient
     end if
-    repeat with itemIndex from 3 to count of argv
-      set attachmentFile to POSIX file (item itemIndex of argv)
-      send attachmentFile to recipient
-    end repeat
   end tell
+  repeat with itemIndex from 3 to count of argv
+    set attachmentPath to item itemIndex of argv
+    set attachmentFile to (POSIX file attachmentPath) as alias
+    tell application "Messages"
+      set svc to 1st account whose service type = iMessage
+      set recipient to participant recipientHandle of svc
+      send attachmentFile to recipient
+    end tell
+  end repeat
 end run
 '''
 

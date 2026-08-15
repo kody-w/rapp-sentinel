@@ -70,6 +70,13 @@ class OutboxAttachmentTests(unittest.TestCase):
         outbox.enqueue("summary", "recipient", [outbox.REPORTS / "missing.html"])
         self.assertEqual(1, outbox.status()["missing_attachments"])
 
+    def test_applescript_coerces_files_outside_messages_context(self):
+        script = outbox.APPLESCRIPT
+        self.assertLess(
+            script.index("set attachmentFile to (POSIX file attachmentPath) as alias"),
+            script.index('tell application "Messages"', script.index("repeat with")),
+        )
+
 
 class MeaningfulActivityTests(unittest.TestCase):
     def test_single_repetitive_actor_and_stale_chat_fail(self):
