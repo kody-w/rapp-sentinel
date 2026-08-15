@@ -16,6 +16,7 @@ quiet night should be cheap to read, not padded to look like work.
 """
 
 import json
+import math
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -26,7 +27,6 @@ import neighborhood as NB
 HOME = Path(__file__).resolve().parent
 STATE = HOME / "state"
 MARK = STATE / "last_report.json"
-DASH = "http://localhost:9797"
 
 
 def cfg():
@@ -45,7 +45,7 @@ def parse(u):
     return None
 
 
-def send(text, to):
+def send(text, to, attachment):
     """Queue first, then attempt delivery.
 
     Under launchd, osascript blocks forever on a TCC prompt nobody can see, so
@@ -53,7 +53,7 @@ def send(text, to):
     means the worst case is a delayed message, never a missing one.
     """
     import outbox
-    outbox.enqueue(text, to)
+    outbox.enqueue(text, to, [attachment])
     if "--queue-only" in sys.argv:
         # launchd invokes it this way on purpose. Attempting a send from a
         # background context does not merely fail — it wedges Messages for
@@ -145,7 +145,7 @@ def build(since):
         lines.append(f"Stale watcher: {', '.join(stale)} — not reporting.")
 
     lines.append("")
-    lines.append(DASH)
+    lines.append("Static HTML shift report attached.")
     return "\n".join(lines), bool(broken or cut or not events)
 
 
@@ -177,7 +177,16 @@ def main():
         print(text)
         return 0
 
-    outcome, reason = send(text, to)
+    span_hours = max(2, math.ceil(
+        (datetime.now(timezone.utc) - since).total_seconds() / 3600))
+    try:
+        import standup
+        attachment = standup.portable_snapshot(span_hours)
+    except Exception as e:
+        print(f"report snapshot failed: {type(e).__name__}: {e}")
+        return 1
+
+    outcome, reason = send(text, to, attachment)
     print(f"{outcome}=1 to={to}" + (f" reason={reason}" if reason else ""))
     # "queued" advances the mark as well as "sent": a queued message WILL be
     # delivered by the next permitted context, and not advancing would make the

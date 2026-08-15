@@ -38,6 +38,7 @@ STATE = HOME / "state"
 STATE.mkdir(exist_ok=True)
 QUEUE = STATE / "outbox.jsonl"
 SENT = STATE / "outbox-sent.jsonl"
+REPORTS = STATE / "reports"
 
 SEND_TIMEOUT = 25   # a hang is the failure mode; fail fast and leave it queued
 
@@ -45,7 +46,14 @@ APPLESCRIPT = '''
 on run argv
   tell application "Messages"
     set svc to 1st account whose service type = iMessage
-    send (item 1 of argv) to participant (item 2 of argv) of svc
+    set recipient to participant (item 2 of argv) of svc
+    if (item 1 of argv) is not "" then
+      send (item 1 of argv) to recipient
+    end if
+    repeat with itemIndex from 3 to count of argv
+      set attachmentFile to POSIX file (item itemIndex of argv)
+      send attachmentFile to recipient
+    end repeat
   end tell
 end run
 '''
@@ -55,10 +63,12 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def enqueue(text, to):
+def enqueue(text, to, attachments=None):
     """Never blocks, never raises. A queued message is a kept message."""
+    paths = [str(Path(p).expanduser().resolve()) for p in (attachments or [])]
     with open(QUEUE, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps({"at": now(), "to": to, "text": text},
+        fh.write(json.dumps({"at": now(), "to": to, "text": text,
+                             "attachments": paths},
                             ensure_ascii=False) + "\n")
 
 
@@ -100,7 +110,30 @@ def _delivered_count(to):
         return None
 
 
-def _send(text, to):
+def _delivered_attachment_count(to, transfer_name):
+    """Delivered outgoing attachments with this filename for the recipient."""
+    if not CHAT_DB.exists():
+        return None
+    try:
+        con = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute(
+                "SELECT COUNT(*) FROM attachment a"
+                " JOIN message_attachment_join j ON j.attachment_id = a.ROWID"
+                " JOIN message m ON m.ROWID = j.message_id"
+                " JOIN handle h ON m.handle_id = h.ROWID"
+                " WHERE h.id = ? AND m.is_from_me = 1 AND m.is_sent = 1"
+                " AND m.error = 0 AND (a.transfer_name = ? OR a.filename LIKE ?)",
+                (to, transfer_name, f"%/{transfer_name}"),
+            ).fetchone()
+        finally:
+            con.close()
+        return int(row[0]) if row else None
+    except Exception:
+        return None
+
+
+def _send(text, to, attachments=None):
     """Send, then prove it landed.
 
     osascript exiting 0 is not delivery. Measured against an unroutable handle:
@@ -117,10 +150,20 @@ def _send(text, to):
     the return code -- an unverifiable send is still better attempted than
     dropped.
     """
+    attachment_paths = [Path(p) for p in (attachments or [])]
+    missing = [p.name for p in attachment_paths if not p.is_file()]
+    if missing:
+        return False, "attachment missing: " + ", ".join(missing)
+
     before = _delivered_count(to)
+    attachment_before = {
+        p.name: _delivered_attachment_count(to, p.name)
+        for p in attachment_paths
+    }
     try:
-        p = subprocess.run(["osascript", "-", text, to], input=APPLESCRIPT,
-                           capture_output=True, text=True, timeout=SEND_TIMEOUT)
+        p = subprocess.run(
+            ["osascript", "-", text, to, *[str(path) for path in attachment_paths]],
+            input=APPLESCRIPT, capture_output=True, text=True, timeout=SEND_TIMEOUT)
     except subprocess.TimeoutExpired:
         # the launchd signature: blocked on a permission prompt nobody can see
         return False, "osascript timed out (no Automation permission in this context)"
@@ -129,15 +172,32 @@ def _send(text, to):
 
     if p.returncode != 0:
         return False, p.stderr.strip()[:160]
-    if before is None:
+    if before is None or any(v is None for v in attachment_before.values()):
         return True, "sent (delivery unverifiable: chat.db unreadable)"
 
-    for _ in range(12):                      # ~3s, in 250ms steps
-        if (_delivered_count(to) or 0) > before:
+    for _ in range(40):                      # attachments can take longer to index
+        text_landed = not text or (_delivered_count(to) or 0) > before
+        files_landed = all(
+            (_delivered_attachment_count(to, name) or 0) > count
+            for name, count in attachment_before.items()
+        )
+        if text_landed and files_landed:
             return True, ""
         time.sleep(0.25)
-    return False, (f"osascript exited 0 but chat.db recorded no SENT message for {to} "
-                   f"within 3s (a failed send still writes a row) - staying queued")
+    return False, (f"osascript exited 0 but chat.db did not record the complete "
+                   f"text/attachment delivery for {to} within 10s - staying queued")
+
+
+def _cleanup_attachments(message):
+    """Delete only generated report snapshots after confirmed delivery."""
+    root = REPORTS.resolve()
+    for raw in message.get("attachments", []):
+        try:
+            path = Path(raw).resolve()
+            if root in path.parents:
+                path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 def drain(limit=20):
@@ -151,13 +211,14 @@ def drain(limit=20):
     for i, m in enumerate(pending):
         if sent >= limit:
             break
-        ok, err = _send(m["text"], m["to"])
+        ok, err = _send(m["text"], m["to"], m.get("attachments"))
         if not ok:
             why = err
             break
         sent += 1
         with open(SENT, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({**m, "sent_at": now()}, ensure_ascii=False) + "\n")
+        _cleanup_attachments(m)
 
     kept = pending[sent:]
     QUEUE.write_text("".join(json.dumps(m, ensure_ascii=False) + "\n" for m in kept),
@@ -202,7 +263,11 @@ def last_drain():
 def status():
     pending = _pending()
     last = last_drain()
-    base = {"last_drain": last}
+    missing = sum(
+        1 for message in pending for raw in message.get("attachments", [])
+        if not Path(raw).is_file()
+    )
+    base = {"last_drain": last, "missing_attachments": missing}
     if not pending:
         return {**base, "pending": 0, "oldest_minutes": None}
     oldest = min(datetime.fromisoformat(m["at"]) for m in pending)
@@ -217,7 +282,7 @@ if __name__ == "__main__":
         print(f"sent={sent} still_queued={kept}" + (f" reason={why}" if why else ""))
         sys.exit(0 if kept == 0 else 1)
     elif cmd == "enqueue":
-        enqueue(sys.argv[2], sys.argv[3])
+        enqueue(sys.argv[2], sys.argv[3], sys.argv[4:])
         print("queued")
     else:
         print(json.dumps(status(), indent=2))

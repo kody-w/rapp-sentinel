@@ -31,6 +31,7 @@ HOME = Path(__file__).resolve().parent
 OUT = HOME / "dashboard"
 OUT.mkdir(exist_ok=True)
 LOGS = HOME / "logs"
+REPORTS = HOME / "state" / "reports"
 
 def _cfg():
     p = HOME / "config.json"
@@ -441,6 +442,61 @@ def render(hours=14):
 
     (OUT / "index.html").write_text("".join(p), encoding="utf-8")
     return s, verified
+
+
+def portable_snapshot(hours=14, rebuild=True):
+    """Write an immutable report that remains readable away from localhost."""
+    if rebuild or not (OUT / "index.html").is_file():
+        render(hours)
+    page = (OUT / "index.html").read_text(encoding="utf-8")
+    page = re.sub(r'<meta http-equiv="refresh"[^>]*>', "", page)
+
+    transcripts = []
+
+    def inline_transcript(match):
+        name = Path(match.group(1)).name
+        target = LOGS / name
+        anchor = "transcript-" + re.sub(r"[^a-zA-Z0-9_-]", "-", name)
+        if target.is_file():
+            transcripts.append((anchor, name, target.read_text(
+                encoding="utf-8", errors="replace")))
+            return f'href="#{anchor}"'
+        return 'href="#missing-local-transcript"'
+
+    page = re.sub(r'href="/logs/([^"]+)"', inline_transcript, page)
+    mobile = """
+<style>
+@media(max-width:640px){
+  .wrap{padding:20px 14px 48px}h1{font-size:31px;line-height:1.1}
+  table{display:block;overflow-x:auto;font-size:13px}.cards{grid-template-columns:1fr 1fr}
+}
+details{margin:10px 0;border:1px solid rgba(20,20,19,.14);border-radius:8px;padding:10px}
+summary{cursor:pointer;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.45}
+</style>"""
+    page = page.replace("</head>", mobile + "</head>")
+    page = page.replace(
+        "auto-refresh 5 min · nothing here is stored twice",
+        "portable static snapshot · nothing here is stored twice",
+    )
+    if transcripts:
+        detail = ["<h2>Decision transcripts</h2>",
+                  '<p class="sub">Embedded so this file works without the local dashboard.</p>']
+        for anchor, name, text in transcripts:
+            detail.append(
+                f'<details id="{esc(anchor)}"><summary>{esc(name)}</summary>'
+                f'<pre>{esc(text)}</pre></details>')
+        page = page.replace("<footer", "".join(detail) + "<footer", 1)
+
+    REPORTS.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    target = REPORTS / f"neighborhood-watch-{stamp}.html"
+    suffix = 1
+    while target.exists():
+        target = REPORTS / f"neighborhood-watch-{stamp}-{suffix}.html"
+        suffix += 1
+    target.write_text(page, encoding="utf-8")
+    return target
 
 
 if __name__ == "__main__":

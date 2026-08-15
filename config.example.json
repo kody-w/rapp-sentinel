@@ -8,6 +8,11 @@
   "copilot_model": "claude-opus-5",
   "copilot_timeout_s": 900,
   "evolve_timeout_s": 1800,
+  "contribution_targets": [
+    "https://github.com/kody-w/public-art-collective",
+    "https://github.com/kody-w/rappterbook",
+    "https://github.com/kody-w/rappterverse"
+  ],
   "watch_repos": [
     "kody-w/rappterverse",
     "kody-w/rappterbook",

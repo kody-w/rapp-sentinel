@@ -27,6 +27,7 @@ import pathlib as _pathlib
 import subprocess
 import urllib.error
 import urllib.request
+from collections import Counter
 from datetime import datetime, timezone
 
 TIMEOUT = 25
@@ -281,6 +282,24 @@ DEEPLY_CHECKED = {RV, RB}
 CHANNEL = "https://kody-w.github.io/rappvision-field-notes"
 
 
+def public_json(repo, path, attempts=2):
+    """Read public state with a short retry; return (document, error)."""
+    import time
+    last = ""
+    url = f"https://raw.githubusercontent.com/{repo}/main/{path}"
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(attempt)
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "rapp-sentinel"})
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as response:
+                return json.loads(response.read().decode("utf-8")), ""
+        except Exception as exc:
+            last = f"{type(exc).__name__}: {exc}"
+    return None, last
+
+
 def declared_repos():
     """What direction.json says this sentinel cares about.
 
@@ -444,6 +463,71 @@ def world_still_merging():
             else fail("rv_world_merging", f"last merge {h:.1f}h ago"))
 
 
+@check
+def world_is_meaningfully_active():
+    """Commits are not life when one bot repeats one action forever."""
+    actions_doc, actions_error = public_json(RV, "state/actions.json")
+    chat_doc, chat_error = public_json(RV, "state/chat.json")
+    agents_doc, agents_error = public_json(RV, "state/agents.json")
+    unreadable = [
+        name for name, doc in (
+            ("actions", actions_doc), ("chat", chat_doc), ("agents", agents_doc))
+        if doc is None
+    ]
+    if unreadable:
+        errors = "; ".join(
+            error for error in (actions_error, chat_error, agents_error) if error)
+        return fail("rv_meaningful_activity",
+                    f"cannot read {', '.join(unreadable)} state: {errors[:160]}",
+                    critical=False)
+
+    actions = actions_doc.get("actions", [])
+    messages = chat_doc.get("messages", [])
+    recent = actions[-50:]
+    actors = Counter(str(row.get("agentId") or "") for row in recent)
+    types = Counter(str(row.get("type") or "") for row in recent)
+    signatures = Counter(
+        (str(row.get("agentId") or ""), str(row.get("type") or ""),
+         json.dumps(row.get("data") or {}, sort_keys=True))
+        for row in recent
+    )
+    findings = []
+    actor_count = len([actor for actor in actors if actor])
+    type_count = len([kind for kind in types if kind])
+    if len(recent) >= 20 and actor_count < 3:
+        findings.append(
+            f"only {actor_count} actor(s) in the last {len(recent)} actions")
+    if len(recent) >= 20 and type_count < 2:
+        findings.append(f"only {type_count} action type(s)")
+    if recent and signatures:
+        signature, count = signatures.most_common(1)[0]
+        if len(recent) >= 20 and count / len(recent) >= 0.9:
+            findings.append(
+                f"{count}/{len(recent)} actions repeat "
+                f"{signature[0]} {signature[1]}")
+
+    chat_age = hours_since((chat_doc.get("_meta") or {}).get("lastUpdate"))
+    agent_age = hours_since((agents_doc.get("_meta") or {}).get("lastUpdate"))
+    if chat_age is None:
+        findings.append("chat has no readable lastUpdate")
+    elif chat_age >= 24:
+        findings.append(f"chat stale {chat_age:.1f}h")
+    if agent_age is None:
+        findings.append("agent state has no readable lastUpdate")
+    elif agent_age >= 24:
+        findings.append(f"agent state stale {agent_age:.1f}h")
+    if not messages:
+        findings.append("chat has no messages")
+
+    if findings:
+        return fail("rv_meaningful_activity", "; ".join(findings))
+    return ok(
+        "rv_meaningful_activity",
+        f"{actor_count} actors, {type_count} action types in last {len(recent)}; "
+        f"chat {chat_age:.1f}h old; agents {agent_age:.1f}h old",
+    )
+
+
 # Consecutive newest failures before the gate counts as rejecting work. The
 # gate runs on roughly a 30min cadence, so 4 in a row is ~2h of refusing
 # everything -- the same order of patience as the 3h staleness bar below.
@@ -561,13 +645,33 @@ def action_gate_accepting():
 def queue_draining():
     """679 PRs once piled up behind a broken gate. A queue that only grows is
     the same failure as a dead queue, and neither shows up as an error."""
-    n = gh(["api", "--paginate", f"repos/{RV}/pulls?state=open&per_page=100",
-            "--jq", "length"], default=None)
-    if not isinstance(n, int):
+    prs = gh(["pr", "list", "-R", RV, "--state", "open", "--limit", "1000",
+              "--json", "number,title,createdAt"], default=None)
+    if not isinstance(prs, list):
         # default=0 made a dead API indistinguishable from an empty queue, and
         # an empty queue is the healthiest possible reading (#45).
         return fail("rv_pr_queue", "cannot read the PR queue", critical=False)
-    return ok("rv_pr_queue", f"{n} open PRs") if n < 40 else fail("rv_pr_queue", f"{n} open PRs")
+    n = len(prs)
+    if not prs:
+        return ok("rv_pr_queue", "empty")
+    oldest = min(prs, key=lambda pr: pr.get("createdAt") or "")
+    oldest_age = hours_since(oldest.get("createdAt"))
+    titles = Counter(str(pr.get("title") or "") for pr in prs)
+    repeated_title, repeated = titles.most_common(1)[0]
+    findings = []
+    if n >= 40:
+        findings.append(f"{n} open PRs")
+    if oldest_age is None:
+        findings.append("oldest PR has no readable creation time")
+    elif oldest_age >= 6:
+        findings.append(
+            f"oldest PR #{oldest['number']} has waited {oldest_age:.1f}h")
+    if n >= 5 and repeated / n >= 0.8:
+        findings.append(
+            f"{repeated}/{n} queued PRs repeat {repeated_title[:80]}")
+    if findings:
+        return fail("rv_pr_queue", "; ".join(findings))
+    return ok("rv_pr_queue", f"{n} open PRs, oldest {oldest_age:.1f}h")
 
 
 @check
@@ -736,6 +840,63 @@ def rb_content_moving():
     if posts <= 0:
         return fail("rb_content_moving", "roll-up reports zero posts analyzed")
     return ok("rb_content_moving", f"roll-up {age_h:.1f}h old, {posts} posts")
+
+
+@check
+def rb_derived_state_tells_the_truth():
+    """A fresh roll-up must not publish mutually impossible counters."""
+    stats, stats_error = public_json(RB, "state/stats.json")
+    trending, trending_error = public_json(RB, "state/trending.json")
+    analytics, analytics_error = public_json(RB, "state/analytics.json")
+    posted, posted_error = public_json(RB, "state/posted_log.json")
+    unreadable = [
+        name for name, doc in (
+            ("stats", stats), ("trending", trending),
+            ("analytics", analytics), ("posted_log", posted))
+        if doc is None
+    ]
+    if unreadable:
+        errors = "; ".join(
+            error for error in (
+                stats_error, trending_error, analytics_error, posted_error)
+            if error)
+        return fail("rb_derived_truth",
+                    f"cannot read {', '.join(unreadable)}: {errors[:160]}",
+                    critical=False)
+
+    reported_posts = int(stats.get("total_posts") or 0)
+    analyzed_posts = int(
+        (trending.get("_meta") or {}).get("total_posts_analyzed") or 0)
+    summary = analytics.get("summary") or {}
+    total_comments = int(summary.get("total_comments") or 0)
+    reply_rate = float(summary.get("reply_rate_pct") or 0)
+    thread_depth = float(summary.get("avg_thread_depth") or 0)
+    recent_posts = posted.get("posts") or []
+    commented_posts = sum(
+        1 for post in recent_posts if int(post.get("commentCount") or 0) > 0)
+
+    findings = []
+    if analyzed_posts and reported_posts < analyzed_posts * 0.9:
+        findings.append(
+            f"stats reports {reported_posts} posts while roll-up analyzed "
+            f"{analyzed_posts}")
+    if total_comments and commented_posts and reply_rate == 0:
+        findings.append(
+            f"analytics reports 0% reply rate despite {commented_posts} "
+            f"commented retained posts")
+    if total_comments and commented_posts:
+        expected_depth = round(total_comments / commented_posts, 1)
+        if abs(thread_depth - expected_depth) > max(1.0, expected_depth * 0.5):
+            findings.append(
+                f"analytics thread depth {thread_depth:.1f} disagrees with "
+                f"{total_comments} comments across {commented_posts} threads")
+    if findings:
+        return fail("rb_derived_truth", "; ".join(findings))
+    return ok(
+        "rb_derived_truth",
+        f"{reported_posts} reported / {analyzed_posts} analyzed posts; "
+        f"reply rate {reply_rate:.1f}%; depth {thread_depth:.1f}",
+    )
 
 
 @check
@@ -962,8 +1123,13 @@ def alerts_can_actually_reach_you():
     except Exception as e:
         return fail("alert_delivery", f"outbox unreadable: {e}", critical=False)
     n, age = st.get("pending", 0), st.get("oldest_minutes")
+    missing = int(st.get("missing_attachments") or 0)
     last = st.get("last_drain") or {}
     why = (last.get("why") or "").strip()
+    if missing:
+        return fail("alert_delivery",
+                    f"{missing} queued static report attachment(s) are missing",
+                    critical=False)
 
     # A drain that failed already knows which failure it was. Waiting 180
     # minutes to mention it wastes the one piece of information that says what
