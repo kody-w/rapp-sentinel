@@ -45,7 +45,7 @@ def parse(u):
     return None
 
 
-def send(text, to, attachment):
+def send(text, to):
     """Queue first, then attempt delivery.
 
     Under launchd, osascript blocks forever on a TCC prompt nobody can see, so
@@ -53,7 +53,7 @@ def send(text, to, attachment):
     means the worst case is a delayed message, never a missing one.
     """
     import outbox
-    outbox.enqueue(text, to, [attachment])
+    outbox.enqueue(text, to)
     if "--queue-only" in sys.argv:
         # launchd invokes it this way on purpose. Attempting a send from a
         # background context does not merely fail — it wedges Messages for
@@ -144,8 +144,6 @@ def build(since):
         lines.append("")
         lines.append(f"Stale watcher: {', '.join(stale)} — not reporting.")
 
-    lines.append("")
-    lines.append("Static HTML shift report attached as a ZIP for Messages compatibility.")
     return "\n".join(lines), bool(broken or cut or not events)
 
 
@@ -181,12 +179,16 @@ def main():
         (datetime.now(timezone.utc) - since).total_seconds() / 3600))
     try:
         import standup
-        attachment = standup.portable_snapshot(span_hours)
+        snapshot = standup.portable_snapshot(span_hours)
+        urls = standup.publish_snapshot(snapshot)
+        if not urls:
+            raise RuntimeError("no private network address available")
     except Exception as e:
         print(f"report snapshot failed: {type(e).__name__}: {e}")
         return 1
 
-    outcome, reason = send(text, to, attachment)
+    text += "\n\nStatic HTML report:\n" + "\n".join(urls)
+    outcome, reason = send(text, to)
     print(f"{outcome}=1 to={to}" + (f" reason={reason}" if reason else ""))
     # "queued" advances the mark as well as "sent": a queued message WILL be
     # delivered by the next permitted context, and not advancing would make the

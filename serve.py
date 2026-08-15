@@ -8,11 +8,16 @@ Local only. It binds 127.0.0.1 deliberately: the report names internal state,
 links to full run transcripts, and exists to be trusted — none of which should
 be reachable from anywhere but this machine.
 
+Tokenized static snapshots under /share/ are the sole exception. The server
+binds all private interfaces so a phone can read one unguessable frozen report;
+all dashboard, log, and public-head routes still reject non-loopback clients.
+
   python3 serve.py            # http://localhost:8787
   python3 serve.py --port N
 """
 
 import http.server
+import ipaddress
 import socketserver
 import subprocess
 import sys
@@ -23,6 +28,7 @@ from pathlib import Path
 HOME = Path(__file__).resolve().parent
 DASH = HOME / "dashboard"
 LOGS = HOME / "logs"
+SHARED_REPORTS = HOME / "state" / "shared-reports"
 PORT = 9797
 # Don't rebuild on every asset request — a page load fires several.
 MIN_REBUILD_INTERVAL = 20
@@ -63,6 +69,27 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
+        client = ipaddress.ip_address(self.client_address[0])
+
+        if path.startswith("/share/"):
+            target = (SHARED_REPORTS / path.removeprefix("/share/")).resolve()
+            if (SHARED_REPORTS.resolve() not in target.parents
+                    or target.suffix != ".html"
+                    or not target.is_file()):
+                self.send_error(404)
+                return
+            body = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "private, no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if not client.is_loopback:
+            self.send_error(404)
+            return
 
         if path in ("/", "/index.html"):
             hours = 14
@@ -120,6 +147,6 @@ if __name__ == "__main__":
                        capture_output=True, timeout=180, cwd=str(HOME))
     rebuild()
     socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
+    with socketserver.TCPServer(("0.0.0.0", port), Handler) as httpd:
         print(f"neighborhood watch → http://localhost:{port}")
         httpd.serve_forever()

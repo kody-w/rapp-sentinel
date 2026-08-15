@@ -213,10 +213,10 @@ Reads the chains — it keeps **no log of its own**, because a dashboard with a 
 
 Every claim links to evidence: commits to GitHub, contributions to their source, and each autonomous decision to the full local transcript of the run that produced it.
 
-Periodic Messages updates attach an immutable static HTML snapshot of this
-report inside a ZIP (Messages rejects raw HTML attachments). The HTML embeds
-local decision transcripts, so it remains readable on a phone that cannot
-reach `localhost:9797`; the localhost URL is never sent as the report.
+Periodic Messages updates link to an immutable, tokenized static HTML snapshot
+served only over the Mac's private Tailscale/LAN addresses. The HTML embeds local
+decision transcripts, so it remains readable on a phone that cannot reach
+`localhost:9797`; dashboard and log routes remain loopback-only.
 
 ---
 

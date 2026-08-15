@@ -40,6 +40,26 @@ class PortableReportTests(unittest.TestCase):
             self.assertIn("verified transcript", page)
             self.assertIn("portable static snapshot", page)
 
+    def test_publish_snapshot_uses_tokenized_private_urls(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            snapshot = root / "report.html"
+            snapshot.write_text("<html>private</html>", encoding="utf-8")
+            old = standup.SHARED_REPORTS
+            standup.SHARED_REPORTS = root / "shared"
+            try:
+                with mock.patch.object(
+                        standup, "private_report_addresses",
+                        return_value=["100.64.1.2", "192.168.1.2"]):
+                    urls = standup.publish_snapshot(snapshot)
+            finally:
+                standup.SHARED_REPORTS = old
+            self.assertEqual(2, len(urls))
+            self.assertTrue(all("/share/" in url for url in urls))
+            token_names = {url.rsplit("/", 1)[-1] for url in urls}
+            self.assertEqual(1, len(token_names))
+            self.assertTrue((root / "shared" / token_names.pop()).is_file())
+
 
 class OutboxAttachmentTests(unittest.TestCase):
     def setUp(self):
@@ -185,7 +205,7 @@ class MessageContentTests(unittest.TestCase):
     def test_nightwatch_never_sends_localhost_link(self):
         source = Path(nightwatch.__file__).read_text(encoding="utf-8")
         self.assertNotIn("http://localhost:9797", source)
-        self.assertIn("Static HTML shift report attached as a ZIP", source)
+        self.assertIn("Static HTML report:", source)
 
     def test_repairs_render_as_repairs_instead_of_question_marks(self):
         outcome, transcript_kind = standup.action_outcome({
