@@ -148,6 +148,19 @@ def transcript_for(kind, slug, when):
     return best
 
 
+def action_outcome(payload):
+    """Normalize evolve and repair records into one reportable outcome."""
+    outcome = str(payload.get("outcome") or "").strip()
+    if outcome:
+        return outcome, "evolve"
+    result = str(payload.get("result") or "").strip()
+    act = str(payload.get("act") or "acted").upper()
+    if result:
+        return f"{act} — {result}", "escalation"
+    return json.dumps(payload, sort_keys=True), (
+        "escalation" if payload.get("act") else "evolve")
+
+
 # ── the shift ───────────────────────────────────────────────────────────────
 
 def shift(hours):
@@ -348,10 +361,13 @@ def render(hours=14):
     if acts:
         p.append('<table><tr><th>when</th><th>neighbor</th><th>outcome</th><th>evidence</th></tr>')
         for a in reversed(acts):
-            out = str(a["payload"].get("outcome", ""))
-            tag = "p-ok" if "CONTRIBUTED" in out else ("p-mut" if "DECLINED" in out else "p-bad")
+            out, transcript_kind = action_outcome(a["payload"])
+            upper = out.upper()
+            tag = ("p-ok" if any(word in upper for word in ("CONTRIBUTED", "FIXED"))
+                   else "p-mut" if any(word in upper for word in ("DECLINED", "NO_ACTION"))
+                   else "p-bad")
             word = out.split(",")[0].split("—")[0].strip()[:12] or "?"
-            t = transcript_for("evolve", a["slug"], a["when"])
+            t = transcript_for(transcript_kind, a["slug"], a["when"])
             # relative, not file:// — a file:// link from an http page is
             # blocked by the browser, and this report is served over http
             ev = (f'<a href="/logs/{t.name}">full transcript</a>' if t else
@@ -424,7 +440,7 @@ def render(hours=14):
             elif e["kind"] == "watcher.attested":
                 what = f'{"alive" if pay.get("alive") else "NOT ALIVE"} — {pay.get("detail", "")}'
             elif e["kind"] == "neighbor.acted":
-                what = str(pay.get("outcome", ""))[:120]
+                what = action_outcome(pay)[0][:120]
             else:
                 what = json.dumps(pay)[:110]
             p.append(f'<tr><td class="ev">{e["when"].astimezone():%H:%M:%S}</td>'

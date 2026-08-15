@@ -140,7 +140,11 @@ class RappterbookDerivedTruthTests(unittest.TestCase):
     def test_consistent_derived_state_passes(self):
         documents = [
             ({"total_posts": 16000}, ""),
-            ({"_meta": {"total_posts_analyzed": 16000}}, ""),
+            ({"_meta": {
+                "real_posts_analyzed": 16000,
+                "synthetic_posts_analyzed": 4000,
+                "total_posts_analyzed": 20000,
+            }}, ""),
             ({"summary": {
                 "total_comments": 4,
                 "reply_rate_pct": 50,
@@ -158,6 +162,15 @@ class MessageContentTests(unittest.TestCase):
         source = Path(nightwatch.__file__).read_text(encoding="utf-8")
         self.assertNotIn("http://localhost:9797", source)
         self.assertIn("Static HTML shift report attached.", source)
+
+    def test_repairs_render_as_repairs_instead_of_question_marks(self):
+        outcome, transcript_kind = standup.action_outcome({
+            "act": "repair",
+            "result": "FIXED — restored the write path",
+        })
+        self.assertEqual(
+            "REPAIR — FIXED — restored the write path", outcome)
+        self.assertEqual("escalation", transcript_kind)
 
 
 if __name__ == "__main__":
