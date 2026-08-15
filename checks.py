@@ -173,7 +173,10 @@ def workflows_currently_broken(repo, limit=100, streak=4, ignore=()):
     whether it is failing NOW and has been for a while -- a streak on the newest
     runs, not a count over all of them.
 
-    gh returns runs newest-first; this relies on that ordering.
+    gh returns runs newest-first; this relies on that ordering. Active
+    workflows absent from the shared repository window are probed separately:
+    otherwise a busy repo can push a low-frequency failed Release workflow
+    completely out of view and turn red into green.
     """
     runs = gh(["run", "list", "-R", repo, "--limit", str(limit),
                "--json", "name,conclusion"], default=None)
@@ -184,9 +187,52 @@ def workflows_currently_broken(repo, limit=100, streak=4, ignore=()):
         if r["name"] in ignore:
             continue
         per.setdefault(r["name"], []).append(r.get("conclusion"))
+
+    active = active_workflows(repo)
+    if active:
+        for name in active:
+            if name in ignore or name in per:
+                continue
+            history = gh([
+                "run", "list", "-R", repo,
+                "--workflow", name,
+                "--limit", str(streak),
+                "--json", "conclusion",
+            ], default=None)
+            if not history:
+                continue
+            conclusions = [
+                row.get("conclusion") for row in history
+                if row.get("conclusion")
+            ]
+            leading_failures = 0
+            for conclusion in conclusions:
+                if conclusion != "failure":
+                    break
+                leading_failures += 1
+            if leading_failures:
+                per[name] = conclusions
+
     out = {}
     for name, concl in per.items():
         recent = concl[:streak]
+        sparse = active and name in active and name not in {
+            r["name"] for r in runs if r["name"] not in ignore
+        }
+        if sparse and recent and recent[0] == "failure":
+            leading_failures = 0
+            for conclusion in recent:
+                if conclusion != "failure":
+                    break
+                leading_failures += 1
+            out[name] = {
+                "streak": leading_failures,
+                "of": len(recent),
+                "failed": sum(1 for c in recent if c == "failure"),
+                "insufficient_window": True,
+                "sparse": True,
+            }
+            continue
         if len(recent) < streak:
             # Too few runs inside the window to judge. That is NOT "fine", and
             # calling it fine is how openrappter's Ring workflow went from
@@ -427,8 +473,14 @@ def ecosystem_not_silently_broken():
         if thin:
             parts.append("thin failing history -- " + "; ".join(
                 f"{r.split('/')[-1]}: " + ", ".join(
-                    f"{name} ({meta.get('failed', meta.get('streak', '?'))}/"
-                    f"{meta.get('of', '?')} observed runs failed)"
+                    (
+                        f"{name} (newest {meta.get('streak', '?')} failed; "
+                        f"{meta.get('of', '?')} runs inspected)"
+                        if meta.get("sparse")
+                        else
+                        f"{name} ({meta.get('failed', meta.get('streak', '?'))}/"
+                        f"{meta.get('of', '?')} observed runs failed)"
+                    )
                     for name, meta in sorted(workflows)
                 )
                 for r, workflows in sorted(thin.items())))
