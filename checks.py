@@ -415,18 +415,23 @@ def ecosystem_not_silently_broken():
         confirmed, thin = {}, {}
         for r, wfs in broken.items():
             for name, meta in wfs.items():
-                target = thin if (isinstance(meta, dict)
-                                  and meta.get("insufficient_window")) else confirmed
-                target.setdefault(r, []).append(name)
+                if isinstance(meta, dict) and meta.get("insufficient_window"):
+                    thin.setdefault(r, []).append((name, meta))
+                else:
+                    confirmed.setdefault(r, []).append(name)
         parts = []
         if confirmed:
             parts.append("red streak in %d repo(s) -- " % len(confirmed) + "; ".join(
                 f"{r.split('/')[-1]}: {', '.join(sorted(w))}"
                 for r, w in sorted(confirmed.items())))
         if thin:
-            parts.append("too few runs to judge -- " + "; ".join(
-                f"{r.split('/')[-1]}: {', '.join(sorted(w))}"
-                for r, w in sorted(thin.items())))
+            parts.append("thin failing history -- " + "; ".join(
+                f"{r.split('/')[-1]}: " + ", ".join(
+                    f"{name} ({meta.get('failed', meta.get('streak', '?'))}/"
+                    f"{meta.get('of', '?')} observed runs failed)"
+                    for name, meta in sorted(workflows)
+                )
+                for r, workflows in sorted(thin.items())))
         detail = " | ".join(parts)
         # WARN, not CRITICAL. fail() defaults to critical, and critical is what
         # invokes the repair arm -- which knows rappterverse and rappterbook and
