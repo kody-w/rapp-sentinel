@@ -184,11 +184,66 @@ class OutboxAttachmentTests(unittest.TestCase):
         report.write_text("<html>report</html>", encoding="utf-8")
         outbox.enqueue("summary", "recipient", [report])
         queued = Path(outbox._pending()[0]["attachments"][0])
-        with mock.patch.object(outbox, "_send", return_value=(True, "")) as send:
+        rewrite_seen = {}
+        real_rewrite = outbox._rewrite_queue_unlocked
+
+        def wrapped_rewrite(lines):
+            rewrite_seen["attachment_present_during_commit"] = queued.exists()
+            return real_rewrite(lines)
+
+        with mock.patch.object(outbox, "_send", return_value=(True, "")) as send, \
+                mock.patch.object(
+                    outbox,
+                    "_rewrite_queue_unlocked",
+                    side_effect=wrapped_rewrite,
+                ):
             sent, kept, why = outbox.drain()
         self.assertEqual((1, 0, ""), (sent, kept, why))
         self.assertEqual([str(queued)], send.call_args.args[2])
+        self.assertTrue(rewrite_seen["attachment_present_during_commit"])
         self.assertFalse(report.exists())
+        self.assertFalse(queued.exists())
+
+    def test_sent_ledger_write_failure_keeps_head_and_attachment(self):
+        report = outbox.REPORTS / "ledger-failure.html"
+        report.write_text("<html>ledger-failure</html>", encoding="utf-8")
+        outbox.enqueue("summary", "recipient", [report])
+        queued = Path(outbox._pending()[0]["attachments"][0])
+
+        with mock.patch.object(outbox, "_send", return_value=(True, "")), \
+                mock.patch.object(
+                    outbox, "_append_sent", side_effect=OSError("ledger unavailable")
+                ):
+            sent, kept, why = outbox.drain()
+
+        self.assertEqual((0, 1), (sent, kept))
+        self.assertIn("sent ledger write failed", why)
+        self.assertTrue(queued.exists())
+        pending = outbox._pending()
+        self.assertEqual(1, len(pending))
+        self.assertEqual(str(queued), pending[0]["attachments"][0])
+
+    def test_queue_rewrite_failure_keeps_attachment_and_recovers(self):
+        report = outbox.REPORTS / "rewrite-failure.html"
+        report.write_text("<html>rewrite-failure</html>", encoding="utf-8")
+        outbox.enqueue("summary", "recipient", [report])
+        queued = Path(outbox._pending()[0]["attachments"][0])
+
+        with mock.patch.object(outbox, "_send", return_value=(True, "")), \
+                mock.patch.object(
+                    outbox.os, "replace", side_effect=OSError("rewrite failed")
+                ):
+            with self.assertRaises(OSError):
+                outbox.drain()
+
+        self.assertTrue(queued.exists())
+        self.assertEqual(1, len(outbox._pending()))
+
+        with mock.patch.object(outbox, "_send", return_value=(True, "")) as send:
+            sent, kept, why = outbox.drain()
+
+        self.assertEqual((1, 0, ""), (sent, kept, why))
+        self.assertEqual([str(queued)], send.call_args.args[2])
         self.assertFalse(queued.exists())
 
     def test_html_is_queued_as_a_zip_containing_the_static_file(self):
