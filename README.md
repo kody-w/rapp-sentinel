@@ -214,9 +214,9 @@ Reads the chains — it keeps **no log of its own**, because a dashboard with a 
 Every claim links to evidence: commits to GitHub, contributions to their source, and each autonomous decision to the full local transcript of the run that produced it.
 
 Periodic Messages updates attach an immutable static HTML snapshot of this
-report. The attachment embeds local decision transcripts, so it remains
-readable on a phone that cannot reach `localhost:9797`; the localhost URL is
-never sent as the report.
+report inside a ZIP (Messages rejects raw HTML attachments). The HTML embeds
+local decision transcripts, so it remains readable on a phone that cannot
+reach `localhost:9797`; the localhost URL is never sent as the report.
 
 ---
 
