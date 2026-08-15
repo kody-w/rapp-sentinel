@@ -18,10 +18,15 @@ a commit, a pull request, or the full local transcript of the run.
 """
 
 import html
+import ipaddress
 import json
 import re
+import secrets
+import shutil
+import socket
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -32,6 +37,7 @@ OUT = HOME / "dashboard"
 OUT.mkdir(exist_ok=True)
 LOGS = HOME / "logs"
 REPORTS = HOME / "state" / "reports"
+SHARED_REPORTS = HOME / "state" / "shared-reports"
 
 def _cfg():
     p = HOME / "config.json"
@@ -513,6 +519,54 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.45}
         suffix += 1
     target.write_text(page, encoding="utf-8")
     return target
+
+
+def private_report_addresses():
+    """Private addresses that can reach the Mac from the user's phone."""
+    candidates = []
+    try:
+        result = subprocess.run(
+            ["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            candidates.extend(result.stdout.splitlines())
+    except Exception:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))
+            candidates.append(probe.getsockname()[0])
+    except Exception:
+        pass
+    addresses = []
+    for candidate in candidates:
+        try:
+            address = ipaddress.ip_address(candidate.strip())
+        except ValueError:
+            continue
+        if address.version == 4 and not address.is_loopback:
+            value = str(address)
+            if value not in addresses:
+                addresses.append(value)
+    return addresses
+
+
+def publish_snapshot(snapshot, port=9797, max_age_hours=48):
+    """Publish one tokenized static report on private Mac network addresses."""
+    SHARED_REPORTS.mkdir(parents=True, exist_ok=True)
+    cutoff = time.time() - max_age_hours * 3600
+    for old in SHARED_REPORTS.glob("*.html"):
+        try:
+            if old.stat().st_mtime < cutoff:
+                old.unlink()
+        except OSError:
+            pass
+    token = secrets.token_urlsafe(24)
+    target = SHARED_REPORTS / f"{token}.html"
+    shutil.copy2(snapshot, target)
+    return [
+        f"http://{address}:{port}/share/{target.name}"
+        for address in private_report_addresses()
+    ]
 
 
 if __name__ == "__main__":
