@@ -30,6 +30,7 @@ import sqlite3
 import time
 import subprocess
 import sys
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -70,9 +71,23 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _prepare_attachment(raw):
+    """Wrap blocked HTML file types in a ZIP that preserves the static file."""
+    path = Path(raw).expanduser().resolve()
+    if not path.is_file():
+        return path
+    if path.suffix.lower() not in (".html", ".htm"):
+        return path
+    archive = path.with_suffix(path.suffix + ".zip")
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.write(path, arcname=path.name)
+    path.unlink()
+    return archive
+
+
 def enqueue(text, to, attachments=None):
     """Never blocks, never raises. A queued message is a kept message."""
-    paths = [str(Path(p).expanduser().resolve()) for p in (attachments or [])]
+    paths = [str(_prepare_attachment(p)) for p in (attachments or [])]
     with open(QUEUE, "a", encoding="utf-8") as fh:
         fh.write(json.dumps({"at": now(), "to": to, "text": text,
                              "attachments": paths},

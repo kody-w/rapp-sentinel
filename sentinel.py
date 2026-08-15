@@ -110,7 +110,7 @@ def notify(cfg, text):
             attachments = [standup.portable_snapshot(rebuild=False)]
         except Exception as e:
             log(f"static report generation failed: {type(e).__name__}: {e}")
-        suffix = ("\n\nStatic HTML report attached." if attachments
+        suffix = ("\n\nStatic HTML report attached as a ZIP." if attachments
                   else "\n\nStatic HTML report generation failed; alert preserved.")
         outbox.enqueue(text + suffix, to, attachments)
         outbox.drain()

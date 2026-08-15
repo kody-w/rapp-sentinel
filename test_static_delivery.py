@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -60,11 +61,27 @@ class OutboxAttachmentTests(unittest.TestCase):
         report = outbox.REPORTS / "report.html"
         report.write_text("<html>report</html>", encoding="utf-8")
         outbox.enqueue("summary", "recipient", [report])
+        queued = Path(outbox._pending()[0]["attachments"][0])
         with mock.patch.object(outbox, "_send", return_value=(True, "")) as send:
             sent, kept, why = outbox.drain()
         self.assertEqual((1, 0, ""), (sent, kept, why))
-        self.assertEqual([str(report.resolve())], send.call_args.args[2])
+        self.assertEqual([str(queued)], send.call_args.args[2])
         self.assertFalse(report.exists())
+        self.assertFalse(queued.exists())
+
+    def test_html_is_queued_as_a_zip_containing_the_static_file(self):
+        report = outbox.REPORTS / "phone-report.html"
+        report.write_text("<html>phone</html>", encoding="utf-8")
+
+        outbox.enqueue("summary", "recipient", [report])
+
+        queued = Path(outbox._pending()[0]["attachments"][0])
+        self.assertEqual(".zip", queued.suffix)
+        self.assertFalse(report.exists())
+        with zipfile.ZipFile(queued) as bundle:
+            self.assertEqual(["phone-report.html"], bundle.namelist())
+            self.assertEqual(
+                b"<html>phone</html>", bundle.read("phone-report.html"))
 
     def test_missing_attachment_is_visible(self):
         outbox.enqueue("summary", "recipient", [outbox.REPORTS / "missing.html"])
@@ -168,7 +185,7 @@ class MessageContentTests(unittest.TestCase):
     def test_nightwatch_never_sends_localhost_link(self):
         source = Path(nightwatch.__file__).read_text(encoding="utf-8")
         self.assertNotIn("http://localhost:9797", source)
-        self.assertIn("Static HTML shift report attached.", source)
+        self.assertIn("Static HTML shift report attached as a ZIP", source)
 
     def test_repairs_render_as_repairs_instead_of_question_marks(self):
         outcome, transcript_kind = standup.action_outcome({

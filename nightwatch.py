@@ -145,7 +145,7 @@ def build(since):
         lines.append(f"Stale watcher: {', '.join(stale)} — not reporting.")
 
     lines.append("")
-    lines.append("Static HTML shift report attached.")
+    lines.append("Static HTML shift report attached as a ZIP for Messages compatibility.")
     return "\n".join(lines), bool(broken or cut or not events)
 
 
