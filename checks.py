@@ -1341,6 +1341,92 @@ def derived_data_regenerating():
 
 
 @check
+def test_baseline_honest():
+    """A baseline is a claim with a timestamp AND an environment (#13).
+
+    'Matches the baseline' let a real regression through because the
+    baseline was a number in someone's head from two hours ago — and the
+    same commit measured 7, 10 or 0 failures depending on clone depth and
+    directory permissions. baseline.py records the NAMED failing set with
+    its environment stamp; this check reads those receipts every tick and
+    reports set drift — newly_failing and newly_passing by name, never a
+    count — plus the baseline's age, so nobody briefs an agent with a stale
+    number again.
+
+    Organism-safe by design: comparisons are heavy (full clone + suite) and
+    OPT-IN via the com.rapp.test-baseline plist. A compare receipt only
+    age-warns when it was written by the SCHEDULE (a scheduled instrument
+    that stops is dead, #45); an install that never opted in is reported as
+    exactly that, in the passing detail, not held at degraded forever —
+    a permanent warn would silently disable the evolve arm.
+    """
+    import baseline as B
+    try:
+        enrolled = B.enrollment()
+    except Exception as e:
+        return fail("w_test_baseline",
+                    f"enrollment unreadable: {type(e).__name__}", critical=False)
+    if not enrolled:
+        return ok("w_test_baseline", "no repos enrolled")
+    critical_regressions = False
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        critical_regressions = bool(cfg.get("baseline_regression_critical"))
+    except Exception:
+        pass
+    problems, notes = [], []
+    for slug in sorted(enrolled):
+        try:
+            base = json.loads(B.baseline_path(slug).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            problems.append(f"{slug}: no baseline recorded - run "
+                            f"`python3 baseline.py record {slug}`")
+            continue
+        except Exception as e:
+            problems.append(f"{slug}: baseline unreadable ({type(e).__name__})")
+            continue
+        age_h = hours_since(base.get("utc"))
+        if age_h is None or not isinstance(base.get("failures"), list):
+            problems.append(f"{slug}: baseline is undated or carries no "
+                            f"failure set - the exact defect #13 names")
+            continue
+        stamp = f"{slug}: baseline {age_h / 24:.1f}d old, " \
+                f"{len(base['failures'])} known-failing"
+        try:
+            comp = json.loads(B.compare_path(slug).read_text(encoding="utf-8"))
+        except Exception:
+            notes.append(stamp + ", never compared (opt-in schedule)")
+            continue
+        comp_age = hours_since(comp.get("utc"))
+        if comp.get("refused"):
+            problems.append(f"{slug}: refusing set comparison - "
+                            f"{comp['refused']}")
+            continue
+        newly_failing = comp.get("newly_failing") or []
+        if newly_failing:
+            problems.append(
+                f"{slug}: newly failing vs baseline "
+                f"{(base.get('commit') or '?')[:8]} ({base.get('utc')}): "
+                + ", ".join(newly_failing)
+                + (f"; newly passing: {', '.join(comp['newly_passing'])}"
+                   if comp.get("newly_passing") else ""))
+            continue
+        if comp.get("scheduled") and comp_age is not None and comp_age >= 48:
+            problems.append(f"{slug}: scheduled comparison stopped "
+                            f"{comp_age:.0f}h ago - dead instrument, not health")
+            continue
+        note = stamp + f", 0 newly failing (compared {comp_age:.1f}h ago)"
+        if comp.get("newly_passing"):
+            note += f", newly passing: {', '.join(comp['newly_passing'])}"
+        notes.append(note)
+    if problems:
+        return fail("w_test_baseline", "; ".join(problems + notes),
+                    critical=critical_regressions and any(
+                        "newly failing" in p for p in problems))
+    return ok("w_test_baseline", "; ".join(notes))
+
+
+@check
 def github_status_operational():
     """Distinguish OUR outage from GitHub's.
 
