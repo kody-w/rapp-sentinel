@@ -172,6 +172,11 @@ HARD CONSTRAINTS — these are not suggestions:
 5. If the fix needs a credential, a paid resource, or a judgement call about
    product direction, STOP and report instead of guessing.
 6. Never commit secrets. Never rewrite history. Never force-push main.
+7. When two inferences about the same cause have failed, stop inferring and
+   measure. Build or run the smallest thing that reports ground truth
+   (`python3 diagnose.py` prints the identity, scope and reachability of
+   every credential and endpoint, values never printed). An unverified
+   diagnosis is a guess wearing a lab coat.
 """
 
 DIAGNOSE_RULES = """
@@ -179,6 +184,34 @@ You are the diagnostic arm of an autonomous sentinel. You are READ-ONLY.
 Investigate the failure and report the root cause and the exact fix you would
 apply. Do NOT edit files, commit, push, or trigger workflows. Read logs, read
 code, run read-only commands only.
+When two inferences about the same cause have failed, stop inferring and
+measure: `python3 diagnose.py` reports the identity, scope and reachability
+of every credential and endpoint this loop depends on, values never printed.
+"""
+
+
+def method_change_block(attempt, last_result):
+    """The paragraph that breaks a repair out of a wrong-diagnosis loop (#4).
+
+    Three fixes landed in modules that were never on the call path because
+    each attempt re-inferred the same cause with more confidence. From the
+    second attempt on, the prompt carries the count and the prior result and
+    says the quiet part out loud: repeated failure of the same repair is
+    evidence the DIAGNOSIS is wrong, not that the fix needs another try.
+    Absent from attempt 1 on purpose — diluted into every prompt it would be
+    noise, and noise trains the reader to scroll past (#39's lesson, applied
+    to prompts).
+    """
+    if attempt < 2 or not last_result:
+        return ""
+    return f"""
+THIS IS ATTEMPT {attempt}. {attempt - 1} PRIOR ATTEMPT(S) DID NOT CLEAR IT.
+The previous attempt ended: {last_result[:300]}
+Repeated failure of the same repair is evidence the DIAGNOSIS is wrong — do
+NOT retry the previous method. Before proposing anything, measure: run
+`python3 diagnose.py` and reproduce the failure with the smallest direct
+probe you can build. If your new diagnosis matches the failed attempt's,
+that is a finding to report, not a fix to repeat.
 """
 
 
@@ -214,15 +247,21 @@ def github_degraded():
             and c.get("status") in ("major_outage", "partial_outage")]
 
 
-def escalate(cfg, verdict, failing, mode):
-    """Hand the failure to Copilot. Returns (ok, output)."""
+def escalate(cfg, verdict, failing, mode, attempt=1, last_result=None):
+    """Hand the failure to Copilot. Returns (ok, output).
+
+    `attempt` and `last_result` come from the issue record BEFORE this call,
+    so a repeat attempt carries its own history — the prompt used to be
+    byte-identical on attempts 1 through 3, which is how the same wrong
+    diagnosis got three confident retries (#4).
+    """
     rules = REPAIR_RULES if mode == "repair" else DIAGNOSE_RULES
     detail = "\n".join(
         f"  - {c['id']} [{c['severity']}]: {c['detail']}"
         for c in verdict["checks"] if not c["ok"]
     )
     prompt = f"""{rules}
-
+{method_change_block(attempt, last_result)}
 FAILING HEALTH CHECKS ({verdict['status']}):
 {detail}
 
@@ -560,10 +599,15 @@ def main():
         return 0
 
     mode = "repair" if level >= 2 else "diagnose"
-    ok, output = escalate(cfg, verdict, critical, mode)
+    # Read the record BEFORE escalating so the prompt carries its own attempt
+    # history (#4); the bookkeeping below stays where it was, so attempt
+    # accounting cannot double-count.
+    rec = issues.get(key, {"attempts": 0})
+    ok, output = escalate(cfg, verdict, critical, mode,
+                          attempt=rec["attempts"] + 1,
+                          last_result=rec.get("last_result"))
     verdict_line = result_line(output)
 
-    rec = issues.get(key, {"attempts": 0})
     rec["attempts"] += 1
     rec["last_attempt"] = now().isoformat(timespec="seconds")
     rec["last_result"] = verdict_line
@@ -618,6 +662,11 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["diagnose"]:
+        # Read-only dependency page (#4). Dispatched before the tick so the
+        # launchd entrypoint — which passes no arguments — is untouched.
+        import diagnose
+        sys.exit(diagnose.main())
     try:
         sys.exit(main())
     except Exception as e:

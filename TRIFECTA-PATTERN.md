@@ -248,6 +248,28 @@ not-success.
 
 ---
 
+## 6e. When two inferences have failed, stop inferring and measure
+
+Same register as situation-not-task, because it fails the same way: with
+confidence. A FORBIDDEN was diagnosed by reasoning three times — each fix
+landed in a module that was never on the call path, and the third wrong
+inference texted the owner asking for work that was not needed. The
+diagnostic that settled it took two minutes and was shorter than any of the
+wrong fixes.
+
+> **When two inferences about the same cause have failed, stop inferring and
+> measure.** Build the smallest thing that reports ground truth. An
+> unverified diagnosis is a guess wearing a lab coat.
+
+In this repo that is `python3 diagnose.py` — identity, scope and
+reachability of every credential and endpoint, values never printed — and
+the escalation prompt enforces it: from the second attempt on an issue, the
+prompt carries the attempt count and the prior result, and says that
+repeated failure of the same repair is evidence the *diagnosis* is wrong,
+not that the fix needs another try.
+
+---
+
 ## 7. Porting it to another machine or task
 
 Only three things are estate-specific. Everything else is the pattern.
