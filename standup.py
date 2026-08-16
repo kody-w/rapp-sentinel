@@ -31,8 +31,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import neighborhood as NB
+from paths import HOME
 
-HOME = Path(__file__).resolve().parent
 OUT = HOME / "dashboard"
 OUT.mkdir(exist_ok=True)
 LOGS = HOME / "logs"

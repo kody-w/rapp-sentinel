@@ -16,11 +16,9 @@ import os
 import subprocess
 import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
 import checks as C
-
-HOME = Path(__file__).resolve().parent
+from paths import CODE, HOME
 
 
 def _run(cmd, timeout=15):
@@ -55,7 +53,9 @@ def _brainstem_answers_turns():
     except urllib.error.HTTPError as e:
         return C.fail("w_brainstem", f"/chat HTTP {e.code}", critical=False)
     except Exception as e:
-        return C.fail("w_brainstem", f"/chat unreachable: {type(e).__name__}", critical=False)
+        return C.fail("w_brainstem",
+                      f"/chat unreachable: {type(e).__name__}: {str(e)[:60]}",
+                      critical=False)
 
 
 # Which labels this daemon might carry. A hint, not a requirement: the verdict
@@ -491,7 +491,10 @@ def check_completeness(results):
                           critical=True)
         seen[cid] = who
     ran = set(seen) | {"w_checks_complete"}
-    manifest = HOME / "required_checks.json"
+    # CODE, not HOME: the required set is a property of checks.py — every
+    # instance running this code owes the same checks, so the manifest rides
+    # with the code, not with an instance's state directory.
+    manifest = CODE / "required_checks.json"
     if not manifest.exists():
         return C.fail("w_checks_complete", "required_checks.json is missing",
                       critical=True)

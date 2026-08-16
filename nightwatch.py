@@ -20,11 +20,10 @@ import math
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import neighborhood as NB
+from paths import HOME
 
-HOME = Path(__file__).resolve().parent
 STATE = HOME / "state"
 MARK = STATE / "last_report.json"
 

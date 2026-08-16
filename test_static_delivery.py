@@ -1,6 +1,8 @@
 import http.client
 import json
+import os
 import plistlib
+import re
 import socketserver
 import subprocess
 import sys
@@ -14,8 +16,13 @@ from unittest import mock
 
 import checks
 import health
+import neighborhood
 import nightwatch
 import outbox
+import participate
+import paths
+import retro
+import sentinel
 import serve
 import standup
 
@@ -507,7 +514,7 @@ class RappterbookDerivedTruthTests(unittest.TestCase):
 class CompletenessRegressionTests(unittest.TestCase):
     def test_missing_required_check_still_fails_critical(self):
         required = json.loads(
-            (health.HOME / "required_checks.json").read_text(encoding="utf-8")
+            (health.CODE / "required_checks.json").read_text(encoding="utf-8")
         )["required"]
         self.assertIn("w_checks_complete", required)
         self.assertGreater(len(required), 1)
@@ -525,6 +532,64 @@ class CompletenessRegressionTests(unittest.TestCase):
         self.assertFalse(verdict["ok"])
         self.assertEqual(checks.CRITICAL, verdict["severity"])
         self.assertIn(missing, verdict["detail"])
+
+
+class SentinelHomeContractTests(unittest.TestCase):
+    """paths.py is the ONLY place HOME is derived (#1, ask 1).
+
+    Ten modules deriving HOME independently is ten chances for one of them to
+    miss SENTINEL_HOME — and a module that misses it writes a second, silent
+    instance into the code tree. So the contract is enforced two ways: by
+    source (no runtime module re-derives Path(__file__).resolve().parent) and
+    by identity (every module's HOME is literally paths.HOME, not a copy that
+    could drift).
+    """
+
+    RUNTIME_MODULES = (
+        sentinel, health, checks, neighborhood, outbox,
+        standup, participate, nightwatch, serve, retro,
+    )
+    _DERIVATION = re.compile(r"Path\(__file__\)\.resolve\(\)\.parent")
+
+    def test_no_runtime_module_rederives_home_from_file(self):
+        # The one legitimate use of the module's own location is putting the
+        # module directory on sys.path so a sibling import works from any
+        # cwd — that is a fact about the CODE and must stay on __file__.
+        # Anything else is a path derivation that would bypass SENTINEL_HOME.
+        for module in self.RUNTIME_MODULES:
+            source = Path(module.__file__).read_text(encoding="utf-8")
+            for number, line in enumerate(source.splitlines(), start=1):
+                if not self._DERIVATION.search(line):
+                    continue
+                self.assertIn(
+                    "sys.path.insert", line,
+                    f"{Path(module.__file__).name}:{number} derives a path "
+                    f"from __file__ outside paths.py: {line.strip()!r}")
+
+    def test_every_runtime_module_shares_the_paths_home(self):
+        for module in self.RUNTIME_MODULES:
+            self.assertIs(
+                module.HOME, paths.HOME,
+                f"{Path(module.__file__).name} carries its own HOME")
+
+    def test_unset_env_home_is_the_code_directory(self):
+        # The molt constraint: the live install runs with SENTINEL_HOME unset
+        # and its paths — including the external ledger key derived from
+        # str(HOME) — must be byte-identical to what the old per-module
+        # derivation produced.
+        env = {k: v for k, v in os.environ.items() if k != "SENTINEL_HOME"}
+        out = subprocess.run(
+            [sys.executable, "-c", "import paths; print(paths.HOME)"],
+            capture_output=True, text=True, env=env,
+            cwd=str(Path(__file__).resolve().parent), check=True)
+        self.assertEqual(
+            str(Path(__file__).resolve().parent), out.stdout.strip())
+
+    def test_install_script_offers_a_home_flag(self):
+        script = (Path(__file__).resolve().parent /
+                  "install-launchd.sh").read_text(encoding="utf-8")
+        self.assertIn("--home", script)
+        self.assertIn("EnvironmentVariables:SENTINEL_HOME", script)
 
 
 class MessageContentTests(unittest.TestCase):

@@ -33,8 +33,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import neighborhood as NB
+from paths import CODE, HOME
 
-HOME = Path(__file__).resolve().parent
 STATE = HOME / "state"
 LOGS = HOME / "logs"
 STOP = HOME / "STOP"
@@ -120,7 +120,9 @@ def notify(cfg, text):
 
 
 def run_health():
-    r = subprocess.run([sys.executable, str(HOME / "health.py")],
+    # CODE, not HOME: the runner is a code artifact. The child inherits this
+    # process's environment, so it resolves the same SENTINEL_HOME.
+    r = subprocess.run([sys.executable, str(CODE / "health.py")],
                        capture_output=True, text=True, timeout=180)
     return json.loads(r.stdout)
 
@@ -240,7 +242,12 @@ def github_degraded():
             headers={"User-Agent": "rapp-sentinel"})
         with urllib.request.urlopen(req, timeout=20) as r:
             comps = json.loads(r.read().decode("utf-8")).get("components", [])
-    except Exception:
+    except Exception as e:
+        # Documented posture, but never a silent one: the swallowed reason is
+        # the difference between "status page 503'd" and "DNS is broken here",
+        # and losing it made the fallback undebuggable (#1, ask 5).
+        log(f"github status unreadable ({type(e).__name__}: {str(e)[:60]}) — "
+            f"treating as no outage so escalation still runs")
         return []
     return [c["name"] for c in comps
             if c.get("name") in ("Actions", "Pages")
@@ -405,7 +412,7 @@ def main():
         """Rebuild the shift report every tick. It only ever reads the chains,
         so it can never disagree with the record it renders."""
         try:
-            subprocess.run([sys.executable, str(HOME / "standup.py"), "--hours=14"],
+            subprocess.run([sys.executable, str(CODE / "standup.py"), "--hours=14"],
                            capture_output=True, timeout=180, cwd=str(HOME))
         except Exception as e:
             log(f"dashboard refresh failed: {type(e).__name__}: {e}")

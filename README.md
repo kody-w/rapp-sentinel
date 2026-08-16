@@ -80,6 +80,29 @@ Background reporters remain queue-only; the drainer is the single serialized
 process allowed to drive Messages, so reports survive both producer failures
 and reboot without waiting for a terminal command.
 
+### One instance per `SENTINEL_HOME`
+
+One checkout can serve several instances. Set `SENTINEL_HOME` to a directory
+and everything an instance owns — `config.json`, `direction.json`, `state/`,
+`logs/`, `neighborhood/`, `public/`, `dashboard/`, `STOP` — lives there
+instead of beside the code:
+
+```bash
+SENTINEL_HOME=~/vision-court python3 health.py     # a second neighborhood
+./install-launchd.sh --home ~/vision-court         # …or under launchd
+```
+
+Unset, nothing changes: state lives beside the code, byte-for-byte the same
+paths as before the variable existed, so a live install picks this up by
+`git pull` without its ledger key or chains moving. `paths.py` is the single
+place the split is derived.
+
+Honest limit: instances share `checks.py` and `required_checks.json` — every
+instance running this code runs the same check SET against the same targets
+declared in its own `direction.json`. Per-instance check sets are a different
+feature this does not provide; if two instances need different checks, today
+that still means two checkouts.
+
 ---
 
 ## Write your checks

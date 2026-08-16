@@ -44,7 +44,6 @@ platforms this pattern was built for. Delete it and write your own.
 """
 
 import json
-import pathlib as _pathlib
 import subprocess
 import urllib.error
 import urllib.request
@@ -419,7 +418,10 @@ def workflows_never_succeeding(repo, limit=40, ignore=()):
 # ── your checks ── everything below here is an example. Replace it.
 # ══════════════════════════════════════════════════════════════════════════
 
-HOME = _pathlib.Path(__file__).resolve().parent
+# Instance state (direction.json, state/coverage.json) keys off HOME so one
+# checkout can serve many SENTINEL_HOME instances. The checks themselves are
+# code and ride with the checkout.
+from paths import HOME
 
 RV = "kody-w/rappterverse"
 RB = "kody-w/rappterbook"
@@ -1302,8 +1304,12 @@ def github_status_operational():
             comps = _j.loads(r.read().decode("utf-8")).get("components", [])
     except Exception as e:
         # Fail closed. Reporting "all operational" about a source we could not
-        # read is the blind-green mistake (#45).
-        return fail("gh_status", f"cannot read GitHub status ({type(e).__name__})",
+        # read is the blind-green mistake (#45). Carry the reason: "HTTPError"
+        # alone cannot separate a 503 (wait) from a 404 (fix the URL), and the
+        # two demand opposite responses (#1, ask 5).
+        return fail("gh_status",
+                    f"cannot read GitHub status ({type(e).__name__}: "
+                    f"{str(e)[:60]})",
                     critical=False)
     seen = {c.get("name"): c.get("status") for c in comps
             if c.get("name") in watched}

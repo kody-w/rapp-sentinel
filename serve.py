@@ -23,9 +23,9 @@ import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 
-HOME = Path(__file__).resolve().parent
+from paths import CODE, HOME
+
 DASH = HOME / "dashboard"
 LOGS = HOME / "logs"
 SHARED_REPORTS = HOME / "state" / "shared-reports"
@@ -55,7 +55,7 @@ def rebuild(hours=14):
 
     def _work():
         try:
-            subprocess.run([sys.executable, str(HOME / "standup.py"), f"--hours={hours}"],
+            subprocess.run([sys.executable, str(CODE / "standup.py"), f"--hours={hours}"],
                            capture_output=True, timeout=180, cwd=str(HOME))
         except Exception:
             pass  # keep serving the last good copy rather than a stack trace
@@ -158,7 +158,7 @@ if __name__ == "__main__":
     DASH.mkdir(exist_ok=True)
     if not (DASH / "index.html").exists():
         # first ever start: build once, synchronously, so there is something to serve
-        subprocess.run([sys.executable, str(HOME / "standup.py")],
+        subprocess.run([sys.executable, str(CODE / "standup.py")],
                        capture_output=True, timeout=180, cwd=str(HOME))
     rebuild()
     socketserver.TCPServer.allow_reuse_address = True

@@ -60,8 +60,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import rapp
+from paths import HOME
 
-HOME = Path(__file__).resolve().parent
 NBHD = HOME / "neighborhood"
 NBHD.mkdir(exist_ok=True)
 IDENTITY = NBHD / "neighbors.json"
@@ -308,6 +308,14 @@ def anchor_heads():
 # machine: a fresh clone has no chains, so it would read the live install's
 # high-water mark and report every stream as vanished. Caught before shipping,
 # by cloning the repo and running the check in it.
+#
+# Keyed on HOME deliberately, and this is load-bearing for the molt: with
+# SENTINEL_HOME unset, HOME is the code directory and str(HOME) is
+# byte-identical to what the old per-module derivation produced, so the LIVE
+# install's ledger key does not move on upgrade — a moved key would make the
+# running organism read an empty ledger and report its own streams vanished.
+# With SENTINEL_HOME set, each instance gets its own key, which is exactly
+# the isolation the key exists for.
 _INSTALL_KEY = rapp.H("rapp/1:install", {"path": str(HOME)})[:16]
 EXTERNAL_LEDGER = Path.home() / "Library" / "Application Support" / \
     "rapp-sentinel" / f"anchor-ledger-{_INSTALL_KEY}.json"
@@ -501,15 +509,29 @@ def head_violations(doc):
 
 
 def fetch_peer(slug, url, timeout=20):
-    """Read one outside neighbor's published head."""
+    """Read one outside neighbor's published head.
+
+    Failure details carry the HTTP status when there is one (#1, ask 5): the
+    bare word "HTTPError" cannot separate a 404 (misconfigured — fix the URL)
+    from a 503 (transient — wait), and the two demand opposite responses.
+    `reachable` stays False for HTTP errors on purpose: a peer whose head
+    cannot be READ has not been observed, whatever the transport said, so the
+    consumer's `gone` classification keeps its meaning. The `http_status`
+    field is additive — nothing existing reads it.
+    """
+    import urllib.error
     import urllib.request
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             doc = json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        return {"slug": slug, "url": url, "reachable": False,
+                "detail": f"HTTP {e.code} {e.reason}",
+                "http_status": int(e.code)}
     except Exception as e:
         return {"slug": slug, "url": url, "reachable": False,
-                "detail": f"{type(e).__name__}"}
+                "detail": f"{type(e).__name__}: {str(e)[:60]}"}
     if doc.get("schema") != "rapp-sentinel-head/1.0":
         return {"slug": slug, "url": url, "reachable": True, "valid": False,
                 "detail": f"unexpected schema {doc.get('schema')!r}"}
