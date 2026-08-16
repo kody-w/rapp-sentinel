@@ -285,6 +285,12 @@ Stated plainly, because the whole point is verifiable claims.
   resealed — verifying clean. Verification is self-referential; the chain
   attests to itself. Publish the head hash somewhere outside the chain, or
   history can be silently shortened. A watcher found this in its own memory.
+- **`utc` is the one field the chain does not bind.** `prev` links the
+  predecessor's `payload_hash`, which excludes `utc`, and `prev_wave` — the
+  field that would bind it — must be null off-swarm. So a frame's payload is
+  sealed but its timestamp is testimony: the chain proves *what* was recorded
+  and in what order, not *when*. Also found by a watcher reading its own
+  chain, and unchanged since.
 - **Level 2 is real write access.** The guardrails are good, not perfect.
   Worktree isolation and the allowlist are what stand between an autonomous
   repair and your uncommitted work.

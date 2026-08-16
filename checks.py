@@ -33,6 +33,12 @@ paid for them are in TRIFECTA-PATTERN.md §6d):
     because a state nobody thought to name passes silently.
     require_success() is the cheap default for run histories.
 
+Check ids are load-bearing in state files and are never renamed, so an id
+does not have to match its function's name (`rb_wf_starved` lives in
+`rb_workflows_never_succeed`). The `produced_by` field health.py stamps on
+every verdict line is how you map a line back to its function without
+grepping.
+
 Everything below `# ── your checks ──` is an example: the two GitHub-native
 platforms this pattern was built for. Delete it and write your own.
 """
