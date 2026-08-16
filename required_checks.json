@@ -31,6 +31,7 @@
     "w_openrappter",
     "w_openrappter_spin",
     "w_outsider_coverage",
+    "w_outsider_smoke",
     "w_sentinel_fresh",
     "w_test_baseline"
   ],
@@ -153,6 +154,10 @@
     "rb_rejection_rate": {
       "domain": "rappterbook",
       "kind": "consistency"
+    },
+    "w_outsider_smoke": {
+      "domain": "watchers",
+      "kind": "watcher"
     }
   },
   "_unpaired_accepted_why": "An accepted pairing gap is a DECISION with a diff, not a silence. A permanently-red pairing check would hold the verdict at degraded forever, which silently disables the level-3 evolve arm (sentinel only evolves while healthy) and trains readers to scroll past the channel. Each entry names the domain and why its gap is accepted; deleting an entry re-arms the check for that domain.",

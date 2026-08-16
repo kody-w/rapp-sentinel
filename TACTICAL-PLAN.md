@@ -86,9 +86,9 @@ ledger, `peers-seen.json`, its own `config.json` — and it picks up new code by
   when it was written and what it guarded against; unreviewed rails surface.
 - [ ] **`rb_rejection_rate`** (#6): on the live slop-cop ledger; ≥90% rejection
   pages critically — the check that would have caught the July-30 outage day one.
-- [ ] **participate.py outcome honesty** (#5/#7): decline first-class, a silent
+- [x] **participate.py outcome honesty** (#5/#7): decline first-class, a silent
   model failure never recorded as success, exit codes never believed.
-- [ ] **Outsider smoke in the tick** (#5): budgeted like evolve (writes a real
+- [x] **Outsider smoke in the tick** (#5): budgeted like evolve (writes a real
   issue — 72h interval, daily cap 1), verified by re-reading `participation.jsonl`,
   with read-only `w_outsider_smoke` watching that the front door stays exercised.
 - [ ] **Test baselines** (#13): dated, environment-stamped, set-based —

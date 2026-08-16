@@ -2166,3 +2166,96 @@ def served_docs_keep_their_cadence_claims():
               f"{read}/{len(docs)} documents read, {declared} declare a "
               f"cadence and every stamp honors it, {read - declared} "
               f"declare none{suffix}")
+# The evidence file the outsider smoke writes (participate.py) and the check
+# below reads. A module global so a prove harness can point the read at a
+# synthetic log without touching the instance's real record.
+PARTICIPATION_LOG = HOME / "state" / "participation.jsonl"
+
+
+def _smoke_interval_hours():
+    """config.json's smoke_interval_hours, defaulting like sentinel.DEFAULTS.
+
+    Tolerant on purpose (growth path): the live config predates the key."""
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        return float(cfg.get("smoke_interval_hours", 72))
+    except Exception:
+        return 72.0
+
+
+@check
+def outsider_smoke_exercised():
+    """The front door stays EXERCISED, not just theoretically open (#5).
+
+    rb_public_surface proves a stranger can READ; nothing read-only can
+    prove a stranger can WRITE. sentinel.outsider_smoke runs participate.py
+    against one platform per spend and participation.jsonl carries the
+    verdicts — each row's ok earned by re-reading PUBLISHED state, never a
+    receipt (R1, #2). This check is the read-only side of that loop: per
+    platform participate.py names, the newest smoke row must be a
+    smoke.landed with ok=True, younger than 2x the smoke interval plus 24h
+    (one full missed rotation plus a day of slack).
+
+    Absence pages (#43): a platform never smoked, or a missing log, is
+    "outsider path never exercised" — warn, so a fresh clone is not
+    critical on tick 1, and because the remedy (waiting for the budgeted
+    smoke, or raising the level so it may write) is a human's call, not the
+    repair arm's. An ok=True row that is not smoke.landed (a dry run, or a
+    run that died between steps) never reached published-state verification
+    and does not count as exercised — that would be a receipt.
+
+    Known coupling, stated rather than hidden: the tick's smoke only runs
+    while the verdict is HEALTHY, and this warn holds a fresh install at
+    degraded — so a new instance pages here until a human primes the loop
+    with one manual smoke. That is deliberate (#43: absence must page; a
+    front door nobody has ever opened is not a green), and the detail
+    carries the priming command so the page is actionable.
+    """
+    import participate
+    platforms = sorted(participate.PLATFORMS)
+    try:
+        lines = PARTICIPATION_LOG.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return fail("w_outsider_smoke",
+                    "outsider path never exercised - no participation log; "
+                    "prime by hand once: python3 participate.py smoke "
+                    "--platform <name>", critical=False)
+    newest = {}
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if str(row.get("kind", "")).startswith("smoke."):
+            newest[row.get("platform")] = row      # later lines overwrite
+    bar = 2 * _smoke_interval_hours() + 24
+    findings = []
+    for p in platforms:
+        row = newest.get(p)
+        if row is None:
+            findings.append(f"{p}: outsider path never exercised")
+            continue
+        if not row.get("ok"):
+            findings.append(f"{p}: newest smoke failed - {row.get('kind')}: "
+                            f"{str(row.get('detail'))[:80]}")
+            continue
+        if row.get("kind") != "smoke.landed":
+            findings.append(f"{p}: newest smoke never reached published-state "
+                            f"verification ({row.get('kind')})")
+            continue
+        age = hours_since(row.get("utc"))
+        if age is None:
+            findings.append(f"{p}: newest smoke row carries no readable "
+                            f"timestamp")
+        elif age >= bar:
+            findings.append(f"{p}: last verified smoke {age:.1f}h ago "
+                            f"(bar {bar:.0f}h)")
+    if findings:
+        detail = "; ".join(findings)
+        if "never exercised" in detail:
+            detail += ("; prime by hand once: python3 participate.py smoke "
+                       "--platform <name>")
+        return fail("w_outsider_smoke", detail, critical=False)
+    return ok("w_outsider_smoke",
+              f"{len(platforms)} platform(s) smoked from outside within "
+              f"{bar:.0f}h")

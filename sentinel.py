@@ -50,6 +50,13 @@ DEFAULTS = {
     "notify_handle": "",   # set in config.json; empty disables notify
     "copilot_model": "claude-sonnet-4.6",
     "copilot_timeout_s": 900,
+    # Outsider smoke (#5 ask 2): a smoke test is a WRITE (it files a real
+    # GitHub issue), so it gets evolve's treatment — its own small budget,
+    # never repair's. The live config predates these keys; defaults apply
+    # (growth path).
+    "daily_smoke_budget": 1,
+    "smoke_interval_hours": 72,
+    "smoke_timeout_s": 600,
     "repo_paths": {
         "rappterverse": str(Path.home() / "Documents/GitHub/rappterverse"),
         "rappterbook": str(Path.home() / "Documents/GitHub/rappterbook"),
@@ -449,6 +456,178 @@ def result_line(output):
     return "UNKNOWN (no SENTINEL_RESULT line)"
 
 
+# ── outsider smoke (#5 ask 2) ───────────────────────────────────────────────
+
+def smoke_rows(platform):
+    """Every smoke.* participation row for `platform`, oldest first.
+
+    participation.jsonl is participate.py's own evidence file — every row's
+    ok came from re-reading published state, never from a receipt. Reading
+    it back is therefore the only way this loop is allowed to decide whether
+    a smoke landed (R1).
+    """
+    path = STATE / "participation.jsonl"
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+    rows = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if (row.get("platform") == platform
+                and str(row.get("kind", "")).startswith("smoke.")):
+            rows.append(row)
+    return rows
+
+
+def outsider_smoke(cfg):
+    """Exercise the public write path from the tick, budgeted like evolve.
+
+    Issue #5 ask 2: the resident fleet runs inside the platforms with repo
+    secrets, so a green heartbeat proves nothing about onboarding. This runs
+    participate.py's smoke — GitHub Issue in, published state re-read out —
+    on one platform per spend, rotating over every platform participate.py
+    names (today: rappterbook and rappterverse, both via the github-issue
+    write path).
+
+    Only from the HEALTHY branch: smoking a critical platform measures the
+    outage, not the front door. Only at level >= 2: a smoke files a real
+    issue, and levels 0-1 promise the sentinel writes nothing.
+
+    EVIDENCE (R1): after the subprocess, participation.jsonl is RE-READ. The
+    smoke landed only if a NEW row exists whose kind is smoke.landed with
+    ok=True — that row is wait_for_state's verdict from PUBLISHED state. A
+    subprocess that exited 0 without writing the log is NO-RECORD, which is
+    a failure; the exit code is never believed.
+
+    Honest identity limit: this proves the PUBLIC WRITE PATH works without
+    repo access. It cannot prove a true stranger's identity onboarding —
+    the platform binds agent_id to the authenticated issue author, so the
+    smoke joins as the owner's login walking the stranger's road. And
+    rappterverse's consent-delegation (`delegates`, #5 ask 3) stays
+    uncovered: participate.py does not implement that path yet.
+    """
+    if int(cfg.get("level", 1)) < 2:
+        log("smoke skipped — level < 2 and a smoke files a real issue")
+        return
+
+    import participate
+    platforms = sorted(participate.PLATFORMS)
+    if not platforms:
+        return
+
+    # Budget: smoke's OWN rolling-24h cap, separate from repair's and from
+    # evolve's — same reasoning as evolve: overnight, a spent shared budget
+    # is a real failure at 3am getting skipped. Skipped rows are decisions
+    # not to spend and never consume the budget (#50).
+    hist = load_json(STATE / "escalations.json", [])
+    cutoff = now() - timedelta(hours=24)
+    recent = [h for h in hist
+              if datetime.fromisoformat(h["at"]) > cutoff
+              and h.get("mode") == "smoke" and not h.get("skipped")]
+    cap = int(cfg.get("daily_smoke_budget", 1))
+    if len(recent) >= cap:
+        log(f"smoke skipped — smoke budget spent ({len(recent)}/{cap}); "
+            f"repair capacity untouched")
+        return
+
+    turn = load_json(STATE / "smoke_turn.json", {"i": 0})
+    platform = platforms[turn["i"] % len(platforms)]
+
+    # Interval gate BEFORE spending: the newest smoke row for this platform,
+    # whatever its verdict, marks the last knock on this door. A recently
+    # smoked platform advances the turn anyway, so a fresh platform can
+    # never wedge the rotation and starve a stale one.
+    rows = smoke_rows(platform)
+    interval_h = float(cfg.get("smoke_interval_hours", 72))
+    if rows:
+        age_h = (now() - datetime.fromisoformat(
+            rows[-1]["utc"].replace("Z", "+00:00"))).total_seconds() / 3600
+        if age_h < interval_h:
+            log(f"smoke skipped for {platform}: last smoke {age_h:.1f}h ago "
+                f"(interval {interval_h:.0f}h)")
+            turn["i"] += 1
+            save_json(STATE / "smoke_turn.json", turn)
+            return
+
+    issues = load_json(STATE / "issues.json", {})
+    key = f"smoke:{platform}"
+    allowed, why = issue_allowed(issues, key, cfg)
+    if not allowed:
+        log(f"smoke skipped for {platform}: {why}")
+        rec = issues.get(key) or {}
+        if "attempt cap" in why and not rec.get("human_notified"):
+            # Three failed smokes is a broken front door; re-knocking will
+            # not fix it. Say so once, then hold.
+            notify(cfg, f"🔴 RAPP sentinel: the outsider path on {platform} "
+                        f"failed {cfg['max_attempts_per_issue']} smoke "
+                        f"attempts — the front door needs a human.\n"
+                        f"last: {str(rec.get('last_result'))[:300]}")
+            rec["human_notified"] = True
+            issues[key] = rec
+            save_json(STATE / "issues.json", issues)
+        return
+
+    n0 = len(rows)
+    timeout_s = int(cfg.get("smoke_timeout_s", 600))
+    log(f"smoke: exercising the outsider path on {platform} "
+        f"(budget {len(recent) + 1}/{cap})")
+    try:
+        r = subprocess.run(
+            [sys.executable, str(CODE / "participate.py"),
+             "smoke", "--platform", platform],
+            capture_output=True, text=True, timeout=timeout_s, cwd=str(HOME))
+        receipt = f"exit {r.returncode}"
+        out = (r.stdout or "") + (r.stderr or "")
+    except subprocess.TimeoutExpired:
+        receipt, out = f"timed out after {timeout_s}s", ""
+    except FileNotFoundError:
+        receipt, out = "participate.py not found", ""
+
+    # The verdict comes from the evidence file, never the receipt (R1).
+    after = smoke_rows(platform)
+    new = after[n0:]
+    newest = new[-1] if new else None
+    if newest and newest.get("kind") == "smoke.landed" and newest.get("ok") is True:
+        landed = True
+        result = f"LANDED — {str(newest.get('detail'))[:200]}"
+    elif newest:
+        landed = False
+        result = (f"FAILED — {newest.get('kind')}: "
+                  f"{str(newest.get('detail'))[:200]} (subprocess {receipt})")
+    else:
+        landed = False
+        result = (f"NO-RECORD — subprocess {receipt} but participation.jsonl "
+                  f"gained no row; an exit code is a receipt, not evidence (R1)")
+
+    (LOGS / f"smoke-{platform}-{now():%Y%m%d-%H%M%S}.log").write_text(
+        out, encoding="utf-8")
+    NB.emit("copilot", "neighbor.acted", {
+        "act": "smoke", "platform": platform,
+        "result": result[:200], "landed": landed,
+    })
+
+    if landed:
+        issues.pop(key, None)          # a clean smoke resets the failure count
+    else:
+        rec = issues.get(key, {"attempts": 0})
+        rec["attempts"] += 1
+        rec["last_attempt"] = now().isoformat(timespec="seconds")
+        rec["last_result"] = result
+        issues[key] = rec
+    save_json(STATE / "issues.json", issues)
+
+    hist.append({"at": now().isoformat(timespec="seconds"),
+                 "key": key, "mode": "smoke", "result": result})
+    save_json(STATE / "escalations.json", hist[-200:])
+    turn["i"] += 1
+    save_json(STATE / "smoke_turn.json", turn)
+    log(f"smoke ({platform}): {result}")
+
+
 # ── main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -558,6 +737,12 @@ def main():
 
     level = int(cfg["level"])
     if status == "healthy":
+        # Outsider smoke BEFORE evolve, and only from here: smoking a
+        # critical platform measures the outage, not the front door (#5).
+        try:
+            outsider_smoke(cfg)
+        except Exception as e:
+            log(f"outsider smoke failed: {type(e).__name__}: {e}")
         if level >= 3:
             hist = load_json(STATE / "escalations.json", [])
             issues = load_json(STATE / "issues.json", {})
