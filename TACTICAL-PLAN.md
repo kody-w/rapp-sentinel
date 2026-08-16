@@ -1,5 +1,12 @@
 # Tactical plan — every open issue, addressed or deliberately deferred
 
+**STATUS 2026-08-16 (same day): every tranche landed — PRs #73–#87, all
+verified on the live organism. Day-one findings by the new checks: the
+rappterverse front door structurally dead-ends (filed as rappterverse#6752
+by the outsider smoke); page_fetch caught and fixed its own scanner defect;
+the #12 drift was confirmed fixed upstream. Still open by design: #16 (the
+method record) and #7 (deferred on an explicit owner decision).**
+
 *Drafted 2026-08-16 from all 14 open issues (#1–#38), six design passes and one
 adversarial synthesis, every claim spot-checked against source. This file is a
 living ledger: boxes get checked as PRs land, and a deferral here is a decision
@@ -70,33 +77,33 @@ ledger, `peers-seen.json`, its own `config.json` — and it picks up new code by
   credential and endpoint the checks depend on, values never printed.
 - [x] **Escalation prompts carry attempt history** (#4): repeated failure of the
   same repair means the *diagnosis* is wrong — the prompt says to change method.
-- [ ] **`@outsider_check` vantage marker + `w_outsider_coverage`** (#5): every
+- [x] **`@outsider_check` vantage marker + `w_outsider_coverage`** (#5): every
   watched platform must have ≥1 unauthenticated check, enforced per tick.
-- [ ] **probe_watchers targets from config.json** (#1 ask 2): the brainstem POST
+- [x] **probe_watchers targets from config.json** (#1 ask 2): the brainstem POST
   and launchd labels stop being hardcoded estate facts; a disabled probe is
   declared in the verdict, never silently green.
-- [ ] **`page_fetch` + `cadence_honest`** (#12): fetch the served HTML, assert
+- [x] **`page_fetch` + `cadence_honest`** (#12): fetch the served HTML, assert
   every first-party request it makes returns 2xx (pollers loudest); and a served
   doc whose declared refresh cadence contradicts its own newest timestamp fails.
   Stdlib regex extraction, honestly labeled, with a CDP slot-in path.
 
 ## Tranche 4 — rails, rejection rates, real-write smoke, baselines (#6, #5, #7-part, #13, #1-part)
 
-- [ ] **Scaffolding registry + `rails_fresh`** (#6): each quality rail declares
+- [x] **Scaffolding registry + `rails_fresh`** (#6): each quality rail declares
   when it was written and what it guarded against; unreviewed rails surface.
-- [ ] **`rb_rejection_rate`** (#6): on the live slop-cop ledger; ≥90% rejection
+- [x] **`rb_rejection_rate`** (#6): on the live slop-cop ledger; ≥90% rejection
   pages critically — the check that would have caught the July-30 outage day one.
 - [x] **participate.py outcome honesty** (#5/#7): decline first-class, a silent
   model failure never recorded as success, exit codes never believed.
 - [x] **Outsider smoke in the tick** (#5): budgeted like evolve (writes a real
   issue — 72h interval, daily cap 1), verified by re-reading `participation.jsonl`,
   with read-only `w_outsider_smoke` watching that the front door stays exercised.
-- [ ] **Test baselines** (#13): dated, environment-stamped, set-based —
+- [x] **Test baselines** (#13): dated, environment-stamped, set-based —
   `baseline.py` recorder (refuses shallow clones and world-writable dirs, the
   two measured phantom-failure sources) + `w_test_baseline` comparing the named
   set, reporting `newly_failing` / `newly_passing`. Enrolls rapp-sentinel only
   at landing.
-- [ ] **Low-noise head hosting** (#1 ask 6): JOINING.md recipe (gist first),
+- [x] **Low-noise head hosting** (#1 ask 6): JOINING.md recipe (gist first),
   optional throttled `head_publish_cmd` hook, and a live example head the first
   outside neighbor can actually point at.
 
@@ -108,8 +115,8 @@ ledger, `peers-seen.json`, its own `config.json` — and it picks up new code by
   more than "file one issue". Parked behind an explicit owner decision on
   budget, sandbox, and representation. The safer v2 (model emits a structured
   block; critique.py files the issue itself) should be v1 when approved.
-- **`attests_for` head field (#1 ask 4)**: approved as designed; purely
-  additive; rides any later neighborhood.py PR at near-zero cost.
+- ~~**`attests_for` head field (#1 ask 4)**~~: LANDED (PR #87) — validated
+  claim, never verified truth; malformed claims fail the publish.
 - **P2 inversion backlog** (eco_sweep colour-blindness, rv_* inversions,
   alert_delivery chat.db-verified SENT, sites body markers): each recorded in
   CHECK-AUDIT.md with its inversion; each lands as its own small PR after the
