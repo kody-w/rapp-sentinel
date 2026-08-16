@@ -158,8 +158,8 @@ check keeps its history.*
 | `w_checks_complete` | ledger row; `CompletenessRegressionTests` in `test_static_delivery.py` | proven |
 | `w_openrappter` | ledger row (nothing LISTENING on :18790) | proven |
 | `w_sentinel_fresh` | ledger row (last_run.json moved 9h into the past) | proven |
-| `w_openrappter_spin` | `prove_spinning_job.py` | lands with PR-2B |
-| `w_freshness_paired` | `prove_freshness_pairing.py` | lands with PR-2B |
+| `w_openrappter_spin` | `prove_spinning_job.py` | landed in #76 |
+| `w_freshness_paired` | `prove_freshness_pairing.py` | landed in #76 |
 
 The two UNPROVEN rows are the honest debt: both ids landed in #62 with unit
 tests that exercise their fail and pass branches, but neither has been through
