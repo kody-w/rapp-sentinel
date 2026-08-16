@@ -1,4 +1,7 @@
 {
+  "_head_publish_why": "Optional low-noise head hosting (#1 ask 6). head_publish_cmd runs after every publish_head(), throttled by head_publish_min_minutes, hard-timed-out, never fatal; the head file's path arrives as $SENTINEL_HEAD_PATH. Executes YOUR shell from YOUR config - same trust boundary as your plists; no default on purpose. Example: gh gist edit <gist-id> --filename sentinel-head.json \"$SENTINEL_HEAD_PATH\"",
+  "head_publish_cmd": "",
+  "head_publish_min_minutes": 10,
   "level": 0,
   "daily_escalation_budget": 8,
   "issue_cooldown_hours": 4,

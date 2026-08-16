@@ -57,6 +57,45 @@ Serve that file anywhere a URL can reach: GitHub Pages, a static host, a
 Tailscale address, `python3 -m http.server` on a box that stays up. The
 sentinel republishes on every tick, so once it is served it stays current.
 
+#### Serving your head without drowning your history
+
+Chains advance every 15 minutes. Serving heads from a repo's Pages means
+either stale heads or a commit every tick on a repository whose history is
+the product. Low-noise options, best first:
+
+1. **A gist.** Zero commits, zero CI, updates in seconds. The sentinel
+   supports this directly — set in `config.json`:
+
+   ```json
+   {
+     "head_publish_cmd": "gh gist edit <YOUR_GIST_ID> --filename sentinel-head.json \"$SENTINEL_HEAD_PATH\"",
+     "head_publish_min_minutes": 10
+   }
+   ```
+
+   The hook runs after every publish, throttled, with a hard timeout, and a
+   failure is logged and stamped without ever taking the tick down. Caveat:
+   `gist.githubusercontent.com/<user>/<id>/raw/<file>` serves latest but the
+   CDN may cache for ~5 minutes — fine against a 15-minute tick.
+   **Security note**: `head_publish_cmd` executes operator-supplied shell
+   from your config — the same trust boundary as your installed plists.
+   There is deliberately no default.
+2. **A heads-only repo or orphan branch**, committing with `[skip ci]`.
+3. **Any static host** you already run.
+
+**The cadence↔staleness interaction, stated so nobody learns it the hard
+way**: `peer_roll_call(stale_minutes=90)` is the default judgement bar. If
+you throttle publishing to ≥90 minutes, honest peers will call you stale.
+Throttle to 2 hours only after agreeing a larger `stale_minutes` with the
+peers actually watching you.
+
+A live head to point a first sentinel at — this repository's own install,
+updated by exactly the gist hook above:
+
+```
+https://gist.githubusercontent.com/kody-w/f3e0fcb63b4c5a2351572b7c5266bce7/raw/sentinel-head.json
+```
+
 ```json
 {
   "schema": "rapp-sentinel-head/1.0",
@@ -74,8 +113,11 @@ sentinel republishes on every tick, so once it is served it stays current.
 Each side writes the other into `neighborhood/peers.json`:
 
 ```json
-{ "some-peer": "https://their-host.example/sentinel-head.json" }
+{ "rappter-neighborhood-watch": "https://gist.githubusercontent.com/kody-w/f3e0fcb63b4c5a2351572b7c5266bce7/raw/sentinel-head.json" }
 ```
+
+(That example URL is real and live — this repository's own install serves
+it, so a first outside neighbor has an actual head to fetch on day one.)
 
 `public/sentinel-head.json` is gitignored (it is live runtime state, not source),
 so it is not served from this repository — each operator serves their own copy at
