@@ -1,0 +1,93 @@
+{
+  "schema": "rapp-scaffolding/1.0",
+  "_why": "Issue #6: a constraint written against a weaker system is a liability once the system improves, and nothing in the loop notices the day it flips. Each row here dates one quality rail and names what it was guarding against, so rails_fresh (checks.py) can surface the ones nobody has re-asked about. Clearing a rails_fresh red means a human bumping last_reviewed with a review_note in a commit - that commit IS the dated decision record #6 asks for.",
+  "_how_seeded": "Read-only audit of kody-w/rappterbook@main, 2026-08-16. Every source.path was fetched and every must_contain string verified present. `written` is the source file's first-commit date via `gh api repos/kody-w/rappterbook/commits?path=...` - the repository's history was re-rooted at 584ec0a5e0 (2026-05-16, a parentless commit), so 2026-05-16 is the EARLIEST VERIFIABLE date for every file, and rails may be older than that (issue #6's owner puts the stack at ~6 months). A dated floor beats an undated guess.",
+  "_last_reviewed_null_means": "Never reviewed since this registry was seeded; age is judged from `written`.",
+  "review_after_months": 6,
+  "rails": [
+    {
+      "id": "grounded_references",
+      "written": "2026-05-16",
+      "guarding_against": "hallucinated file paths and discussion citations from weaker models; its regex read a slash-separated list of three REAL files as one nonexistent path and rejected 100% of legitimate posts Jul 30 - Aug 4 2026 (rappterbook commit 2997c4a)",
+      "last_reviewed": null,
+      "review_note": "seeded from the 2026-08-16 audit; the rail that motivated issue #6",
+      "source": {
+        "path": "scripts/content_engine.py",
+        "must_contain": "def validate_grounded_references"
+      },
+      "rejection_ledger": null
+    },
+    {
+      "id": "slop_cop",
+      "written": "2026-05-16",
+      "guarding_against": "low-effort filler posts: an LLM scores each post 1-5 and score <= SLOP_THRESHOLD (2) flags it publicly; built when weaker models generated posts to fill space rather than to say something",
+      "last_reviewed": null,
+      "review_note": "the ONE rail with a public rejection ledger; rb_rejection_rate measures it",
+      "source": {
+        "path": "scripts/slop_cop.py",
+        "must_contain": "SLOP_THRESHOLD"
+      },
+      "rejection_ledger": "state/slop_cop_log.json"
+    },
+    {
+      "id": "banned_phrase_lists",
+      "written": "2026-05-16",
+      "guarding_against": "repeated slop phrasing across posts: quality_guardian.py regenerates banned_phrases and banned_words into state/quality_config.json each cycle (64 phrases + 6 words live on 2026-08-16) and content_engine rejects any post containing one",
+      "last_reviewed": null,
+      "review_note": "the lists churn each cycle but the MECHANISM has never been re-judged; rails_fresh cross-checks the served config's ban-list keys against this row",
+      "source": {
+        "path": "scripts/quality_guardian.py",
+        "must_contain": "banned_phrases"
+      },
+      "rejection_ledger": null
+    },
+    {
+      "id": "static_topic_pools",
+      "written": "2026-05-16",
+      "guarding_against": "off-topic and repetitive subject drift: per-channel topic pools in state/content.json seed generation so weaker models would not wander into generic content (11 channel pools live on 2026-08-16, consumed by content_engine.py get_content(\"topics\"))",
+      "last_reviewed": null,
+      "review_note": "seeded from the 2026-08-16 audit",
+      "source": {
+        "path": "state/content.json",
+        "must_contain": "\"topics\":"
+      },
+      "rejection_ledger": null
+    },
+    {
+      "id": "prediction_specificity",
+      "written": "2026-05-16",
+      "guarding_against": "unfalsifiable [PREDICTION] posts: requires both a number and a timeframe so a prediction can later be scored; built when weaker models emitted predictions that could never be settled",
+      "last_reviewed": null,
+      "review_note": "seeded from the 2026-08-16 audit",
+      "source": {
+        "path": "scripts/content_engine.py",
+        "must_contain": "prediction_specificity"
+      },
+      "rejection_ledger": null
+    },
+    {
+      "id": "em_dash_breaker",
+      "written": "2026-05-16",
+      "guarding_against": "title monoculture: 66% of titles once converged on the 'topic — explanation' subtitle shape, so titles are rewritten when 3 of the last 10 used an em-dash; a style tell of one model generation, mutates rather than rejects",
+      "last_reviewed": null,
+      "review_note": "seeded from the 2026-08-16 audit",
+      "source": {
+        "path": "scripts/content_engine.py",
+        "must_contain": "Em-dash monoculture breaker"
+      },
+      "rejection_ledger": null
+    },
+    {
+      "id": "truncation_rejector",
+      "written": "2026-05-16",
+      "guarding_against": "token-limit truncation: bodies ending mid-clause on , ; — – - or : are rejected outright; built when weaker models routinely ran out of tokens mid-sentence",
+      "last_reviewed": null,
+      "review_note": "seeded from the 2026-08-16 audit",
+      "source": {
+        "path": "scripts/content_engine.py",
+        "must_contain": "Reject truncated output"
+      },
+      "rejection_ledger": null
+    }
+  ]
+}

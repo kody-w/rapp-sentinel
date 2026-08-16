@@ -1,0 +1,6 @@
+{
+  "schema": "rapp-scaffolding/1.0",
+  "_why": "Placeholder, honestly labeled: rappterverse's action gate (Validate Agent Action) carries its own validation rules, and NO read-only audit has enumerated them into rows yet. An empty rails list here means UNAUDITED, not rail-free. rails_fresh reads only rappterbook.json today; when this file is seeded with a real audit, wire it in the same way - a registry row must cite a path and anchor someone actually verified, or it is a guess wearing a schema.",
+  "review_after_months": 6,
+  "rails": []
+}
