@@ -449,6 +449,36 @@ def peers():
         return {}
 
 
+def _attests_for():
+    """config.json's attests_for map — {watcher_slug: subject_rappid}.
+
+    Issue #1 ask 4: twins arrive with canonical identities, but a watcher
+    mints its own rappid, so a published head attests that A WATCHER is
+    alive — never that THE TWIN it watches is. attests_for lets a head carry
+    the subject rappid it stands witness for, so a reader no longer needs
+    prose to link them.
+
+    A VALIDATED CLAIM, never verified truth: publishing refuses a malformed
+    rappid outright (an operator typo must fail the publish, not travel),
+    but a well-formed claim is still only the operator's assertion — the
+    reader decides what the witness is worth, exactly as with every other
+    field in the head.
+    """
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        claims = cfg.get("attests_for") or {}
+    except Exception:
+        return {}
+    out = {}
+    for slug, rid in claims.items():
+        if not isinstance(rid, str) or not rapp.rappid_valid(rid):
+            raise ValueError(
+                f"attests_for[{slug!r}] is not a conformant rappid (§6.1): "
+                f"{rid!r} - refusing to publish a malformed claim")
+        out[slug] = rid
+    return out
+
+
 def publish_head():
     """Write the head this neighborhood exposes to outsiders.
 
@@ -458,6 +488,7 @@ def publish_head():
     """
     PUBLIC.mkdir(exist_ok=True)
     ids = identities()
+    attests = _attests_for()
     doc = {
         "schema": "rapp-sentinel-head/1.0",
         "neighborhood": NEIGHBORHOOD["slug"],
@@ -474,6 +505,10 @@ def publish_head():
                 "frame_hash": ch[-1]["frame_hash"],
                 "utc": ch[-1]["utc"],
             }
+            # Additive on purpose: absent config publishes the exact
+            # pre-#1-ask-4 shape, byte-identical.
+            if slug in attests:
+                doc["heads"][slug]["attests_for"] = attests[slug]
     (PUBLIC / "sentinel-head.json").write_text(
         json.dumps(doc, indent=2) + "\n", encoding="utf-8")
     return doc
@@ -505,6 +540,14 @@ def head_violations(doc):
             bad.append(f"{slug}: frame_hash is not 64 lowercase hex (§5), len={n}")
         if not isinstance(h.get("seq"), int) or isinstance(h.get("seq"), bool):
             bad.append(f"{slug}: seq is not an integer")
+        # attests_for is optional, but a present claim must be well-formed:
+        # accepting a malformed subject identity would let a peer smuggle
+        # arbitrary strings into the one field readers link trust through.
+        if "attests_for" in h:
+            af = h.get("attests_for")
+            if not isinstance(af, str) or not rapp.rappid_valid(af):
+                bad.append(f"{slug}: attests_for is not a conformant rappid "
+                           f"(§6.1): {af!r}")
     return bad
 
 
