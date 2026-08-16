@@ -1487,3 +1487,292 @@ def alerts_can_actually_reach_you():
                     critical=False)
     return ok("alert_delivery",
               f"{n} queued, {age:.0f}m old (persistent drain within 5 min)")
+
+
+# ── the visitor's vantage (#12) ─────────────────────────────────────────────
+
+# The served pages a visitor actually loads. Overridable module-level on
+# purpose, same as the constants above: the prove harness points these at
+# synthetic pages.
+PAGE_FETCH_PAGES = (
+    f"https://kody-w.github.io/{RV.split('/')[1]}/",
+    f"https://kody-w.github.io/{RB.split('/')[1]}/",
+    f"https://kody-w.github.io/{RB.split('/')[1]}/reddit.html",
+    f"https://kody-w.github.io/{RB.split('/')[1]}/hackernews.html",
+    f"https://kody-w.github.io/{RB.split('/')[1]}/explore.html",
+    CHANNEL + "/",
+)
+
+# Hard cap on probes per tick. When it is hit the cap is NAMED in the
+# detail — silent truncation would be a coverage claim the check no longer
+# makes. Pollers and fetch/xhr targets sort first, so the cap sheds the
+# passive tail (images), never the loud failures.
+PAGE_PROBE_CAP = 40
+
+_KIND_RANK = {"fetch": 0, "xhr": 1, "script": 2, "link": 3, "json": 4,
+              "img": 5}
+
+
+def _short_name(url):
+    from urllib.parse import urlparse as _up
+    path = _up(url).path
+    return path.rsplit("/", 1)[-1] or path or url
+
+
+def _write_pagescan_receipt(pages, targets, failures):
+    """Receipt for what the visitor's vantage observed this tick.
+
+    Best-effort, never a reason to fail the check (mirrors
+    _write_coverage_receipt). observed_by:"regex" states the vantage; a
+    CDP-driven scanner can later write the same file with observed_by:"cdp"
+    and every consumer — cadence_honest reads the targets — carries on.
+    """
+    try:
+        (HOME / "state").mkdir(exist_ok=True)
+        (HOME / "state" / "pagescan.json").write_text(json.dumps({
+            "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "observed_by": "regex",
+            "pages": [{"url": p["url"], "status": p["status"],
+                       "targets": len(p["targets"]),
+                       "skipped": p["skipped"]} for p in pages],
+            "targets": [{"url": t["url"], "kind": t["kind"],
+                         "polling": t["polling"],
+                         "interval_s": t["interval_s"],
+                         "first_party": True,
+                         "status": t.get("probe_status")} for t in targets],
+            "failures": [t["url"] for t in failures],
+        }, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass          # a receipt is evidence, never a reason to fail a check
+
+
+@check
+def served_pages_fetch_what_they_ask_for():
+    """Does everything the served pages say they will request actually come
+    back? Nothing asked this before #12, and the answer was six dangling
+    fetches — three polling forever — and 550KB of authored content
+    silently 404ing behind a state/-vs-docs/ path drift that no repo-side
+    check could see, because each half was individually fine.
+
+    STATED LIMIT: this vantage is regex extraction over served bytes
+    (pagescan.py). It sees URL literals; a URL computed at runtime is
+    counted as a blind spot, never guessed. A CDP-driven variant can slot
+    in later by writing state/pagescan.json with observed_by:"cdp" — the
+    receipt is the seam, this check's verdict logic does not change.
+
+    EXPECTED TO FIRE against rappterbook's dead-fetch class — it was
+    written to, and the first live scan (2026-08-16) found the #12 drift
+    already fixed upstream (reddit.html's FEED_BASE now points at
+    docs/feed) with the remaining dangling requests hiding behind computed
+    URLs, counted as blind spots. While red it holds the install at
+    degraded, which pauses the level-3 evolve arm. That is CORRECT
+    behavior: evolve's precondition is "nothing is on fire", and 550KB of
+    authored content silently 404ing on every visitor is a fire. The
+    remedy is fixing the platform repo (or an owner-filed acceptance),
+    never softening this check.
+
+    critical=False throughout: the repair arm operates on this install; the
+    fix for a dangling page request is a content change in the platform
+    repo, which is not a repair it can perform (#50/#51 budget rule).
+    """
+    import pagescan
+    pages = [pagescan.scan_page(u, pagescan.http_fetch)
+             for u in PAGE_FETCH_PAGES]
+    blind = sum(p["skipped"] for p in pages)
+    unfetchable = [p for p in pages if not (200 <= p["status"] < 300)]
+
+    total_extracted = sum(len(p["targets"]) for p in pages)
+    if total_extracted == 0:
+        _write_pagescan_receipt(pages, [], [])
+        note = ""
+        if unfetchable:
+            note = ("; " + ", ".join(
+                f"{_short_name(p['url']) or 'page'} HTTP {p['status']}"
+                for p in unfetchable) + " unfetchable")
+        return fail("page_fetch",
+                    f"scanner extracted nothing across {len(pages)} pages "
+                    f"— blind, not clean{note}", critical=False)
+
+    merged, third_party = {}, set()
+    for p in pages:
+        for t in p["targets"]:
+            if not t["first_party"]:
+                third_party.add(t["url"])
+                continue
+            cur = merged.get(t["url"])
+            if cur is None:
+                cur = dict(t)
+                merged[t["url"]] = cur
+            elif t["polling"]:
+                cur["polling"] = True
+                if t["interval_s"] is not None and (
+                        cur["interval_s"] is None
+                        or t["interval_s"] < cur["interval_s"]):
+                    cur["interval_s"] = t["interval_s"]
+
+    ordered = sorted(merged.values(),
+                     key=lambda t: (not t["polling"],
+                                    _KIND_RANK.get(t["kind"], 9), t["url"]))
+    capped = len(ordered) > PAGE_PROBE_CAP
+    to_probe = ordered[:PAGE_PROBE_CAP]
+    failures = []
+    for t in to_probe:
+        t["probe_status"] = pagescan.probe(t["url"], pagescan.http_fetch)
+        if not (200 <= t["probe_status"] < 300):
+            failures.append(t)
+    _write_pagescan_receipt(pages, to_probe, failures)
+
+    notes = []
+    if capped:
+        notes.append(f"probe cap {PAGE_PROBE_CAP} hit "
+                     f"({len(ordered)} first-party targets — "
+                     f"{len(ordered) - PAGE_PROBE_CAP} unprobed)")
+    if unfetchable:
+        notes.append(", ".join(
+            f"page {_short_name(p['url']) or p['url']} HTTP {p['status']}"
+            for p in unfetchable) + " — could not scan")
+
+    if failures or unfetchable:
+        # Pollers first — a 404 every 30s is a different outage from one at
+        # load — then fetch/xhr/script, passive img last (`ordered` already
+        # sorts that way and `failures` preserves it).
+        parts = []
+        for t in failures:
+            status = t["probe_status"] or "unreachable"
+            if t["polling"]:
+                iv = (f"polled every {t['interval_s']:g}s"
+                      if t["interval_s"] is not None
+                      else "polled (interval not parseable)")
+                parts.append(f"{_short_name(t['url'])} {status}, {iv}")
+            else:
+                parts.append(f"{_short_name(t['url'])} {status} ({t['kind']})")
+        detail = (f"{len(failures)}/{len(to_probe)} first-party requests "
+                  f"do not come back: " + "; ".join(parts[:6]))
+        if len(parts) > 6:
+            detail += f" (+{len(parts) - 6} more)"
+        if not failures:
+            detail = "every probed request came back"
+        if notes:
+            detail += "; " + "; ".join(notes)
+        return fail("page_fetch", detail, critical=False)
+
+    pollers = sum(1 for t in to_probe if t["polling"])
+    detail = (f"{len(pages)} pages, {len(to_probe)} first-party targets all "
+              f"2xx ({pollers} pollers), {len(third_party)} third-party "
+              f"skipped, {blind} computed-URL blind spots")
+    if notes:
+        detail += "; " + "; ".join(notes)
+    return ok("page_fetch", detail)
+
+
+# Seed documents whose cadence claims matter most, UNIONed at runtime with
+# the first-party .json targets the last page scan actually observed.
+CADENCE_SEED_DOCS = (
+    f"https://raw.githubusercontent.com/{RB}/main/state/trending.json",
+    f"https://raw.githubusercontent.com/{RB}/main/state/synthetic_posts.json",
+    f"https://raw.githubusercontent.com/{RV}/main/state/chat.json",
+    CHANNEL + "/rappvision/channel.json",
+)
+CADENCE_DOC_CAP = 15
+CADENCE_GRACE = 10          # fire only past 10x the declared cadence...
+CADENCE_FLOOR_S = 1800      # ...and never inside 30 min, so cron jitter
+                            # cannot page. The target is 2-minutes-claimed
+                            # vs a-month-real, not 2-minutes vs 9.
+
+
+def _fmt_span(seconds):
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}min"
+    if seconds < 172800:
+        return f"{seconds / 3600:.1f}h"
+    return f"{seconds / 86400:.1f}d"
+
+
+@check
+def served_docs_keep_their_cadence_claims():
+    """A served document whose declared refresh cadence contradicts its own
+    newest timestamp is lying to every reader, and the contradiction is
+    machine-checkable (#12): synthetic_posts.json claimed a 2-minute
+    refresh while its last_updated sat a month old, and nothing compared
+    the two halves of the same file.
+
+    Grammar-or-nothing: declared_cadence() parses a closed grammar and
+    returns None for anything else, so an unparsed claim is counted as
+    silent, never guessed at. Firing needs BOTH halves readable — except a
+    cadence-declared-with-no-readable-stamp, which fires as an
+    unfalsifiable claim (a promise with no way to check it is the R1 shape:
+    a receipt the document writes about itself).
+
+    The bar is max(10x declared, 30min): 10x grace plus a floor, so cron
+    jitter never pages — the target is a month of drift behind a 2-minute
+    claim. Unreachable or unparseable documents are counted in the detail,
+    not judged; parseability is rb_json_parses' beat. critical=False: the
+    remedy is a content fix in the platform repo, not repair-arm budget.
+    """
+    import pagescan
+    docs = list(CADENCE_SEED_DOCS)
+    # Union with what the visitor's vantage last saw, if it is fresh enough
+    # to trust (<24h). A stale or missing receipt silently narrows to the
+    # seed set — the union is an enrichment, never a dependency.
+    try:
+        receipt = json.loads((HOME / "state" / "pagescan.json").read_text(
+            encoding="utf-8"))
+        age_h = hours_since(receipt.get("at"))
+        if age_h is not None and age_h < 24:
+            for t in receipt.get("targets") or []:
+                u = t.get("url") or ""
+                if (t.get("first_party")
+                        and u.split("?")[0].endswith(".json")
+                        and u not in docs):
+                    docs.append(u)
+    except Exception:
+        pass
+    docs = docs[:CADENCE_DOC_CAP]
+
+    liars, unreadable = [], []
+    read = declared = 0
+    now = datetime.now(timezone.utc)
+    for u in docs:
+        status, body = pagescan.http_fetch(u)
+        if not (200 <= status < 300) or not body:
+            unreadable.append(f"{_short_name(u)} ({status or 'unreachable'})")
+            continue
+        try:
+            doc = json.loads(body)
+        except Exception:
+            unreadable.append(f"{_short_name(u)} (unparseable)")
+            continue
+        read += 1
+        cadence = pagescan.declared_cadence(doc)
+        if cadence is None:
+            continue
+        declared += 1
+        stamp = pagescan.newest_stamp(doc)
+        if stamp is None:
+            liars.append(f"{_short_name(u)} claims refresh every "
+                         f"{_fmt_span(cadence)} but carries no readable "
+                         f"stamp — unfalsifiable claim")
+            continue
+        age_s = (now - pagescan.parse_iso(stamp)).total_seconds()
+        if age_s > max(CADENCE_GRACE * cadence, CADENCE_FLOOR_S):
+            liars.append(f"{_short_name(u)} claims refresh every "
+                         f"{_fmt_span(cadence)} but newest stamp is "
+                         f"{_fmt_span(age_s)} old")
+    if read == 0:
+        return fail("cadence_honest",
+                    f"read none of {len(docs)} served documents — blind, "
+                    f"not clean (" + ", ".join(unreadable[:5]) + ")",
+                    critical=False)
+    suffix = ""
+    if unreadable:
+        suffix = (f" ({len(unreadable)} unreadable, counted not judged: "
+                  + ", ".join(unreadable[:4]) + ")")
+    if liars:
+        return fail("cadence_honest", "; ".join(liars[:5]) + suffix,
+                    critical=False)
+    return ok("cadence_honest",
+              f"{read}/{len(docs)} documents read, {declared} declare a "
+              f"cadence and every stamp honors it, {read - declared} "
+              f"declare none{suffix}")
