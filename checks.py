@@ -18,6 +18,21 @@ Rules that make the difference between a loop that works and one that cries wolf
   * HONEST SEVERITY. critical=True spends money and takes actions. Use it for
     "the thing is not doing its job", not for "a page is slow".
 
+Three invariants, numbered so they can be cited in review (the incidents that
+paid for them are in TRIFECTA-PATTERN.md §6d):
+
+  * R1 A RECEIPT IS NOT EVIDENCE. Never pass on an exit code, an HTTP 200, a
+    workflow conclusion, or an intermediary's "✅ APPLIED". Evidence is the
+    observable end state: the published file, the row, the pid LISTENING,
+    the answered turn.
+  * R2 RAN IS NOT WORKED. Every watched domain carries at least one check
+    that measures OUTPUT movement — a timestamp on the thing produced, not
+    the status of the process producing it. moving() is the cheap default.
+  * R3 REQUIRE KNOWN-GOOD, NEVER ENUMERATE KNOWN-BAD. ok() must be gated on
+    a positive assertion; the absence of a named bad state is not health,
+    because a state nobody thought to name passes silently.
+    require_success() is the cheap default for run histories.
+
 Everything below `# ── your checks ──` is an example: the two GitHub-native
 platforms this pattern was built for. Delete it and write your own.
 """
@@ -119,6 +134,72 @@ class _Sentinel:
 # outage is not a missing check). Absence still pages (#43) -- but only absence
 # we actually observed.
 UNREADABLE = _Sentinel("UNREADABLE")
+
+# Evidence THIN, not evidence ABSENT-BY-FAILURE. UNREADABLE means the read
+# itself failed (we are blind); UNDECIDED means the read worked and what came
+# back is too little to judge (we can see, there is just not enough there).
+# The two demand different sentences — "cannot read run history" versus "too
+# few runs to judge" — and prove_undecided.py exists because conflating the
+# second with health hid a 5-of-5 failing workflow behind a thin window.
+UNDECIDED = _Sentinel("UNDECIDED")
+
+
+def moving(cid, timestamp_fn, max_age_h, what="output"):
+    """Output-freshness verdict — positive evidence that work HAPPENED (R2).
+
+    `timestamp_fn` returns an ISO stamp of the newest OBSERVED OUTPUT (never a
+    run receipt), or None when the output carries no stamp, or raises when it
+    could not be read. The three cases get three different sentences, because
+    they are three different claims (#45/#51):
+
+      reader raised -> warn      blind, not broken; no repair budget is spent
+                                 on a read we could not make
+      stamp absent  -> critical  we READ the output and it cannot testify to
+                                 its own freshness — that is a defect in the
+                                 output, not in our instrument
+      stamp stale   -> critical  the outage this helper exists for
+    """
+    try:
+        stamp = timestamp_fn()
+    except Exception as e:
+        return fail(cid, f"cannot read {what} timestamp "
+                         f"({type(e).__name__}: {str(e)[:60]})", critical=False)
+    if stamp is None:
+        return fail(cid, f"{what} carries no timestamp - cannot claim movement")
+    age = hours_since(stamp)
+    if age is None:
+        return fail(cid, f"{what} timestamp unreadable: {str(stamp)[:40]!r}")
+    if age >= max_age_h:
+        return fail(cid, f"{what} stale {age:.1f}h (bar {max_age_h}h)")
+    return ok(cid, f"{what} {age:.1f}h old")
+
+
+def require_success(conclusions, min_runs=3):
+    """Judge run history by POSITIVE evidence: an explicit success (R3).
+
+    Colour-blind about failure. cancelled, skipped, timed_out, action_required
+    and failure are all equally not-success, so a colour nobody enumerated
+    cannot pass — the shape that made static-api's cancelled-3/3 invisible to
+    `fail == total`, and would have made an all-skipped workflow invisible to
+    `cancelled > 0`.
+
+    Returns one of:
+      "success"    at least one explicit conclusion == "success"
+      "no-success" >= min_runs explicit conclusions, none of them a success
+      UNDECIDED    fewer than min_runs explicit conclusions (thin evidence —
+                   a prompt to look, never a defect and never health)
+      UNREADABLE   conclusions is None (the read failed; the caller inherited
+                   gh()'s default and must say "blind", not "fine")
+
+    min_runs=3 mirrors the existing total >= 3 bar in this file. Callers that
+    restate it silently own it (#27).
+    """
+    if conclusions is None:
+        return UNREADABLE
+    decided = [c for c in conclusions if c]   # queued/in-flight = non-verdicts
+    if any(c == "success" for c in decided):
+        return "success"
+    return "no-success" if len(decided) >= min_runs else UNDECIDED
 
 
 def workflows_failing_every_run(repo, limit=30, ignore=()):
@@ -262,6 +343,13 @@ def workflows_never_succeeding(repo, limit=40, ignore=()):
     Cancellation is not benign. It usually means a concurrency group is
     starving the job, which is exactly "the work never happens" wearing a
     colour that is neither red nor green.
+
+    Colour-blind on purpose (R3). The first version's candidate filter was
+    `cancelled > 0` — the enumerate-known-bad shape sitting inside the very
+    check written against it. A workflow skipped or timed out on every run
+    has ok == 0 and cancelled == 0, and was invisible. So candidacy is now
+    decided by require_success(): no explicit success across enough decided
+    runs, whatever colours the non-successes wear.
     """
     runs = gh(["run", "list", "-R", repo, "--limit", str(limit),
                "--json", "name,conclusion"], default=None)
@@ -273,14 +361,23 @@ def workflows_never_succeeding(repo, limit=40, ignore=()):
     for r in runs:
         if r["name"] in ignore:
             continue
-        d = per.setdefault(r["name"], {"ok": 0, "total": 0, "cancelled": 0})
-        d["total"] += 1
-        if r.get("conclusion") == "success":
-            d["ok"] += 1
-        elif r.get("conclusion") == "cancelled":
-            d["cancelled"] += 1
-    candidates = {n: v for n, v in per.items()
-                  if v["total"] >= 3 and v["ok"] == 0 and v["cancelled"] > 0}
+        per.setdefault(r["name"], []).append(r.get("conclusion"))
+    candidates = {}
+    for name, concl in per.items():
+        if require_success(concl) != "no-success":
+            continue
+        decided = [c for c in concl if c]
+        # Failing every run is workflows_failing_every_run's signal, already
+        # paged as rb_workflows' "100% failing". Reporting it here too would
+        # raise two alarms for one outage (prove_starvation_confirm holds
+        # this contract). This check owns the colours that are neither red
+        # nor green: cancelled, skipped, timed_out, action_required.
+        if all(c == "failure" for c in decided):
+            continue
+        candidates[name] = {
+            "total": len(decided),
+            "colours": dict(Counter(decided)),
+        }
     if not candidates:
         return {}
     # Confirm each candidate against a wider lookback FOR THAT WORKFLOW.
@@ -778,9 +875,34 @@ def rb_workflows_never_succeed():
         return ok("rb_wf_starved", "no workflows defined")
     if not stuck:
         return ok("rb_wf_starved", "every workflow has at least one success")
-    detail = ", ".join(f"{n} ({v['cancelled']}/{v['total']} cancelled)"
-                       for n, v in sorted(stuck.items()))
-    return fail("rb_wf_starved", "never succeeded: " + detail)
+
+    def colour_note(v):
+        colours = v.get("colours") or {}
+        note = ", ".join(f"{colours[c]}/{v.get('total', '?')} {c}"
+                         for c in sorted(colours))
+        if v.get("unconfirmed"):
+            note += ", wide lookback unreadable"
+        return note
+
+    # A workflow that is SKIPPED every run never ran the job at all — a
+    # trigger or path-filter is deciding that, and a path-filtered workflow
+    # can legitimately skip forever. That is a prompt to look, not a paged
+    # outage, so all-skipped stays visible at WARN rather than pretending we
+    # know which it is (refuse-rather-than-pretend). Any other colour mix —
+    # cancelled, timed_out, action_required, failure — means work was asked
+    # for and never completed, which is the starvation this check pages on.
+    hard = {n: v for n, v in stuck.items()
+            if set((v.get("colours") or {})) - {"skipped"}}
+    soft = {n: v for n, v in stuck.items() if n not in hard}
+    parts = []
+    if hard:
+        parts.append("never succeeded: " + ", ".join(
+            f"{n} ({colour_note(v)})" for n, v in sorted(hard.items())))
+    if soft:
+        parts.append("never ran the job (all skipped - trigger or "
+                     "path-filter suspect): " + ", ".join(
+                         f"{n} ({colour_note(v)})" for n, v in sorted(soft.items())))
+    return fail("rb_wf_starved", "; ".join(parts), critical=bool(hard))
 
 
 @check
@@ -795,7 +917,7 @@ def rb_served_json_parses():
     """
     import json as _j
     import urllib.request
-    bad, parsed = [], 0
+    bad, unread, parsed = [], [], 0
     names = ("stats", "agents", "channels", "trending", "social_graph")
     for name in names:
         url = f"https://raw.githubusercontent.com/{RB}/main/state/{name}.json"
@@ -806,9 +928,13 @@ def rb_served_json_parses():
             parsed += 1
         except _j.JSONDecodeError as e:
             bad.append(f"{name} ({str(e)[:40]})")
-        except Exception:
-            # Reachability is a different check's job; only parseability here.
-            pass
+        except Exception as e:
+            # Reachability is a different check's job — but a file we could
+            # not read is a file we did NOT examine, and `except: pass` made
+            # 4-unreachable-plus-1-parsed read as "served state parses (1/5)"
+            # at full green. Partial blindness is not a passing grade (R3):
+            # every unexamined name is carried into the verdict.
+            unread.append(f"{name} ({type(e).__name__})")
     if bad:
         return fail("rb_json_parses", "unparseable: " + ", ".join(bad))
     if parsed == 0:
@@ -817,6 +943,10 @@ def rb_served_json_parses():
         return fail("rb_json_parses",
                     f"read none of {len(names)} state files - cannot judge "
                     f"parseability", critical=False)
+    if unread:
+        return fail("rb_json_parses",
+                    f"parsed {parsed}/{len(names)}; could not read: "
+                    + ", ".join(unread), critical=False)
     return ok("rb_json_parses", f"served state parses ({parsed}/{len(names)})")
 
 
@@ -992,6 +1122,17 @@ def outsider_can_join():
             with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
                 import json as _j
                 n = len(_j.loads(r.read().decode()).get("agents", {}))
+            if n == 0:
+                # Readable is not joinable (R3). A roster wiped to zero parses
+                # cleanly and served 200, and the old code called that ok --
+                # an empty world reading healthy. Warn, not critical: the
+                # repair arm cannot restore a roster it did not delete, and
+                # paging it at a platform-owner decision spends budget on
+                # nothing (#50). Flip to critical only if observed behavior
+                # earns it.
+                return fail("rb_public_surface",
+                            "public state readable but lists zero agents",
+                            critical=False)
             note = f"public state readable, {n} agents"
             if i:
                 note += f" (recovered after {i + 1} attempts)"
@@ -1061,12 +1202,63 @@ def rb_rollup_covers_corpus():
                  critical=False))
 
 
+_SHARD_PATH = "state/cache_shards/shard_20750.json"
+
+
+def _shard_last_regenerated():
+    """ISO date of the commit that last touched the probe shard.
+
+    The shard's own bytes carry no timestamp (`_meta` is range_start /
+    range_end / count only — verified 2026-08-16), so freshness has to come
+    from the commit history of the path. Raises when that history cannot be
+    read, so moving() reports blind-not-broken instead of guessing (#45).
+    """
+    rows = gh(["api", f"repos/{RB}/commits?path={_SHARD_PATH}&per_page=1",
+               "--jq", '[.[].commit.committer.date]'], default=None)
+    if rows is None:
+        raise RuntimeError("commit history for the shard path unreadable")
+    if not rows:
+        return None      # path never committed — no stamp to stand on
+    return rows[0]
+
+
 @check
 def derived_data_regenerating():
     """Cache shards stopped regenerating when the write path jammed. The site
-    404'd on this exact file for weeks."""
-    return url_check("rb_shards", f"https://raw.githubusercontent.com/{RB}/main/"
-                                  "state/cache_shards/shard_20750.json")
+    404'd on this exact file for weeks.
+
+    A bare 200-check was the full #11 triple in one line: reachable is not
+    parseable is not current. The bytes are now required to parse and to
+    claim a positive discussion count, and freshness is judged against the
+    shard's MEASURED regeneration cadence: commits touching this path landed
+    every ~2-5h across 2026-08-15/16 (worst observed gap 4.9h), so 15h is
+    three times the worst gap — the same headroom reasoning as
+    rb_content_moving's 12h bar. If the generator is ever redesigned to
+    write shards immutably, this bar becomes a permanent false red and must
+    be replaced with a newest-shard-exists assertion, not silenced.
+    """
+    import json as _j
+    import urllib.request
+    url = f"https://raw.githubusercontent.com/{RB}/main/{_SHARD_PATH}"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+            body = r.read().decode("utf-8")
+    except Exception as e:
+        # Blind, not broken: one dropped connection must not read as a jammed
+        # write path (#45/#51).
+        return fail("rb_shards",
+                    f"cannot read shard ({type(e).__name__}: {str(e)[:60]})",
+                    critical=False)
+    try:
+        doc = _j.loads(body)
+    except Exception as e:
+        return fail("rb_shards", f"shard unparseable ({str(e)[:60]})")
+    count = (doc.get("_meta") or {}).get("count")
+    if not isinstance(count, int) or count <= 0:
+        return fail("rb_shards", "shard reports no discussions")
+    return moving("rb_shards", _shard_last_regenerated, 15,
+                  what=f"cache shard ({count} discussions)")
 
 
 @check
