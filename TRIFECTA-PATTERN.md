@@ -188,6 +188,66 @@ design, and swapping models would have hidden it.
 
 ---
 
+## 6d. The three invariants every check must satisfy
+
+Each of these was paid for with a real outage. They are numbered so a review
+can cite them the way it cites a section of a spec.
+
+### R1 — A receipt is not evidence
+
+No check may pass on an exit code, an HTTP 200, a workflow
+`conclusion: success`, or an intermediary's `✅ APPLIED` alone. Evidence is
+the **observable end state**: the published file, the row in state, the pid
+LISTENING, the answered turn.
+
+Worked example: `_brainstem_answers_turns` POSTs `/chat` and reads the
+answer — written after fourteen "alive" attestations that had never touched
+`/chat`. Counter-example: a registration receipt whose commit sha was real
+while the agent had been silently bound to a different id. Three separate
+authoritative-looking success signals were wrong in one day; all three were
+the same mistake — accepting an intermediary's report instead of measuring
+the thing itself.
+
+### R2 — Ran is not worked
+
+Every watched domain must carry at least one check that measures **output
+movement** — a timestamp on the thing produced — not only run status.
+
+Founding incident: five days of `rb_workflows: all green` over zero posts.
+Three independent failures each degraded to a no-op and exited 0; no workflow
+was failing, and the platform was stopped. The general form:
+
+> A system that reports on itself will report itself healthy right up until
+> it stops running.
+
+`moving()` in checks.py makes the output-freshness check the cheap default.
+
+### R3 — Require known-good, never enumerate known-bad
+
+`ok()` must be gated on a **positive assertion**. The absence of a named bad
+state is not health, because a state nobody thought to name passes silently.
+The enumerate-known-bad shape is a rejected design here, not a discouraged
+one — it has produced a blind spot every time it has been used:
+
+- cancelled 3/3 was invisible to `fail == total` (never a "failure")
+- a 200 response carried 590 unresolved git conflict markers
+- a file existed, parsed, and was 17,500 discussions behind
+
+The inversion table, from the issue that made this canon (#11):
+
+| enumerate known-bad | require known-good |
+|---|---|
+| no run has `conclusion == failure` | at least one run has `conclusion == success` |
+| the URL returns 200 | the bytes parse as the type they claim |
+| the file exists | its content is newer than N |
+
+The second column cannot be quietly satisfied by a state nobody thought of.
+`require_success()` in checks.py is the first row as code — colour-blind
+about failure, so cancelled, skipped and timed_out are all equally
+not-success.
+
+---
+
 ## 7. Porting it to another machine or task
 
 Only three things are estate-specific. Everything else is the pattern.
