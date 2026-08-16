@@ -177,7 +177,7 @@ FULL = [result("rappterbook", "outsider"),
         result("rappterverse", "outsider"),
         result("channel", "outsider")]
 
-REAL_HOME = H.HOME
+REAL_HOME = H.CODE
 
 r = H.check_outsider_coverage(FULL)
 scenario("(g) all three platforms carry an outsider result -> ok",
@@ -225,7 +225,7 @@ def with_manifest(doc_or_bytes):
         p.write_bytes(doc_or_bytes)
     else:
         p.write_text(json.dumps(doc_or_bytes), encoding="utf-8")
-    H.HOME = d
+    H.CODE = d
     return d
 
 
@@ -249,7 +249,7 @@ try:
              and "unreadable" in r["detail"],
              f"severity={r['severity']} {r['detail']}")
 finally:
-    H.HOME = REAL_HOME
+    H.CODE = REAL_HOME
 
 print(f"\n{len(FAILURES)} failing scenario(s)" if FAILURES
       else "\nall scenarios behaved as specified")

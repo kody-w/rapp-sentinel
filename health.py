@@ -489,7 +489,9 @@ def check_outsider_coverage(results):
     ticks and may run one tick ahead of its manifest — is "coverage
     unknown" at warn, never a raise and never green (#45).
     """
-    manifest = HOME / "required_checks.json"
+    # CODE, not HOME: the manifest is a property of checks.py and lives with
+    # the code — same reasoning as the two manifest reads below (#1).
+    manifest = CODE / "required_checks.json"
     try:
         doc = json.loads(manifest.read_text(encoding="utf-8"))
     except Exception as e:
