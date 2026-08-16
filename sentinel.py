@@ -119,6 +119,56 @@ def notify(cfg, text):
         log(f"notify failed: {e}")
 
 
+def publish_head_hook(cfg):
+    """Push the published head somewhere low-noise, throttled (#1 ask 6).
+
+    Chains advance every 15 minutes; serving heads from Pages means either
+    stale heads or a commit every tick on a repo whose history is the
+    product. The supported low-noise path is an operator-supplied command —
+    for this estate, `gh gist edit <id> --filename sentinel-head.json
+    "$SENTINEL_HEAD_PATH"` — run after every publish, throttled by
+    head_publish_min_minutes.
+
+    Absent config = exactly current behavior: no default command exists ON
+    PURPOSE. head_publish_cmd executes operator-supplied shell from
+    config.json — the same trust boundary as the installed plists, and a
+    default would turn a config file into an execution vector nobody wrote.
+
+    Failure is logged and stamped, never fatal: a broken publish hook must
+    not take the anchors, roll call, or the rest of the tick down with it.
+    Hard subprocess timeout — never lean on run.sh's 2100s ceiling.
+    """
+    cmd = cfg.get("head_publish_cmd")
+    if not cmd:
+        return
+    stamp_path = STATE / "head_publish_stamp.json"
+    min_minutes = float(cfg.get("head_publish_min_minutes", 10))
+    stamp = load_json(stamp_path, {})
+    last = stamp.get("at")
+    if last:
+        try:
+            age_m = (now() - datetime.fromisoformat(last)).total_seconds() / 60
+            if age_m < min_minutes:
+                return
+        except Exception:
+            pass
+    env = dict(os.environ)
+    env["SENTINEL_HEAD_PATH"] = str(HOME / "public" / "sentinel-head.json")
+    try:
+        r = subprocess.run(cmd, shell=True, env=env, capture_output=True,
+                           text=True,
+                           timeout=int(cfg.get("head_publish_timeout_s", 120)))
+        rc, err = r.returncode, (r.stderr or "")[:150]
+    except subprocess.TimeoutExpired:
+        rc, err = -1, "timed out"
+    except Exception as e:
+        rc, err = -1, f"{type(e).__name__}: {e}"
+    save_json(stamp_path, {"at": now().isoformat(timespec="seconds"),
+                           "rc": rc, "error": err if rc != 0 else ""})
+    if rc != 0:
+        log(f"head publish hook exited {rc}: {err}")
+
+
 def run_health():
     # CODE, not HOME: the runner is a code artifact. The child inherits this
     # process's environment, so it resolves the same SENTINEL_HOME.
@@ -468,6 +518,7 @@ def main():
         # watch them. Membership is whoever joins — but joining has to be
         # something you DO, not something you are granted.
         NB.publish_head()
+        publish_head_hook(cfg)
         peers = NB.peer_roll_call()
         if peers:
             save_json(STATE / "peers.json", peers)
