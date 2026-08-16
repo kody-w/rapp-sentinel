@@ -15,11 +15,10 @@ import json
 import subprocess
 import sys
 import concurrent.futures as cf
-from pathlib import Path
 
 import neighborhood as NB
+from paths import HOME
 
-HOME = Path(__file__).resolve().parent
 OUT = HOME / "retro"
 
 SITUATION = """

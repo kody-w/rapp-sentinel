@@ -151,14 +151,23 @@ mutated = src[:start] + (
 ) + src[end + len("\n    )\n"):]
 if MARKER in mutated:
     harness_error("mutation left the refusal in place — the splice failed")
+# The mutant models PRE-fix code, and pre-fix code derived HOME from
+# __file__ rather than importing the shared paths.py — which is also what
+# keeps every mutant path under TMP instead of on the real instance.
+HOME_MARKER = "from paths import HOME"
+if HOME_MARKER not in mutated:
+    harness_error(f"mutation anchor {HOME_MARKER!r} not found — cannot pin "
+                  "the mutant's HOME inside the sandbox")
+mutated = mutated.replace(
+    HOME_MARKER, "HOME = Path(__file__).resolve().parent", 1)
 mut_path = MUT_HOME / "neighborhood_prefix_mutant.py"
 mut_path.write_text(mutated, encoding="utf-8")
 
 spec = importlib.util.spec_from_file_location("neighborhood_prefix_mutant",
                                               mut_path)
 mut = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mut)   # HOME derives from __file__, so all its paths
-if TMP not in mut.RELAY.parents:  # land under TMP — but verify, don't assume
+spec.loader.exec_module(mut)   # the mutant's HOME derives from __file__, so
+if TMP not in mut.RELAY.parents:  # its paths land under TMP — but verify
     harness_error(f"mutant relay escaped the sandbox: {mut.RELAY}")
 
 before = mut.RELAY.read_text().splitlines() if mut.RELAY.exists() else []

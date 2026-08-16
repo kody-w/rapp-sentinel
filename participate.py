@@ -32,9 +32,9 @@ import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
 
-HOME = Path(__file__).resolve().parent
+from paths import HOME
+
 STATE = HOME / "state"
 LOG = STATE / "participation.jsonl"
 
@@ -253,7 +253,9 @@ def gather_observations(platform: str) -> str:
         active = sum(1 for v in a.values() if v.get("status") == "active")
         lines.append(f"  agents: {len(a)} registered, {active} active")
     except Exception as e:
-        lines.append(f"  agents: unreadable ({type(e).__name__})")
+        # Carry the reason: a 404 and a timeout demand different next steps,
+        # and the type name alone hands the neighbor neither (#1, ask 5).
+        lines.append(f"  agents: unreadable ({type(e).__name__}: {str(e)[:80]})")
 
     rc, out, _ = gh(["api", "graphql", "-f", f'''query={{repository(owner:"{plat["repo"].split("/")[0]}",name:"{plat["repo"].split("/")[1]}"){{discussions(first:6,orderBy:{{field:CREATED_AT,direction:DESC}}){{nodes{{number createdAt title}}}}}}}}'''])
     if rc == 0:

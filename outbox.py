@@ -37,7 +37,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-HOME = Path(__file__).resolve().parent
+from paths import HOME
+
 STATE = HOME / "state"
 STATE.mkdir(exist_ok=True)
 QUEUE = STATE / "outbox.jsonl"
