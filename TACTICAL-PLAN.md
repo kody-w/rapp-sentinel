@@ -23,52 +23,52 @@ ledger, `peers-seen.json`, its own `config.json` — and it picks up new code by
 
 ## Tranche 1 — framework bedrock (#2, #3, #11, #8, #1-part)
 
-- [ ] **TRIFECTA-PATTERN.md §6d** — three numbered, incident-backed invariants:
+- [x] **TRIFECTA-PATTERN.md §6d** — three numbered, incident-backed invariants:
   R1 *a receipt is not evidence* (#2), R2 *ran is not worked* (#3),
   R3 *require known-good, never enumerate known-bad* (#11). One-line forms also
   appended to the checks.py docstring, where authors actually look at 2am.
-- [ ] **`moving()` + `require_success()` + `UNDECIDED`** — helpers that make the
+- [x] **`moving()` + `require_success()` + `UNDECIDED`** — helpers that make the
   right check shape the cheap default. `moving()` separates *blind* (warn) from
   *stampless* and *stale* (critical). `require_success()` is colour-blind about
   failure: cancelled, skipped, timed_out are all equally not-success.
-- [ ] **Four audited live defects fixed**: `rb_wf_starved` misses all-skipped /
+- [x] **Four audited live defects fixed**: `rb_wf_starved` misses all-skipped /
   all-timed-out (only counts `cancelled`); `rb_public_surface` passes on a
   zero-agent roster; `rb_json_parses` silently skips unreachable files and can
   report ok on 1-of-5; `rb_shards` is a bare 200-check on bytes it never parses.
   Plus **CHECK-AUDIT.md**: the full 22-id ledger of what each check passes on
   today and its positive-evidence inversion, so the findings transfer (#16's rule).
-- [ ] **prove_unsigned_relay_refusal.py** — the #8 fix is already merged
+- [x] **prove_unsigned_relay_refusal.py** — the #8 fix is already merged
   (`say()` refuses, §16 block records both gaps); ship the house-rule proof
   that the refusal fires, then close #8.
-- [ ] **`advancing` is null on first sight** (#1 ask 3) — plus a
+- [x] **`advancing` is null on first sight** (#1 ask 3) — plus a
   `stalled_peers()` classifier, because `sentinel.py` tests truthiness and a
   bare `None` would swap "born-stalled reads healthy" for "first-sight reads stalled".
 
 ## Tranche 2 — instance & runner infrastructure (#1, #23, #3, #38, #16)
 
-- [ ] **SENTINEL_HOME** via one shared `paths.py`, honored by every runtime
+- [x] **SENTINEL_HOME** via one shared `paths.py`, honored by every runtime
   module (all 10 derive HOME independently today — a one-file fix would split-brain).
   Unset ⇒ byte-identical behavior.
-- [ ] **HTTP status codes in every fetch-failure detail** (#1 ask 5) —
+- [x] **HTTP status codes in every fetch-failure detail** (#1 ask 5) —
   `fetch_peer` and the other bare `type(e).__name__` sites; 404 and 503 demand
   opposite responses.
-- [ ] **launchd truth** (#23): fix the missing `import os` in health.py (the
+- [x] **launchd truth** (#23): fix the missing `import os` in health.py (the
   gui-domain query silently falls back to uid 501 today), enumerate both
   domains for the socket-owning pid, three-state supervision answer.
-- [ ] **`w_openrappter_spin`** (#23): a loaded job with runs≥3, last exit ≠ 0,
+- [x] **`w_openrappter_spin`** (#23): a loaded job with runs≥3, last exit ≠ 0,
   never running is a spinning wheel — its own id, manifest row, prove file.
-- [ ] **`w_freshness_paired`** (#3): a watched domain with run-status checks but
+- [x] **`w_freshness_paired`** (#3): a watched domain with run-status checks but
   no output-freshness check becomes a per-tick finding.
-- [ ] **MUTATION-LEDGER.md** — the 19/19 T1 mutation results, the three harness
+- [x] **MUTATION-LEDGER.md** — the 19/19 T1 mutation results, the three harness
   errors, and the transferable rule ("a mutation harness must prove it actually
   broke something"), with a coverage-guard test. Closes #38; names where the
   chain of watchers ends (#16, weakness 5).
 
 ## Tranche 3 — diagnose-and-measure + the outsider's vantage (#4, #5, #1-part, #12)
 
-- [ ] **`sentinel diagnose`** (#4): identity / scope / reachability of every
+- [x] **`sentinel diagnose`** (#4): identity / scope / reachability of every
   credential and endpoint the checks depend on, values never printed.
-- [ ] **Escalation prompts carry attempt history** (#4): repeated failure of the
+- [x] **Escalation prompts carry attempt history** (#4): repeated failure of the
   same repair means the *diagnosis* is wrong — the prompt says to change method.
 - [ ] **`@outsider_check` vantage marker + `w_outsider_coverage`** (#5): every
   watched platform must have ≥1 unauthenticated check, enforced per tick.
