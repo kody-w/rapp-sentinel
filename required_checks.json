@@ -1,6 +1,6 @@
 {
   "_why": "A registry that only ENUMERATES cannot notice something missing. all_checks() returns whatever decorators happened to run, so one lost @check line removes a check while the verdict still reads 'healthy - all checks passing'. Demonstrated: deleting the decorator on rb_workflows_never_succeed dropped rb_wf_starved and changed nothing else about the output. This file is the REQUIRED set; w_checks_complete compares it against what actually ran and fails critically on a gap.",
-  "_adding_a_check": "Add its id here in the same commit. Ids that run but are not listed are reported as 'unlisted' WITHOUT failing, so a new check never breaks the loop before you catch up.",
+  "_adding_a_check": "Add its id here in the same commit. Ids that run but are not listed are reported as 'unlisted' WITHOUT failing, so a new check never breaks the loop before you catch up. Classify it in the kinds map too - an unclassified id is reported by w_freshness_paired without failing.",
   "_removing_a_check": "Delete its id here deliberately, in a commit that says why. Retiring a check should be a decision with a diff, not an accident.",
   "required": [
     "alert_delivery",
@@ -23,7 +23,38 @@
     "w_anchor_ledger",
     "w_brainstem",
     "w_checks_complete",
+    "w_freshness_paired",
     "w_openrappter",
+    "w_openrappter_spin",
     "w_sentinel_fresh"
-  ]
+  ],
+  "_kinds_why": "R2 (ran is not worked) enforced mechanically: w_freshness_paired reads this map and fails, at warn, any domain that has run-status coverage but no output-freshness coverage. Classifying a new check here is one line; the five-day rappterbook silence is what it costs not to.",
+  "kinds": {
+    "eco_sweep": {"domain": "ecosystem", "kind": "run-status"},
+    "rv_world_merging": {"domain": "rappterverse", "kind": "output-freshness"},
+    "rv_meaningful_activity": {"domain": "rappterverse", "kind": "output-freshness"},
+    "rv_validation": {"domain": "rappterverse", "kind": "run-status"},
+    "rv_pr_queue": {"domain": "rappterverse", "kind": "consistency"},
+    "rb_workflows": {"domain": "rappterbook", "kind": "run-status"},
+    "rb_wf_starved": {"domain": "rappterbook", "kind": "run-status"},
+    "rb_json_parses": {"domain": "rappterbook", "kind": "consistency"},
+    "rb_content_moving": {"domain": "rappterbook", "kind": "output-freshness"},
+    "rb_derived_truth": {"domain": "rappterbook", "kind": "consistency"},
+    "rb_public_surface": {"domain": "rappterbook", "kind": "reachability"},
+    "rb_rollup_coverage": {"domain": "rappterbook", "kind": "consistency"},
+    "rb_shards": {"domain": "rappterbook", "kind": "output-freshness"},
+    "gh_status": {"domain": "github", "kind": "reachability"},
+    "sites": {"domain": "sites", "kind": "reachability"},
+    "channel": {"domain": "channel", "kind": "reachability"},
+    "alert_delivery": {"domain": "delivery", "kind": "watcher"},
+    "w_brainstem": {"domain": "watchers", "kind": "watcher"},
+    "w_openrappter": {"domain": "watchers", "kind": "watcher"},
+    "w_openrappter_spin": {"domain": "watchers", "kind": "watcher"},
+    "w_anchor_ledger": {"domain": "watchers", "kind": "watcher"},
+    "w_sentinel_fresh": {"domain": "watchers", "kind": "watcher"}
+  },
+  "_unpaired_accepted_why": "An accepted pairing gap is a DECISION with a diff, not a silence. A permanently-red pairing check would hold the verdict at degraded forever, which silently disables the level-3 evolve arm (sentinel only evolves while healthy) and trains readers to scroll past the channel. Each entry names the domain and why its gap is accepted; deleting an entry re-arms the check for that domain.",
+  "unpaired_accepted": {
+    "ecosystem": "the generic sweep's repos have no single output artifact to stamp; per-repo freshness bars are an owner decision, recorded as the eco_sweep row of CHECK-AUDIT.md (2026-08-16)"
+  }
 }
