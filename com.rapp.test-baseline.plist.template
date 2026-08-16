@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- OPT-IN: daily set-based test-baseline comparison (#13). Heavy (full
+     clone + full suite), which is why it is a schedule and not a tick.
+     BASELINE_SCHEDULED=1 marks the receipts as schedule-written, so
+     w_test_baseline treats a silence >48h as a dead instrument — receipts
+     from manual runs never age-warn. Install via install-launchd.sh or:
+       sed "s|__SENTINEL_DIR__|/path/to/rapp-sentinel|" \
+           com.rapp.test-baseline.plist.template \
+           > ~/Library/LaunchAgents/com.rapp.test-baseline.plist
+       launchctl load ~/Library/LaunchAgents/com.rapp.test-baseline.plist -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.rapp.test-baseline</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__SENTINEL_DIR__/baseline.py</string>
+    <string>compare</string>
+    <string>rapp-sentinel</string>
+  </array>
+  <key>WorkingDirectory</key><string>__SENTINEL_DIR__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>BASELINE_SCHEDULED</key><string>1</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>6</integer><key>Minute</key><integer>30</integer></dict>
+  <key>StandardOutPath</key><string>__SENTINEL_DIR__/logs/test-baseline.log</string>
+  <key>StandardErrorPath</key><string>__SENTINEL_DIR__/logs/test-baseline.log</string>
+</dict>
+</plist>

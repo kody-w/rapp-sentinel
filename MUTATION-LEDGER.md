@@ -163,6 +163,7 @@ check keeps its history.*
 | `w_outsider_coverage` | `prove_outsider_coverage.py` | proven |
 | `page_fetch` | `prove_page_fetch.py` (ships with the check, #12) | proven |
 | `cadence_honest` | `prove_cadence_honest.py` (ships with the check, #12) | proven |
+| `w_test_baseline` | `prove_test_baseline.py` (ships with the check, #13) | proven |
 
 The two UNPROVEN rows are the honest debt: both ids landed in #62 with unit
 tests that exercise their fail and pass branches, but neither has been through
