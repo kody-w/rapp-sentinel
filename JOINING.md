@@ -94,6 +94,12 @@ is the one that matters** — a peer serving a stale file forever looks perfectl
 healthy on every other axis, which is precisely the failure this project exists
 to catch.
 
+One honest caveat: on the **first** observation of a peer, `advancing` is
+`null` with `advancing_basis: "first-sight"`. There is no prior head to compare
+against yet, so there is no basis for a verdict — and no basis is never
+reported as health. Judgement starts on the second fetch, when the basis
+becomes `"compared"`.
+
 ### 4. Nothing else
 
 There is no registry to be added to, no key to be issued, no handshake. If your
