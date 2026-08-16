@@ -41,8 +41,14 @@ grepping.
 
 Everything below `# ── your checks ──` is an example: the two GitHub-native
 platforms this pattern was built for. Delete it and write your own.
+
+One carve-out (issue #1 ask 2): the estate-specific watcher probes — the
+brainstem /chat POST and the openrappter port/labels — live in health.py's
+probe_watchers and are retargeted through config.json's `watchers` block
+(see config.example.json), not by editing this file.
 """
 
+import functools
 import json
 import subprocess
 import urllib.error
@@ -60,6 +66,51 @@ def check(fn):
     """Decorator. Any function decorated with @check runs every tick."""
     _REGISTRY.append(fn)
     return fn
+
+
+def outsider_check(platform):
+    """Register like @check AND enforce the outsider vantage (issue #5).
+
+    A check wearing this decorator claims to see `platform` the way a
+    stranger would — no owner credentials. The claim is ENFORCED, not
+    asserted (R3): _GH_CALLS is snapshotted around the check, and if the
+    execution routed through gh() — the one credentialed helper in this
+    file — the check's own result is REPLACED with a critical failure,
+    because a verdict produced with the owner's token proves nothing about
+    the front door. The runner is single-threaded, so a plain module
+    counter is a sound witness.
+
+    The result is tagged additively: platform=<platform> always, and
+    vantage="outsider" only when the execution stayed unprivileged. A
+    violation is tagged vantage="credentialed" instead, so
+    w_outsider_coverage (health.py) cannot count a violation as coverage —
+    the vantage tag is earned, never declared.
+
+    Honest limit: the counter proves no owner credentials flowed through
+    the one credentialed helper (gh). A check that shells out to `gh`
+    directly, or reads a token file itself, is invisible to it — that is a
+    code-review property, the same class of limit as w_checks_complete's
+    inability to detect its own removal.
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            before = _GH_CALLS
+            r = fn(*args, **kwargs)
+            if not isinstance(r, dict):
+                return r      # the runner already reports non-results
+            if _GH_CALLS != before:
+                r = fail(r.get("id") or fn.__name__,
+                         "claimed outsider vantage but used owner "
+                         "credentials (gh)")
+                r["vantage"] = "credentialed"
+            else:
+                r["vantage"] = "outsider"
+            r["platform"] = platform
+            return r
+        _REGISTRY.append(wrapper)
+        return wrapper
+    return deco
 
 
 def all_checks():
@@ -89,8 +140,22 @@ def http_status(url):
         return 0
 
 
+# How many times gh() has been entered this process. The runner is
+# single-threaded, so outsider_check() can snapshot this around a check to
+# prove the execution never touched the owner's credentials.
+_GH_CALLS = 0
+
+
 def gh(args, default=None):
-    """Run `gh` and parse JSON. Returns `default` on any failure."""
+    """Run `gh` and parse JSON. Returns `default` on any failure.
+
+    The ONE credentialed helper in this file: everything gh does rides the
+    owner's token. _GH_CALLS is incremented on entry, before any outcome,
+    so even a failed or timed-out gh call counts as having reached for the
+    owner's credentials.
+    """
+    global _GH_CALLS
+    _GH_CALLS += 1
     try:
         r = subprocess.run(["gh"] + args, capture_output=True,
                            text=True, timeout=TIMEOUT)
@@ -632,9 +697,15 @@ def world_still_merging():
             else fail("rv_world_merging", f"last merge {h:.1f}h ago"))
 
 
-@check
+@outsider_check("rappterverse")
 def world_is_meaningfully_active():
-    """Commits are not life when one bot repeats one action forever."""
+    """Commits are not life when one bot repeats one action forever.
+
+    Outsider vantage: every read here is public_json — unauthenticated raw
+    fetches of served state, the same bytes a stranger's crawler would get.
+    The decorator holds that honest: any gh() call would replace this
+    check's verdict with a credential-violation failure.
+    """
     actions_doc, actions_error = public_json(RV, "state/actions.json")
     chat_doc, chat_error = public_json(RV, "state/chat.json")
     agents_doc, agents_error = public_json(RV, "state/agents.json")
@@ -1098,7 +1169,7 @@ def rb_derived_state_tells_the_truth():
     )
 
 
-@check
+@outsider_check("rappterbook")
 def outsider_can_join():
     """Can a stranger still participate, or only the privileged fleet?
 
@@ -1358,8 +1429,9 @@ def sites_up():
     )) or ok("sites", "both serving")
 
 
-@check
+@outsider_check("channel")
 def channel_serving():
+    # url_check is a plain unauthenticated GET — the outsider's read.
     return _fanout("channel", (
         ("ch_home", CHANNEL + "/"),
         ("ch_json", CHANNEL + "/rappvision/channel.json"),

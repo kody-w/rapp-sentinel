@@ -26,5 +26,22 @@
     "kody-w/rapp-moment",
     "kody-w/public-art-collective"
   ],
-  "commons_repo": ""
+  "commons_repo": "",
+  "_watchers_why": "health.py's probe_watchers reads its estate-probe targets from this block (issue #1 ask 2). Every key defaults to the previously hardcoded live values, so omitting the whole block changes nothing. Overrides merge per watcher - give only the keys you change. enabled:false skips that probe AND declares the omission in every verdict (w_checks_complete reports 'disabled by config'), never a silent green. openrappter.labels is the same key the spin scan unions into its candidate labels - one key, one read path.",
+  "watchers": {
+    "brainstem": {
+      "enabled": true,
+      "url": "http://localhost:7071/chat",
+      "timeout": 30
+    },
+    "openrappter": {
+      "enabled": true,
+      "port": 18790,
+      "labels": [
+        "com.openrappter.rapptertwo",
+        "com.openrappter.gateway",
+        "com.openrappter.daemon"
+      ]
+    }
+  }
 }
