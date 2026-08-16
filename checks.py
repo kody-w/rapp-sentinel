@@ -1340,6 +1340,310 @@ def derived_data_regenerating():
                   what=f"cache shard ({count} discussions)")
 
 
+# ── issue #6: guardrails built for weaker models expire ─────────────────────
+
+# The registry rides the CHECKOUT, not the instance: which rails exist is a
+# property of the watched platform's code, the same reasoning that puts
+# required_checks.json under CODE rather than HOME.
+from paths import CODE as _CODE
+
+SCAFFOLDING_REGISTRY = _CODE / "scaffolding" / "rappterbook.json"
+
+# The one machine-readable cross-check rails_fresh can make from outside:
+# rappterbook publicly serves this config, and quality_guardian.py regenerates
+# its ban lists each cycle (verified live 2026-08-16: banned_phrases x64,
+# banned_words x6). Any served list-valued key containing "banned" must have a
+# registry row claiming it, or a new ban list is filtering output with no row
+# dating it.
+BAN_LIST_CONFIG = "state/quality_config.json"
+
+_MONTH_DAYS = 30.4375
+
+
+def months_since(day):
+    """Months since an ISO date or datetime; None when unparseable."""
+    try:
+        d = datetime.fromisoformat(str(day).replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - d).days / _MONTH_DAYS
+    except Exception:
+        return None
+
+
+def rails_report(registry_doc, fetch):
+    """Verdict over a scaffolding registry (pure - the fetch is injected).
+
+    `registry_doc` is the parsed registry (None when it could not be read),
+    `fetch(path)` returns the text of `path` as served from the watched
+    repo's main branch, raising on failure. Injected so the harness needs
+    no network and so the drift half is testable against synthetic worlds.
+
+    Three claims, judged separately:
+      * AGE - a rail older than review_after_months since
+        max(written, last_reviewed) is surfaced BY NAME with what it was
+        guarding against. last_reviewed=null legally means "never reviewed";
+        age is then judged from written, so a never-reviewed rail cannot
+        hide behind the null.
+      * DRIFT, both directions - source.path must still contain
+        must_contain. A vanished anchor is a finding ("rail no longer found
+        upstream": either the rail was removed without this registry
+        hearing about it, or it moved and the row is stale - both are the
+        registry lying). An UNREADABLE fetch is counted as "unverifiable: N"
+        and fails at warn - blind is never green (#45).
+      * BAN-LIST CROSS-CHECK - every list-valued "banned*" key in the
+        served quality config must have a claiming rail row, so a new ban
+        list cannot start filtering output with no row dating it.
+    """
+    cid = "rails_fresh"
+    if registry_doc is None:
+        return fail(cid, "scaffolding registry unreadable - rail ages "
+                         "unknown, which is the exact blindness #6 names",
+                    critical=False)
+    rails = registry_doc.get("rails")
+    if not isinstance(rails, list) or not rails:
+        return fail(cid, "scaffolding registry lists no rails - the audit "
+                         "has not happened, not 'no rails exist'",
+                    critical=False)
+    try:
+        bar = float(registry_doc.get("review_after_months") or 6)
+    except Exception:
+        bar = 6.0
+    findings, unverifiable = [], []
+    unmeasured, oldest = 0, 0.0
+    for rail in rails:
+        if not isinstance(rail, dict):
+            findings.append("registry row is not an object")
+            continue
+        rid = str(rail.get("id") or "?")
+        if not rail.get("rejection_ledger"):
+            unmeasured += 1
+        stamp = rail.get("last_reviewed") or rail.get("written")
+        age = months_since(stamp)
+        if age is None:
+            findings.append(f"{rid} carries no parseable written/"
+                            f"last_reviewed date - age unknown")
+        else:
+            oldest = max(oldest, age)
+            if age >= bar:
+                what = str(rail.get("guarding_against") or "?")[:90]
+                findings.append(
+                    f"{rid} unreviewed for {age:.1f} months (bar {bar:g}) - "
+                    f"still guarding against: {what}")
+        src = rail.get("source") or {}
+        path, anchor = src.get("path"), src.get("must_contain")
+        if not path or not anchor:
+            findings.append(f"{rid} declares no verifiable source anchor")
+            continue
+        try:
+            text = fetch(path)
+        except Exception as e:
+            unverifiable.append(f"{rid} ({type(e).__name__})")
+            continue
+        if anchor not in (text or ""):
+            findings.append(f"{rid} rail no longer found upstream "
+                            f"({path} lacks {anchor!r})")
+    try:
+        cfg = json.loads(fetch(BAN_LIST_CONFIG))
+        for key in sorted(k for k, v in cfg.items()
+                          if "banned" in k and isinstance(v, list) and v):
+            claimed = any(
+                key in str((r.get("source") or {}).get("must_contain") or "")
+                or key in str(r.get("guarding_against") or "")
+                for r in rails if isinstance(r, dict))
+            if not claimed:
+                findings.append(f"served ban list {key!r} "
+                                f"({len(cfg[key])} entries) has no claiming "
+                                f"rail row")
+    except Exception as e:
+        unverifiable.append(f"ban-list cross-check ({type(e).__name__})")
+    ledger_note = (f"{unmeasured} rails with no rejection ledger (unmeasured)"
+                   if unmeasured else "")
+    if findings or unverifiable:
+        parts = list(findings)
+        if unverifiable:
+            parts.append(f"unverifiable: {len(unverifiable)} "
+                         f"({', '.join(unverifiable)})")
+        if ledger_note:
+            parts.append(ledger_note)
+        return fail(cid, "; ".join(parts), critical=False)
+    detail = (f"{len(rails)} rails verified upstream, oldest "
+              f"{oldest:.1f} months against a {bar:g}-month bar")
+    if ledger_note:
+        detail += f"; {ledger_note}"
+    return ok(cid, detail)
+
+
+@check
+def scaffolding_rails_fresh():
+    """Quality rails expire silently as models improve; date the assumption.
+
+    Issue #6's evidence: validate_grounded_references was entirely rational
+    against weaker models, then its false-positive rate hit 100% of
+    legitimate output and it caused a five-day total outage - and nothing in
+    the loop noticed the day it flipped. scaffolding/rappterbook.json dates
+    each rail (seeded from a read-only audit of the live repo, 2026-08-16;
+    every path and anchor verified served) and this check surfaces, at warn,
+    any rail unreviewed past the bar, any rail whose anchor has vanished
+    upstream, and any served ban list with no claiming row.
+
+    Warn ON PURPOSE. Clearing the red means a human bumping last_reviewed
+    with a review_note in a commit - which IS the dated decision record #6
+    asks for. Critical would page the repair arm at a judgment call it must
+    not make (#6 ask 4: never strip a rail without evidence).
+
+    Honest limits, stated rather than implied:
+      * The registry is HAND-MAINTAINED CLAIMS. This check dates the
+        assumption; it cannot verify that a claimed review actually
+        happened, any more than a code comment can.
+      * Full enumeration of UNREGISTERED rails is not automatable from
+        outside - a new regex in content_engine.py is invisible until a
+        human audits it into the registry. The one machine-readable
+        cross-check that IS possible is made: rappterbook publicly serves
+        state/quality_config.json whose ban lists are regenerated each
+        cycle, so a ban list nobody claimed is caught. Everything else is
+        the audit cadence this check exists to force.
+    """
+    try:
+        doc = json.loads(SCAFFOLDING_REGISTRY.read_text(encoding="utf-8"))
+    except Exception:
+        doc = None
+    cache = {}
+
+    def fetch(path):
+        # Memoized per tick: four rails share content_engine.py, and four
+        # identical 25s-timeout fetches would quadruple both the cost and
+        # the chance one dropped connection splits the verdict.
+        if path not in cache:
+            url = f"https://raw.githubusercontent.com/{RB}/main/{path}"
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "rapp-sentinel"})
+            try:
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                    cache[path] = ("ok", r.read().decode("utf-8"))
+            except Exception as e:
+                cache[path] = ("err", e)
+        kind, value = cache[path]
+        if kind == "err":
+            raise value
+        return value
+
+    return rails_report(doc, fetch)
+
+
+REJECTION_LEDGER = "state/slop_cop_log.json"
+REJECTION_WINDOW_H = 48
+# n >= 5 and >= 90% flagged: "rejecting essentially everything" - the
+# day-one catch for the July-30 outage shape, and the one shape worth
+# paging. n >= 10 and >= 50%: visible, but whether the cop is miscalibrated
+# or the input got worse is a human question - the same severity split
+# rv_validation draws between a full-streak rejection and a bad ratio.
+REJECTION_CRITICAL_MIN_N, REJECTION_CRITICAL_RATE = 5, 0.9
+REJECTION_WARN_MIN_N, REJECTION_WARN_RATE = 10, 0.5
+
+
+def rejection_report(doc, read_error=""):
+    """Verdict over the served slop-cop ledger (pure - the read is injected).
+
+    Live shape re-verified 2026-08-16 against
+    https://raw.githubusercontent.com/kody-w/rappterbook/main/state/slop_cop_log.json:
+    a ring of 500 `reviews` rows ({post_number, title, score, reason,
+    flagged, timestamp}) plus `_meta` ({total_reviews, total_flags,
+    last_run, last_run_reviewed, last_run_flagged, last_run_avg_score,
+    materialized_at}). The window is judged by TIMESTAMP, never by row
+    count: a 500-row ring spans ~10 weeks, and a rate over the whole ring
+    would dilute a two-day 100%-rejection outage below every threshold.
+
+    Verdicts, in the order they short-circuit:
+      * ledger unreadable        -> warn ("unmeasured, not fine" - blind is
+                                   never green, #45)
+      * _meta.last_run >= 48h    -> warn: rejections UNMEASURED, not fine.
+                                   A cop that stopped patrolling is not a
+                                   clean street.
+      * ran, but no review stamps
+        inside 48h               -> warn: it ran and judged nothing.
+      * n>=5, rate >= 90%        -> CRITICAL "rejecting essentially
+                                   everything"
+      * n>=10, rate >= 50%       -> warn - a human question
+      * else                     -> ok with counts + freshness
+
+    The min-sample gates are the difference between a signal and a slot
+    machine: one flagged post on a quiet platform is 1/1 = 100% and must
+    never page.
+    """
+    cid = "rb_rejection_rate"
+    if doc is None:
+        return fail(cid,
+                    f"rejection ledger not readable - rejections unmeasured, "
+                    f"not fine ({str(read_error)[:80]})", critical=False)
+    meta = doc.get("_meta") or {}
+    run_age = hours_since(str(meta.get("last_run") or ""))
+    if run_age is None:
+        return fail(cid, "rejection ledger carries no parseable "
+                         "_meta.last_run - cannot claim rejections are "
+                         "measured", critical=False)
+    if run_age >= REJECTION_WINDOW_H:
+        return fail(cid,
+                    f"slop-cop last ran {run_age:.1f}h ago - rejections "
+                    f"UNMEASURED for {run_age:.0f}h, not fine",
+                    critical=False)
+    window, stampless = [], 0
+    for row in (doc.get("reviews") or []):
+        if not isinstance(row, dict):
+            continue
+        age = hours_since(str(row.get("timestamp") or ""))
+        if age is None:
+            stampless += 1
+        elif age < REJECTION_WINDOW_H:
+            window.append(row)
+    if not window:
+        note = (f" ({stampless} rows carry no parseable timestamp)"
+                if stampless else "")
+        return fail(cid,
+                    f"slop-cop ran {run_age:.1f}h ago but reviewed nothing "
+                    f"in the last {REJECTION_WINDOW_H}h{note}",
+                    critical=False)
+    n = len(window)
+    flagged = sum(1 for row in window if row.get("flagged"))
+    rate = flagged / n
+    d = (f"{flagged}/{n} flagged in the last {REJECTION_WINDOW_H}h "
+         f"({rate:.0%}), cop ran {run_age:.1f}h ago")
+    if n >= REJECTION_CRITICAL_MIN_N and rate >= REJECTION_CRITICAL_RATE:
+        return fail(cid, f"slop-cop rejecting essentially everything: {d}")
+    if n >= REJECTION_WARN_MIN_N and rate >= REJECTION_WARN_RATE:
+        return fail(cid,
+                    f"slop-cop flagging most recent output: {d} - "
+                    f"miscalibrated rail or worse input, a human question "
+                    f"either way", critical=False)
+    return ok(cid, d)
+
+
+@check
+def rb_slop_cop_rejection_rate():
+    """Measure rejections, not just failures (#6 ask 2).
+
+    The July-30 outage would have been caught on day one by a "rejection
+    rate hit 100%" check; this is that check for the one rail whose
+    verdicts are PUBLIC. rejection_report holds the judgment; the read is
+    injected here so the day another rail publishes a ledger, extending
+    this is one wrapper, not a rewrite.
+
+    The honest limit, stated plainly: this measures the ONE rail with a
+    public ledger - slop_cop, which logs every review to
+    state/slop_cop_log.json. The rail that actually caused July 30
+    (validate_grounded_references) logs its rejections NOWHERE public;
+    generation_outcome records them inside the run, and today only
+    rb_content_moving catches the downstream symptom (output stops
+    moving). The upstream ask that extends this check to the outage-shaped
+    rail is rappterbook publishing state/validation_rejections.json - a
+    per-rail rejected/accepted counter ring, same shape as the slop-cop
+    log. Until it exists, this check is honest about measuring the
+    measurable rather than pretending to measure everything.
+    """
+    doc, err = public_json(RB, REJECTION_LEDGER)
+    return rejection_report(doc, err)
+
+
 @check
 def test_baseline_honest():
     """A baseline is a claim with a timestamp AND an environment (#13).

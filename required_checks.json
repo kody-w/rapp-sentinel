@@ -9,10 +9,12 @@
     "eco_sweep",
     "gh_status",
     "page_fetch",
+    "rails_fresh",
     "rb_content_moving",
     "rb_derived_truth",
     "rb_json_parses",
     "rb_public_surface",
+    "rb_rejection_rate",
     "rb_rollup_coverage",
     "rb_shards",
     "rb_wf_starved",
@@ -142,6 +144,14 @@
     },
     "w_test_baseline": {
       "domain": "self",
+      "kind": "consistency"
+    },
+    "rails_fresh": {
+      "domain": "rappterbook",
+      "kind": "consistency"
+    },
+    "rb_rejection_rate": {
+      "domain": "rappterbook",
       "kind": "consistency"
     }
   },

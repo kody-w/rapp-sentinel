@@ -140,10 +140,12 @@ check keeps its history.*
 | `channel` | ledger row; `prove_required_id_survives_outage.py` | proven |
 | `eco_sweep` | ledger row; `prove_blind_green.py` | proven |
 | `gh_status` | `prove_github_status.py` (post-exercise id, #49) | proven |
+| `rails_fresh` | `prove_rails_fresh.py` | lands with #6's PR |
 | `rb_content_moving` | ledger row; `prove_content_moving.py`; `prove_transport_failure_is_not_a_content_stall.py` | proven |
 | `rb_derived_truth` | none committed — unit branch tests only (`RappterbookDerivedTruthTests` in `test_static_delivery.py`); no mutation row, no prove file | UNPROVEN |
 | `rb_json_parses` | ledger row; `prove_starved_colors.py`; `prove_blind_green.py` | proven |
 | `rb_public_surface` | ledger row; `prove_starved_colors.py` | proven |
+| `rb_rejection_rate` | `prove_rejection_rate.py` | lands with #6's PR |
 | `rb_rollup_coverage` | ledger row; `prove_rollup_coverage.py` | proven |
 | `rb_shards` | ledger row; `prove_shards_regenerating.py` | proven |
 | `rb_wf_starved` | ledger row; `prove_absence.py`; `prove_starvation_confirm.py`; `prove_starved_colors.py`; `prove_unreadable_is_not_absence.py` | proven |
