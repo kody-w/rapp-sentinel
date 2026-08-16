@@ -162,6 +162,18 @@ So the honest version of the claim:
 > A chain makes tampering *detectable*. An external anchor makes truncation
 > detectable. Neither makes the record *true* — only unaltered.
 
+### Where the chain of watchers ends
+
+The regress is infinite, so the honest move is to name the stopping point
+instead of adding tiers forever. Here it is:
+[rapp-overwatch](https://github.com/kody-w/rapp-overwatch) watches this
+sentinel from outside, [rapp-ratchet](https://github.com/kody-w/rapp-ratchet)
+watches whether that watching is actually being done, and **a person reads the
+last one**. Nothing watches the ratchet. That terminus is a stated design
+assumption — the fourth tier is a human with a morning report — not a claim
+that the last watcher cannot fail. A guard nobody reads is the same guard this
+whole repo exists to distrust.
+
 ---
 
 ## The rule that makes it real
