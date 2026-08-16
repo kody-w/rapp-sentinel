@@ -284,6 +284,13 @@ def workflows_failing_every_run(repo, limit=30, ignore=()):
     for r in runs:
         if r["name"] in ignore:
             continue
+        # Queued/in-flight runs carry no conclusion and are non-verdicts.
+        # Counting them in `total` let one in-flight run hide five straight
+        # failures from the fail == total test — the seam between this
+        # check and rb_wf_starved, which deliberately hands failures-only
+        # histories back to this one (found by the 2026-08-16 review sweep).
+        if not r.get("conclusion"):
+            continue
         per.setdefault(r["name"], {"fail": 0, "total": 0})
         per[r["name"]]["total"] += 1
         if r.get("conclusion") == "failure":
@@ -1702,6 +1709,13 @@ def test_baseline_honest():
             notes.append(stamp + ", never compared (opt-in schedule)")
             continue
         comp_age = hours_since(comp.get("utc"))
+        if comp_age is None:
+            # An undated compare receipt is the #13 defect wearing the fix's
+            # own clothes — and formatting None crashed the whole check
+            # (found by the 2026-08-16 review sweep).
+            problems.append(f"{slug}: compare receipt is undated - "
+                            f"cannot judge when it last ran")
+            continue
         if comp.get("refused"):
             problems.append(f"{slug}: refusing set comparison - "
                             f"{comp['refused']}")
@@ -1898,6 +1912,7 @@ PAGE_FETCH_PAGES = (
 # makes. Pollers and fetch/xhr targets sort first, so the cap sheds the
 # passive tail (images), never the loud failures.
 PAGE_PROBE_CAP = 40
+PAGE_PROBE_WALL_S = 120     # wall-clock budget for the probe loop; see below
 
 _KIND_RANK = {"fetch": 0, "xhr": 1, "script": 2, "link": 3, "json": 4,
               "img": 5}
@@ -2005,14 +2020,29 @@ def served_pages_fetch_what_they_ask_for():
                                     _KIND_RANK.get(t["kind"], 9), t["url"]))
     capped = len(ordered) > PAGE_PROBE_CAP
     to_probe = ordered[:PAGE_PROBE_CAP]
-    failures = []
+    failures, probed = [], 0
+    # A wall budget as well as a count cap. 40 probes at the 25s module
+    # timeout is a 1000s worst case inside a health run whose own budget is
+    # 600s — a slow network would turn the whole verdict into a timeout.
+    # Stopping at the wall and SAYING so keeps the claim honest: probed
+    # targets are judged, unprobed ones are named as unprobed, and no
+    # silent truncation reads as coverage (2026-08-16 review sweep).
+    import time as _t
+    deadline = _t.monotonic() + PAGE_PROBE_WALL_S
     for t in to_probe:
+        if _t.monotonic() > deadline:
+            break
         t["probe_status"] = pagescan.probe(t["url"], pagescan.http_fetch)
+        probed += 1
         if not (200 <= t["probe_status"] < 300):
             failures.append(t)
     _write_pagescan_receipt(pages, to_probe, failures)
 
     notes = []
+    if probed < len(to_probe):
+        notes.append(f"probe wall {PAGE_PROBE_WALL_S}s hit after "
+                     f"{probed}/{len(to_probe)} targets — the rest unprobed, "
+                     f"not fine")
     if capped:
         notes.append(f"probe cap {PAGE_PROBE_CAP} hit "
                      f"({len(ordered)} first-party targets — "
@@ -2124,7 +2154,16 @@ def served_docs_keep_their_cadence_claims():
     liars, unreadable = [], []
     read = declared = 0
     now = datetime.now(timezone.utc)
+    # Same wall-budget discipline as page_fetch: 15 docs at the 25s module
+    # timeout is a 375s worst case; stop at the wall and count the rest as
+    # unread rather than letting a slow network eat the health run's budget.
+    import time as _t
+    deadline = _t.monotonic() + 90
     for u in docs:
+        if _t.monotonic() > deadline:
+            unreadable.append(f"{len(docs) - read - len(unreadable)} doc(s) "
+                              f"unread - 90s wall budget hit")
+            break
         status, body = pagescan.http_fetch(u)
         if not (200 <= status < 300) or not body:
             unreadable.append(f"{_short_name(u)} ({status or 'unreachable'})")

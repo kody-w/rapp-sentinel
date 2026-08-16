@@ -179,9 +179,34 @@ def publish_head_hook(cfg):
 def run_health():
     # CODE, not HOME: the runner is a code artifact. The child inherits this
     # process's environment, so it resolves the same SENTINEL_HOME.
-    r = subprocess.run([sys.executable, str(CODE / "health.py")],
-                       capture_output=True, text=True, timeout=180)
-    return json.loads(r.stdout)
+    #
+    # 600s, and a timeout is a VERDICT, not a crash. The 180s budget was
+    # sized for a dozen cheap checks; the check workload has since grown
+    # (page_fetch probes up to 40 targets, cadence_honest reads up to 15
+    # documents), so on a slow network a legitimate health run could outlive
+    # the budget — and TimeoutExpired used to propagate to the crash
+    # handler, which pages. A sentinel that texts "CRASHED" every 15
+    # minutes because the network is slow is the cry-wolf failure this repo
+    # exists to refuse; a health run we could not finish is "blind", said
+    # once per state change like any other degradation (found by the
+    # 2026-08-16 review sweep).
+    try:
+        r = subprocess.run([sys.executable, str(CODE / "health.py")],
+                           capture_output=True, text=True,
+                           timeout=int(os.environ.get("SENTINEL_HEALTH_TIMEOUT_S", "600")))
+        return json.loads(r.stdout)
+    except subprocess.TimeoutExpired:
+        return {
+            "generated": now().isoformat(timespec="seconds"),
+            "status": "degraded",
+            "checks": [{"id": "health_runtime", "ok": False, "severity": "warn",
+                        "detail": "health run exceeded its time budget - "
+                                  "verdict unknown, not healthy",
+                        "produced_by": "run_health"}],
+            "failed": ["health_runtime"],
+            "critical": [],
+            "summary": "health_runtime: health run exceeded its time budget",
+        }
 
 
 # ── guardrails ──────────────────────────────────────────────────────────────
@@ -191,8 +216,17 @@ def within_budget(hist, cfg):
     # Skipped entries record a decision NOT to spend a model, so they must not
     # consume the budget they exist to protect (#50). Counting them would let
     # an 8-hour GitHub outage exhaust the day without a single repair attempt.
+    #
+    # And ONLY repair/diagnose rows count. evolve and smoke carry their own
+    # caps and their code comments have always claimed "repair capacity
+    # untouched" — but this counter had no mode filter, so every evolve and
+    # smoke row silently consumed one of the repair slots it promised not to
+    # touch. Two art runs plus a smoke could eat three of the eight slots a
+    # 3am outage needed (found by the 2026-08-16 review sweep).
     recent = [h for h in hist
-              if datetime.fromisoformat(h["at"]) > cutoff and not h.get("skipped")]
+              if datetime.fromisoformat(h["at"]) > cutoff
+              and not h.get("skipped")
+              and h.get("mode") in (None, "repair", "diagnose")]
     return len(recent) < cfg["daily_escalation_budget"], len(recent)
 
 
@@ -558,6 +592,13 @@ def outsider_smoke(cfg):
     allowed, why = issue_allowed(issues, key, cfg)
     if not allowed:
         log(f"smoke skipped for {platform}: {why}")
+        # A blocked platform must yield its slot, exactly like a recently
+        # smoked one. Without this advance the rotation pinned on a capped
+        # platform forever and starved every other door of smokes — until
+        # their evidence aged out and staleness paged about platforms with
+        # no defect at all (found by the 2026-08-16 review sweep).
+        turn["i"] += 1
+        save_json(STATE / "smoke_turn.json", turn)
         rec = issues.get(key) or {}
         if "attempt cap" in why and not rec.get("human_notified"):
             # Three failed smokes is a broken front door; re-knocking will
@@ -626,6 +667,9 @@ def outsider_smoke(cfg):
     turn["i"] += 1
     save_json(STATE / "smoke_turn.json", turn)
     log(f"smoke ({platform}): {result}")
+    # True = a subprocess actually ran this tick, so the caller can defer
+    # evolve and keep the tick under run.sh's ceiling.
+    return True
 
 
 # ── main ────────────────────────────────────────────────────────────────────
@@ -696,8 +740,17 @@ def main():
         # Publish our heads so outside neighbors can watch us the same way we
         # watch them. Membership is whoever joins — but joining has to be
         # something you DO, not something you are granted.
-        NB.publish_head()
-        publish_head_hook(cfg)
+        # Publishing is isolated from witnessing: a refused head publish
+        # (e.g. a malformed attests_for claim in config, which correctly
+        # raises) must not take down the anchor, roll-call and truncation
+        # checks below — those are the things this block exists for, and a
+        # config typo was silently disabling chain-integrity detection every
+        # tick (found by the 2026-08-16 review sweep).
+        try:
+            NB.publish_head()
+            publish_head_hook(cfg)
+        except Exception as e:
+            log(f"head publish refused/failed: {type(e).__name__}: {e}")
         peers = NB.peer_roll_call()
         if peers:
             save_json(STATE / "peers.json", peers)
@@ -736,14 +789,31 @@ def main():
                     f"{verdict['summary'][:600]}")
 
     level = int(cfg["level"])
-    if status == "healthy":
-        # Outsider smoke BEFORE evolve, and only from here: smoking a
-        # critical platform measures the outage, not the front door (#5).
+    # Smoke on any NON-CRITICAL tick, not only on healthy ones. The original
+    # gate was `status == "healthy"`, and it latched: one failed smoke makes
+    # w_outsider_smoke warn, a warn makes the verdict degraded, degraded
+    # skipped the smoke arm, so the failed row stayed newest forever and the
+    # retry/attempt-cap/human-page machinery inside outsider_smoke was
+    # unreachable. The #5 rationale — do not smoke a platform mid-outage —
+    # only requires excluding CRITICAL states; a warn-degraded estate still
+    # has a front door worth knocking on, and the attempt cap bounds the
+    # knocking (found live by the 2026-08-16 review sweep: the organism was
+    # latched within an hour of the wiring merging).
+    smoked = False
+    if not verdict["critical"]:
         try:
-            outsider_smoke(cfg)
+            smoked = bool(outsider_smoke(cfg))
         except Exception as e:
             log(f"outsider smoke failed: {type(e).__name__}: {e}")
-        if level >= 3:
+    if status == "healthy":
+        if level >= 3 and smoked:
+            # One model-spending arm per tick: a smoke (subprocess up to
+            # 600s) stacked on an evolve (up to 1800s) in the same tick
+            # walks past run.sh's ceiling and gets the tick killed
+            # mid-evolve. Evolve loses nothing — the next healthy tick is
+            # 15 minutes away.
+            log("evolve deferred - a smoke already ran this tick")
+        elif level >= 3:
             hist = load_json(STATE / "escalations.json", [])
             issues = load_json(STATE / "issues.json", {})
             # Evolve gets its OWN, smaller budget and must never eat into the

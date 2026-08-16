@@ -197,6 +197,12 @@ def scan_page(url, fetch, script_limit=SCRIPT_FETCH_LIMIT):
     dangling pollers live in .js files, not the HTML.
     """
     status, html = fetch(url)
+    if status == 0:
+        # One dropped TCP connection is not an unscannable page — the same
+        # one-retry rule probe() applies (rb_content_moving's discipline).
+        import time
+        time.sleep(1)
+        status, html = fetch(url)
     page = {"url": url, "status": status, "targets": [], "skipped": 0,
             "scripts_scanned": 0}
     if not (200 <= status < 300) or not html:
@@ -239,7 +245,12 @@ def probe(url, fetch):
     status, _ = fetch(url, method="HEAD")
     if status in (405, 501):
         status, _ = fetch(url, method="GET", headers={"Range": "bytes=0-0"})
-    if status == 0:
+    # Retry transport failures AND 5xx once. A single Pages 503 used to be
+    # believed immediately, while every neighbouring check (outsider_can_join,
+    # rb_content_moving) already refuses to judge from one dropped sample —
+    # critical=False bounded the blast radius, but a spurious warn still
+    # flips the verdict and trains readers to scroll (2026-08-16 review sweep).
+    if status == 0 or status >= 500:
         import time
         time.sleep(1)
         status, _ = fetch(url, method="HEAD")

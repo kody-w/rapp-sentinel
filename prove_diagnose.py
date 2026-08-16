@@ -34,7 +34,13 @@ def scenario(name, cond, observed):
 
 FAKE = "ghp_FAKESECRETVALUE1234567890abcdefghijk"
 
-# ── canned probes: no network, no real subprocesses ─────────────────────────
+# ── canned probes for scenarios (a)-(d): no network, no real subprocesses.
+# Scenario (e) is the exception, ON PURPOSE and said out loud: it spawns the
+# real `sentinel.py diagnose` subprocess — live brainstem turn, real gh call,
+# real public fetches — because the claim under test there is the DISPATCH
+# (that the command runs without ticking), and a stubbed dispatch would prove
+# nothing. The first version's banner claimed no-network for the whole file,
+# which was false (2026-08-16 review sweep). ─────────────────────────────────
 
 def fake_http(url, headers=None, method="GET", data=None, timeout=15):
     auth = (headers or {}).get("Authorization", "")

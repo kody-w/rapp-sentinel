@@ -310,11 +310,19 @@ try:
     finally:
         subprocess.run = REAL["run"]
         S.notify = real_notify
-    scenario("attempt cap reached -> no subprocess, exactly ONE human page "
-             "across repeated ticks (re-knocking will not fix a broken door)",
-             len(SPAWNS) == 0 and len(notified) == 1
-             and first in notified[0],
-             f"spawns={len(SPAWNS)} notified={len(notified)}")
+    # The capped platform is never re-knocked and pages exactly once — but it
+    # YIELDS its slot: the second tick must smoke the OTHER platform. The
+    # first version of this scenario asserted zero spawns across both ticks,
+    # which encoded the rotation wedge as a virtue — a capped door starved
+    # every other door forever (2026-08-16 review sweep).
+    others = [p for p in sorted(__import__("participate").PLATFORMS) if p != first]
+    scenario("attempt cap: one human page, capped door never re-knocked, and "
+             "the rotation yields — the OTHER platform still gets smoked",
+             len(notified) == 1 and first in notified[0]
+             and len(SPAWNS) == 1 and others[0] in " ".join(SPAWNS[0])
+             and state("smoke_turn.json", {"i": 0})["i"] == 2,
+             f"spawns={len(SPAWNS)} notified={len(notified)} "
+             f"turn={state('smoke_turn.json', {})}")
 
     # ── level gate: below 2 the sentinel promises not to write ──────────────
     fresh_state()
