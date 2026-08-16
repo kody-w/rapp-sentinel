@@ -160,6 +160,7 @@ check keeps its history.*
 | `w_sentinel_fresh` | ledger row (last_run.json moved 9h into the past) | proven |
 | `w_openrappter_spin` | `prove_spinning_job.py` | landed in #76 |
 | `w_freshness_paired` | `prove_freshness_pairing.py` | landed in #76 |
+| `w_outsider_coverage` | `prove_outsider_coverage.py` | proven |
 
 The two UNPROVEN rows are the honest debt: both ids landed in #62 with unit
 tests that exercise their fail and pass branches, but neither has been through

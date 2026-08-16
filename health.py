@@ -37,15 +37,20 @@ def _run(cmd, timeout=15):
         return ""
 
 
-def _brainstem_answers_turns():
-    """Liveness for a thing whose job is answering: make it answer."""
+def _brainstem_answers_turns(url="http://localhost:7071/chat", timeout=30):
+    """Liveness for a thing whose job is answering: make it answer.
+
+    The defaults ARE today's live values; probe_watchers passes the merged
+    config through (issue #1 ask 2), so an install without a `watchers`
+    block behaves byte-identically to the hardcoded probe this replaced.
+    """
     import urllib.request, urllib.error
     body = json.dumps({"user_input": "reply with the single word: ok"}).encode()
-    req = urllib.request.Request("http://localhost:7071/chat", data=body,
+    req = urllib.request.Request(url, data=body,
                                  headers={"Content-Type": "application/json"},
                                  method="POST")
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             data = json.loads(r.read().decode())
         if isinstance(data.get("response"), str) and data["response"].strip():
             return C.ok("w_brainstem", f'answered a turn ({data["response"].strip()[:20]})')
@@ -67,6 +72,53 @@ _OPENRAPPTER_LABELS = (
     "com.openrappter.gateway",
     "com.openrappter.daemon",
 )
+
+# The estate-probe targets, carrying EXACTLY the literals that were hardcoded
+# before issue #1 ask 2: a live config without a `watchers` key — every
+# install today — merges to precisely these values, so the molt changes
+# nothing. config.example.json documents the override shape.
+WATCHER_DEFAULTS = {
+    "brainstem": {
+        "enabled": True,
+        "url": "http://localhost:7071/chat",
+        "timeout": 30,
+    },
+    "openrappter": {
+        "enabled": True,
+        "port": 18790,
+        "labels": list(_OPENRAPPTER_LABELS),
+    },
+}
+
+
+def _watcher_config():
+    """WATCHER_DEFAULTS merged with config.json's `watchers` block.
+
+    Tolerant on purpose (growth path): a missing config, an unparseable
+    config, or a `watchers` value of the wrong shape all mean "the
+    defaults" — the live organism's config predates this key and must keep
+    behaving byte-identically. The merge is per-watcher and shallow
+    ({**defaults, **user}), so a partial override such as
+    {"brainstem": {"url": ...}} keeps every other default.
+
+    This is the ONE read path for watcher targets. The spin scan's
+    candidate labels (_openrappter_candidate_labels) come through here too,
+    reading the same watchers.openrappter.labels key — never a second read
+    of the same fact.
+    """
+    merged = {name: dict(defaults)
+              for name, defaults in WATCHER_DEFAULTS.items()}
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        user = cfg.get("watchers")
+        if isinstance(user, dict):
+            for name, defaults in WATCHER_DEFAULTS.items():
+                override = user.get(name)
+                if isinstance(override, dict):
+                    merged[name] = {**defaults, **override}
+    except Exception:
+        pass    # a live config without the key is the default, not an error
+    return merged
 
 
 def _listening_pid(port):
@@ -139,7 +191,7 @@ def _confirm_owner(target, pid):
     return "state = running" in lines and f"pid = {pid}" in lines
 
 
-def _launchd_owner(pid):
+def _launchd_owner(pid, labels=None):
     """Which launchd job, in ANY domain, claims `pid` — or None.
 
     ASK LAUNCHD, and ask BOTH DOMAINS. `launchctl list` enumerates the USER
@@ -184,7 +236,7 @@ def _launchd_owner(pid):
                   else _gui_domain() + "/" + label)
         if _confirm_owner(target, pid):
             return target, "supervised"
-    for label in _OPENRAPPTER_LABELS:
+    for label in (labels or _OPENRAPPTER_LABELS):
         for target in ("system/" + label, _gui_domain() + "/" + label):
             if _confirm_owner(target, pid):
                 return target, "supervised"
@@ -193,8 +245,13 @@ def _launchd_owner(pid):
     return None, "unverified"
 
 
-def _openrappter_supervision():
+def _openrappter_supervision(port=18790, labels=None):
     """Is the openrappter daemon running, and does launchd own it?
+
+    Defaults are today's live values; probe_watchers passes the merged
+    config through (issue #1 ask 2). `labels` feeds only the targeted
+    fallback probes in _launchd_owner — enumeration of both domains stays
+    the primary route, so an unlisted label is still found.
 
     The previous predicate searched `launchctl list` for one hardcoded label and
     called its absence "launchd daemon not loaded". On the machine this was
@@ -206,12 +263,12 @@ def _openrappter_supervision():
     up — 14 "alive" attestations that had never touched /chat — repeated one
     function down. A label is not evidence. What serves the port is.
     """
-    pid = _listening_pid(18790)
+    pid = _listening_pid(port)
     if not pid:
-        return C.fail("w_openrappter", "nothing is LISTENING on :18790",
+        return C.fail("w_openrappter", f"nothing is LISTENING on :{port}",
                       critical=False)
 
-    owner, verdict = _launchd_owner(pid)
+    owner, verdict = _launchd_owner(pid, labels=labels)
     # The additive `supervision` field is the three-state answer a consumer
     # can branch on. "unverified" was previously storable as indistinguishable
     # from true; now the word travels with the verdict (#23).
@@ -225,30 +282,29 @@ def _openrappter_supervision():
         # not an outage (the mutation ledger records serving-but-unclaimed-ok
         # as deliberate; the false alarm this check replaced paged on it).
         r = C.ok("w_openrappter",
-                 f"serving :18790 (pid {pid}); both launchd domains "
+                 f"serving :{port} (pid {pid}); both launchd domains "
                  "enumerated, no job claims it — unsupervised")
         r["supervision"] = "unsupervised"
         return r
     r = C.ok("w_openrappter",
-             f"serving :18790 (pid {pid}); a launchd domain could not be "
+             f"serving :{port} (pid {pid}); a launchd domain could not be "
              "read — supervision UNVERIFIED, not disproved")
     r["supervision"] = "unverified"
     return r
 
 
 def _openrappter_candidate_labels():
-    """Labels worth auditing for the spin scan: the known set, the config's
-    watchers.openrappter.labels (the SAME key the tranche-3 watcher-config
-    work reads — never a second one), and any openrappter-substring label
-    visible in either domain listing (discovery scoping; each discovered job
-    is then individually measured, never judged from the listing row)."""
+    """Labels worth auditing for the spin scan: the known set, the merged
+    config's watchers.openrappter.labels (the SAME key probe_watchers'
+    targets come from, read through the SAME _watcher_config() path —
+    never a second read of the same fact), and any openrappter-substring
+    label visible in either domain listing (discovery scoping; each
+    discovered job is then individually measured, never judged from the
+    listing row)."""
     labels = set(_OPENRAPPTER_LABELS)
-    try:
-        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
-        extra = ((cfg.get("watchers") or {}).get("openrappter") or {}).get("labels") or []
-        labels.update(x for x in extra if isinstance(x, str))
-    except Exception:
-        pass          # a live config without the key is the default, not an error
+    labels.update(
+        x for x in (_watcher_config()["openrappter"].get("labels") or [])
+        if isinstance(x, str))
     listings_readable = False
     gui = _run(["launchctl", "list"])
     gui_lines = gui.splitlines()
@@ -343,18 +399,42 @@ def probe_watchers():
     peer is checked here, and the sentinel checks its own freshness too — a
     stalled loop cannot notice that it stalled, so it leaves a timestamp behind
     for the next run, and for the other two, to judge.
+
+    Returns (results, disabled_ids). Estate-probe targets come from
+    config.json's `watchers` block via _watcher_config() (issue #1 ask 2);
+    an absent block merges to exactly the values that used to be hardcoded
+    here, so the live organism molts with zero behavior change. A watcher
+    with enabled:false is not probed — and is not silently green either:
+    its id rides back in disabled_ids so check_completeness can declare the
+    omission in every verdict instead of it looking like a deleted check.
     """
-    out = []
+    out, disabled = [], []
+    cfg = _watcher_config()
+
     # Exercise the turn endpoint, not the front page. A GET on / returns 200
     # from a brainstem that can no longer answer a single turn — which is the
     # exact "green while frozen" failure this whole loop exists to catch, and
     # it was sitting in the loop's own liveness check. The brainstem neighbor
     # found it by reading its own chain: 14 "alive" attestations, none of which
     # had ever touched /chat.
-    out.append(_brainstem_answers_turns())
+    bs = cfg["brainstem"]
+    if bs.get("enabled"):
+        out.append(_brainstem_answers_turns(url=bs["url"],
+                                            timeout=bs["timeout"]))
+    else:
+        disabled.append("w_brainstem")
 
-    out.append(_openrappter_supervision())
+    orp = cfg["openrappter"]
+    if orp.get("enabled"):
+        out.append(_openrappter_supervision(port=orp["port"],
+                                            labels=orp.get("labels")))
+    else:
+        disabled.append("w_openrappter")
 
+    # Deliberately independent of the port probe's enabled flag: a spinning
+    # launchd job is a defect worth seeing even on a machine where nothing
+    # should be serving the port. Disabling w_openrappter does NOT disable
+    # this — they are separate declarations.
     out.append(_spinning_openrappter_jobs())
 
     # The in-tree anchor file cannot testify about its own truncation. Compare
@@ -386,7 +466,51 @@ def probe_watchers():
                     else f"last tick {age_m:.0f}m ago")
                if age_m is None or age_m < 90
                else C.fail("w_sentinel_fresh", f"last tick {age_m:.0f}m ago", critical=False))
-    return out
+    return out, disabled
+
+
+def check_outsider_coverage(results):
+    """Issue #5 ask 1, enforced per tick: an outsider view is a DISCIPLINE,
+    not one lucky check.
+
+    Every platform named in the manifest's `outsider_platforms` must have at
+    least one result this tick that RAN from the outsider vantage —
+    vantage == "outsider", a tag checks.outsider_check stamps only after
+    proving no gh() call flowed through the execution. A check that ran and
+    FAILED still covers its platform: the discipline is that someone stood
+    outside and tried the door; the door being stuck is that check's own
+    report, not a coverage gap. A result whose vantage was replaced with
+    "credentialed" (it touched gh()) does NOT count — a violation is
+    precisely the absence of the outsider vantage.
+
+    Warn on gaps, not critical: the repair arm cannot write an
+    unauthenticated check; a human can. And a manifest without the key —
+    mid-deploy on the live organism, where code arrives by git pull between
+    ticks and may run one tick ahead of its manifest — is "coverage
+    unknown" at warn, never a raise and never green (#45).
+    """
+    manifest = HOME / "required_checks.json"
+    try:
+        doc = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception as e:
+        return C.fail("w_outsider_coverage",
+                      f"required_checks.json unreadable: {type(e).__name__} "
+                      "- coverage unknown", critical=False)
+    platforms = doc.get("outsider_platforms")
+    if not isinstance(platforms, list) or not platforms:
+        return C.fail("w_outsider_coverage",
+                      "outsider_platforms missing - coverage unknown",
+                      critical=False)
+    covered = {r.get("platform") for r in results
+               if isinstance(r, dict) and r.get("vantage") == "outsider"}
+    uncovered = sorted(str(p) for p in platforms if p not in covered)
+    if uncovered:
+        return C.fail("w_outsider_coverage",
+                      "no unauthenticated check ran for: "
+                      + ", ".join(uncovered), critical=False)
+    return C.ok("w_outsider_coverage",
+                f"{len(platforms)} platform(s) each watched from the "
+                "outsider vantage this tick")
 
 
 def check_freshness_pairing():
@@ -453,7 +577,7 @@ def check_freshness_pairing():
     return C.ok("w_freshness_paired", note + suffix)
 
 
-def check_completeness(results):
+def check_completeness(results, disabled=()):
     """The registry enumerates; this REQUIRES.
 
     all_checks() returns whatever decorators happened to run. That makes a
@@ -473,6 +597,14 @@ def check_completeness(results):
     Honest limit: this check cannot detect its own removal. That is what an
     external watcher is for, and rapp-overwatch does exactly this comparison
     from outside.
+
+    `disabled` (default () — existing callers unaffected) carries ids whose
+    probes config.json switched off (issue #1 ask 2). Only ids BOTH in the
+    manifest and explicitly disabled are subtracted, and every subtraction
+    is appended to the passing detail — the omission is a standing
+    declaration in every verdict, never a silent shrinking of the required
+    set. A disabled id the manifest does not know is reported as a probable
+    config typo rather than quietly ignored.
     """
     # Include our own id: this check is running, so it ran. Computing `ran`
     # purely from results-so-far made the completeness check report ITSELF
@@ -508,13 +640,22 @@ def check_completeness(results):
                       f"required_checks.json unreadable: {type(e).__name__}: {e}",
                       critical=True)
 
-    missing = sorted(required - ran)
+    honored = sorted(set(disabled) & required)
+    typos = sorted(set(disabled) - required)
+    suffix = ""
+    if honored:
+        suffix += (f"; {len(honored)} disabled by config: "
+                   + ", ".join(honored))
+    if typos:
+        suffix += ("; disabled id(s) not in the manifest (config typo?): "
+                   + ", ".join(typos))
+    missing = sorted(required - set(honored) - ran)
     if missing:
         return C.fail("w_checks_complete",
                       f"{len(missing)} required check(s) did not run: "
-                      + ", ".join(missing), critical=True)
+                      + ", ".join(missing) + suffix, critical=True)
     unlisted = sorted(ran - required)
-    detail = f"all {len(required)} required checks ran"
+    detail = f"all {len(required) - len(honored)} required checks ran" + suffix
     if unlisted:
         detail += f"; {len(unlisted)} unlisted: {', '.join(unlisted)}"
     return C.ok("w_checks_complete", detail)
@@ -541,16 +682,24 @@ def main():
     # they carry no function of their own. Naming their producer anyway keeps
     # every line in the verdict traceable, and gives the duplicate-id guard
     # below something real to compare.
-    for r in probe_watchers():
+    watcher_results, disabled_by_config = probe_watchers()
+    for r in watcher_results:
         r.setdefault("produced_by", "probe_watchers")
         results.append(r)
+    # After every vantage-tagged result exists, before completeness — so the
+    # coverage check is itself covered by the required-ids comparison.
+    coverage = check_outsider_coverage(results)
+    coverage.setdefault("produced_by", "check_outsider_coverage")
+    results.append(coverage)
     # Before completeness, so the pairing check is itself covered by the
     # required-ids comparison.
     pairing = check_freshness_pairing()
     pairing.setdefault("produced_by", "check_freshness_pairing")
     results.append(pairing)
-    # Last, so it can see every id the run actually produced.
-    completeness = check_completeness(results)
+    # Last, so it can see every id the run actually produced — and the ids
+    # config.json deliberately switched off, so a disabled probe is a
+    # declaration in the verdict rather than a phantom deletion.
+    completeness = check_completeness(results, disabled=disabled_by_config)
     completeness.setdefault("produced_by", "check_completeness")
     results.append(completeness)
 
