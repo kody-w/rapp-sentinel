@@ -238,8 +238,8 @@ BOUNDARIES
 - If what you have to say is only worth saying because you were asked to say
   something, do not say it.
 
-Finish with a single line:
-SENTINEL_RESULT: <what you did, in one sentence>
+Finish with a single line starting exactly `SENTINEL_RESULT:` followed by
+CONTRIBUTED, DECLINED or BLOCKED, then one sentence.
 """
 
 
@@ -312,9 +312,34 @@ def cmd_contribute(args) -> int:
         print("  timed out")
         return 1
 
+    # ── outcome honesty (#5/#7) — everything below this marker is the fix ──
+    # The pre-fix code recorded "no result line" as ok=True/declined=False and
+    # never examined r.returncode at all: a model run that crashed, or that
+    # produced pages of output and no verdict, was filed as a successful
+    # contribution. R1 cuts both ways — an exit code alone is a receipt, but
+    # so is ignoring it. The SENTINEL_RESULT line is the model's own record
+    # of what it did; its absence, or a nonzero exit around it, is a failure
+    # of the outsider path and is recorded as one.
     line = next((l.strip()[16:].strip() for l in reversed(out.splitlines())
-                 if l.strip().startswith("SENTINEL_RESULT:")), "no result line")
-    declined = line.upper().startswith(("DECLIN", "NOTHING", "NO CONTRIB"))
+                 if l.strip().startswith("SENTINEL_RESULT:")), None)
+    if r.returncode != 0 or line is None:
+        detail = (f"copilot exit {r.returncode}, no SENTINEL_RESULT line"
+                  if line is None else
+                  f"copilot exit {r.returncode}: {line[:200]}")
+        record("contribute", args.platform, False, detail, {"model": model})
+        print(f"  failed: {detail}")
+        return 1
+    verdict = line.upper()
+    if verdict.startswith("BLOCKED"):
+        # A blocked outsider path is a finding about the front door, not a
+        # decline: the neighbor decided to act and the platform would not
+        # let it. cmd_report counts ok=False rows as "the outsider path was
+        # broken at those times", which is exactly the claim.
+        record("contribute", args.platform, False, line,
+               {"declined": False, "model": model})
+        print(f"  blocked: {line}")
+        return 1
+    declined = verdict.startswith(("DECLIN", "NOTHING", "NO CONTRIB"))
     print(f"  {'declined' if declined else 'contributed'}: {line}")
     record("contribute", args.platform, True, line,
            {"declined": declined, "model": model})
