@@ -12,6 +12,7 @@ Exit code is always 0; the verdict is the payload, not the status.
 """
 
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -20,6 +21,22 @@ from pathlib import Path
 import checks as C
 
 HOME = Path(__file__).resolve().parent
+
+
+def _run(cmd, timeout=15):
+    """stdout of `cmd`, or "" on ANY failure — the single subprocess seam.
+
+    Every launchd interrogation below routes through here, so a prove harness
+    can feed the parsers canned transcripts captured from a real machine, and
+    a wedged launchctl cannot stall the tick past the timeout. "" means the
+    command did not answer; parsers must treat a missing format marker as
+    unreadable, never as an empty-but-healthy world (#45).
+    """
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout or ""
+    except Exception:
+        return ""
 
 
 def _brainstem_answers_turns():
@@ -59,15 +76,67 @@ def _listening_pid(port):
     including CLIENTS. Asked about a live gateway it has returned a browser that
     merely had the dashboard open.
     """
-    try:
-        r = subprocess.run(["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
-                           capture_output=True, text=True, timeout=10)
-        for tok in (r.stdout or "").split():
-            if tok.isdigit():
-                return tok
-    except Exception:
-        pass
+    for tok in _run(["lsof", "-ti", f":{port}", "-sTCP:LISTEN"], timeout=10).split():
+        if tok.isdigit():
+            return tok
     return None
+
+
+def _gui_domain():
+    try:
+        return f"gui/{os.getuid()}"
+    except Exception:
+        return "gui/501"
+
+
+def _enumerate_claimants(pid):
+    """Labels claiming `pid` in each launchd domain, plus per-domain readability.
+
+    Returns (claimants, gui_readable, system_readable) where claimants is a
+    list of (domain, label). Readability is judged by each listing's own
+    format marker — `launchctl list`'s header row, `launchctl print system`'s
+    services block — because "" from a failed command and a healthy-but-empty
+    answer must never be the same value (#45).
+    """
+    claimants = []
+    gui = _run(["launchctl", "list"])
+    gui_lines = gui.splitlines()
+    gui_ok = bool(gui_lines) and gui_lines[0].split()[:1] == ["PID"]
+    if gui_ok:
+        for line in gui_lines[1:]:
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] == str(pid):
+                claimants.append(("gui", parts[2]))
+    sys_out = _run(["launchctl", "print", "system"], timeout=15)
+    sys_ok = "services = {" in sys_out
+    if sys_ok:
+        in_services = False
+        for line in sys_out.splitlines():
+            s = line.strip()
+            if s.startswith("services = {"):
+                in_services = True
+                continue
+            if in_services:
+                if s == "}":
+                    break
+                parts = s.split()
+                if len(parts) >= 3 and parts[0] == str(pid):
+                    claimants.append(("system", parts[-1]))
+    return claimants, gui_ok, sys_ok
+
+
+def _confirm_owner(target, pid):
+    """POSITIVE confirmation (R3): the targeted job is running AND holds `pid`.
+
+    A label appearing in a listing beside the right pid is a candidate, not a
+    verdict — `launchctl print <target>` is the claim from launchd's own
+    mouth, and both `state = running` and the pid must match.
+    """
+    txt = _run(["launchctl", "print", target])
+    if not txt:
+        return False
+    lines = [l.strip() for l in txt.splitlines()]
+    return "state = running" in lines and f"pid = {pid}" in lines
 
 
 def _launchd_owner(pid):
@@ -90,29 +159,38 @@ def _launchd_owner(pid):
     and is indistinguishable that way — nor from XPC_SERVICE_NAME, which is
     inherited from whatever spawned the process rather than proof of the job
     that did.
+
+    ENUMERATE, do not guess labels. The previous version probed three
+    hardcoded labels, so a job under any fourth label was invisible and the
+    check could reach a defensible verdict by a route that could never name
+    the supervisor — which is the thing a sentinel is for (#23). Both domain
+    listings are walked for the pid; every candidate is then positively
+    confirmed with a targeted print (state = running AND pid match). The
+    hardcoded labels remain only as fallback targeted probes against listing
+    format drift.
+
+    Three-state on purpose: (owner, "supervised") when a confirmed job claims
+    the pid; (None, "unsupervised") only when BOTH enumerations were readable
+    and no job claims it — positively determined absence; (None, "unverified")
+    when an enumeration could not be read — we could not look, which is not
+    the same claim (#45), and it must never be stored indistinguishably from
+    either truth.
     """
     if not pid:
-        return None
-    try:
-        uid = str(os.getuid())
-    except Exception:
-        uid = "501"
+        return None, "unverified"
+    claimants, gui_ok, sys_ok = _enumerate_claimants(pid)
+    for domain, label in claimants:
+        target = ("system/" + label if domain == "system"
+                  else _gui_domain() + "/" + label)
+        if _confirm_owner(target, pid):
+            return target, "supervised"
     for label in _OPENRAPPTER_LABELS:
-        for target in ("system/" + label, "gui/" + uid + "/" + label):
-            try:
-                r = subprocess.run(["launchctl", "print", target],
-                                   capture_output=True, text=True, timeout=10)
-                if r.returncode != 0:
-                    continue
-                for line in (r.stdout or "").splitlines():
-                    stripped = line.strip()
-                    if stripped.startswith("pid = "):
-                        claimed = stripped[6:].strip()
-                        if claimed.isdigit() and claimed == str(pid):
-                            return target
-            except Exception:
-                continue
-    return None
+        for target in ("system/" + label, _gui_domain() + "/" + label):
+            if _confirm_owner(target, pid):
+                return target, "supervised"
+    if gui_ok and sys_ok:
+        return None, "unsupervised"
+    return None, "unverified"
 
 
 def _openrappter_supervision():
@@ -133,16 +211,128 @@ def _openrappter_supervision():
         return C.fail("w_openrappter", "nothing is LISTENING on :18790",
                       critical=False)
 
-    owner = _launchd_owner(pid)
+    owner, verdict = _launchd_owner(pid)
+    # The additive `supervision` field is the three-state answer a consumer
+    # can branch on. "unverified" was previously storable as indistinguishable
+    # from true; now the word travels with the verdict (#23).
     if owner:
-        return C.ok("w_openrappter", f"{owner} owns pid {pid}")
+        r = C.ok("w_openrappter", f"{owner} owns pid {pid}")
+        r["supervision"] = "supervised-by:" + owner
+        return r
+    if verdict == "unsupervised":
+        # Both domains enumerated, no claimant: positively determined, and
+        # still ok — a serving unsupervised daemon is a finding for a human,
+        # not an outage (the mutation ledger records serving-but-unclaimed-ok
+        # as deliberate; the false alarm this check replaced paged on it).
+        r = C.ok("w_openrappter",
+                 f"serving :18790 (pid {pid}); both launchd domains "
+                 "enumerated, no job claims it — unsupervised")
+        r["supervision"] = "unsupervised"
+        return r
+    r = C.ok("w_openrappter",
+             f"serving :18790 (pid {pid}); a launchd domain could not be "
+             "read — supervision UNVERIFIED, not disproved")
+    r["supervision"] = "unverified"
+    return r
 
-    # Serving, but nothing claims it. Say that, and do not call it an orphan:
-    # that claim has been made from PPID and from XPC_SERVICE_NAME and was wrong
-    # both times. A watcher that guesses is worse than one that admits the gap.
-    return C.ok("w_openrappter",
-                f"serving :18790 (pid {pid}); no launchd job claims it — "
-                "supervision UNVERIFIED, not disproved")
+
+def _openrappter_candidate_labels():
+    """Labels worth auditing for the spin scan: the known set, the config's
+    watchers.openrappter.labels (the SAME key the tranche-3 watcher-config
+    work reads — never a second one), and any openrappter-substring label
+    visible in either domain listing (discovery scoping; each discovered job
+    is then individually measured, never judged from the listing row)."""
+    labels = set(_OPENRAPPTER_LABELS)
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        extra = ((cfg.get("watchers") or {}).get("openrappter") or {}).get("labels") or []
+        labels.update(x for x in extra if isinstance(x, str))
+    except Exception:
+        pass          # a live config without the key is the default, not an error
+    listings_readable = False
+    gui = _run(["launchctl", "list"])
+    gui_lines = gui.splitlines()
+    if gui_lines and gui_lines[0].split()[:1] == ["PID"]:
+        listings_readable = True
+        for line in gui_lines[1:]:
+            parts = line.split()
+            if len(parts) >= 3 and "openrappter" in parts[2]:
+                labels.add(parts[2])
+    sys_out = _run(["launchctl", "print", "system"], timeout=15)
+    if "services = {" in sys_out:
+        listings_readable = True
+        for line in sys_out.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 3 and "openrappter" in parts[-1]:
+                labels.add(parts[-1])
+    return labels, listings_readable
+
+
+def _job_stats(target):
+    """state / runs / last exit of one targeted job, or None if not loaded."""
+    txt = _run(["launchctl", "print", target])
+    if not txt:
+        return None
+    stats = {"state": None, "runs": 0, "last_exit": None}
+    for line in txt.splitlines():
+        s = line.strip()
+        if s.startswith("state = ") and stats["state"] is None:
+            stats["state"] = s[len("state = "):]
+        elif s.startswith("runs = "):
+            try:
+                stats["runs"] = int(s[len("runs = "):])
+            except ValueError:
+                pass
+        elif s.startswith("last exit code = "):
+            val = s[len("last exit code = "):]
+            try:
+                stats["last_exit"] = int(val)
+            except ValueError:
+                stats["last_exit"] = None      # "(never exited)"
+    return stats
+
+
+def _spinning_openrappter_jobs():
+    """A loaded job that starts, exits nonzero, and repeats is a spinning
+    wheel, not a daemon — and every naive predicate calls it healthy (#23).
+
+    Found live: com.openrappter.gateway loaded with runs = 27, last exit 1,
+    state = not running, losing a runtime lock another process held, while
+    the actual gateway served the port under a label no query looked at.
+    Nothing reported it, because "loaded" was the whole test.
+
+    Warn deliberately: a stale duplicate does not stop the served gateway,
+    and waking the repair arm to unload someone's launchd job is
+    disproportionate. Escape hatch if this flaps: require the same verdict
+    on two consecutive ticks — deliberately deferred until observed.
+    """
+    labels, readable = _openrappter_candidate_labels()
+    if not readable:
+        return C.fail("w_openrappter_spin",
+                      "cannot audit launchd jobs: neither domain listing "
+                      "was readable", critical=False)
+    spinning, audited = [], 0
+    for label in sorted(labels):
+        for target in (_gui_domain() + "/" + label, "system/" + label):
+            stats = _job_stats(target)
+            if stats is None:
+                continue
+            audited += 1
+            if stats["state"] == "running":
+                break
+            if (stats["runs"] >= 3 and isinstance(stats["last_exit"], int)
+                    and stats["last_exit"] != 0):
+                spinning.append(f"{label} (runs={stats['runs']}, "
+                                f"last exit {stats['last_exit']})")
+            break          # one domain answered for this label; do not double-count
+    if spinning:
+        return C.fail("w_openrappter_spin",
+                      "spinning launchd job(s): " + "; ".join(spinning),
+                      critical=False)
+    if audited == 0:
+        return C.ok("w_openrappter_spin", "no openrappter launchd jobs loaded")
+    return C.ok("w_openrappter_spin",
+                f"{audited} job(s) audited, none spinning")
 
 
 def probe_watchers():
@@ -164,6 +354,8 @@ def probe_watchers():
     out.append(_brainstem_answers_turns())
 
     out.append(_openrappter_supervision())
+
+    out.append(_spinning_openrappter_jobs())
 
     # The in-tree anchor file cannot testify about its own truncation. Compare
     # it to the high-water mark kept outside the repository.
@@ -195,6 +387,67 @@ def probe_watchers():
                if age_m is None or age_m < 90
                else C.fail("w_sentinel_fresh", f"last tick {age_m:.0f}m ago", critical=False))
     return out
+
+
+def check_freshness_pairing():
+    """R2 enforced mechanically: a domain with run-status checks but no
+    output-freshness check is reported every tick, not rediscovered per
+    outage.
+
+    The five-day rappterbook silence (#3) happened because run-status
+    coverage existed and output coverage did not, and nothing made that gap
+    visible at authoring time. The tick IS the authoring feedback loop here,
+    so the manifest now classifies every required id (the `kinds` map in
+    required_checks.json) and this check compares coverage per domain.
+
+    An accepted gap must be a DECISION with a diff, not a silence: the
+    `unpaired_accepted` map in the manifest names each domain deliberately
+    left unpaired and why. It exists because a permanently-red check would
+    hold the verdict at degraded forever — which silently disables the
+    level-3 evolve arm (sentinel only evolves while healthy) — and because a
+    red nobody can act on trains people to scroll past the channel. The
+    finding stays recorded (CHECK-AUDIT.md, eco_sweep row); any FUTURE
+    domain that gains run-status coverage without freshness coverage fires
+    here at warn (the repair arm cannot write a freshness check; a human
+    can).
+    """
+    manifest = HOME / "required_checks.json"
+    try:
+        doc = json.loads(manifest.read_text(encoding="utf-8"))
+    except Exception as e:
+        return C.fail("w_freshness_paired",
+                      f"required_checks.json unreadable: {type(e).__name__} - "
+                      "pairing unknown", critical=False)
+    kinds = doc.get("kinds")
+    if not isinstance(kinds, dict) or not kinds:
+        return C.fail("w_freshness_paired",
+                      "kinds map missing from required_checks.json - "
+                      "pairing unknown", critical=False)
+    accepted = doc.get("unpaired_accepted") or {}
+    domains = {}
+    for cid, meta in kinds.items():
+        if not isinstance(meta, dict):
+            continue
+        domains.setdefault(meta.get("domain"), set()).add(meta.get("kind"))
+    unpaired = sorted(
+        d for d, ks in domains.items()
+        if d and "run-status" in ks and "output-freshness" not in ks
+        and d not in accepted)
+    required = set(doc.get("required") or [])
+    runner_ids = {"w_checks_complete", "w_freshness_paired"}
+    unclassified = sorted(required - set(kinds) - runner_ids)
+    suffix = ""
+    if unclassified:
+        suffix = f"; {len(unclassified)} unclassified: " + ", ".join(unclassified)
+    if unpaired:
+        return C.fail("w_freshness_paired",
+                      "run-status without output-freshness (R2): "
+                      + ", ".join(unpaired) + suffix, critical=False)
+    note = f"{len(domains)} domain(s) classified, all paired or accepted"
+    if accepted:
+        note += f" ({len(accepted)} accepted-unpaired: " + \
+                ", ".join(sorted(accepted)) + ")"
+    return C.ok("w_freshness_paired", note + suffix)
 
 
 def check_completeness(results):
@@ -285,6 +538,11 @@ def main():
     for r in probe_watchers():
         r.setdefault("produced_by", "probe_watchers")
         results.append(r)
+    # Before completeness, so the pairing check is itself covered by the
+    # required-ids comparison.
+    pairing = check_freshness_pairing()
+    pairing.setdefault("produced_by", "check_freshness_pairing")
+    results.append(pairing)
     # Last, so it can see every id the run actually produced.
     completeness = check_completeness(results)
     completeness.setdefault("produced_by", "check_completeness")
