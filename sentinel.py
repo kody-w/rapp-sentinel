@@ -425,8 +425,10 @@ def main():
         peers = NB.peer_roll_call()
         if peers:
             save_json(STATE / "peers.json", peers)
-            stalled = [k for k, v in peers.items()
-                       if v.get("valid") and not v.get("advancing")]
+            # advancing is three-valued (None on first sight); truthiness
+            # would read None as stalled, so the classifier does the identity
+            # check on False.
+            stalled = NB.stalled_peers(peers)
             gone = [k for k, v in peers.items() if not v.get("reachable")]
             if stalled or gone:
                 log(f"peers stalled={stalled} unreachable={gone}")

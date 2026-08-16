@@ -537,6 +537,20 @@ def peer_roll_call(stale_minutes=90):
 
     A peer whose published head has not advanced is stalled, and you can see
     that without trusting anything it says about itself.
+
+    `advancing` is a COMPARISON, and a comparison needs two observations. On
+    first sight there is no prior head to compare against, so the old
+    `same = prev == cur and prev is not None` arithmetic made same=False and
+    advancing=True — a twin born stalled read healthy at the exact moment
+    someone first looked at it (#1, ask 3). So the first observation now says
+    what it actually knows: `advancing` is None with
+    `advancing_basis: "first-sight"` — no basis yet, which is not health and
+    not stall. Judgement starts on the second fetch, where the basis is
+    "compared". Additive only: the `advancing` field keeps its name, True and
+    False keep their meanings, and consumers must classify with
+    stalled_peers() rather than truthiness — `not None` is truthy, and a bare
+    truthiness test would swap "born stalled reads healthy" for "first sight
+    reads stalled".
     """
     seen_path = NBHD / "peers-seen.json"
     try:
@@ -549,14 +563,36 @@ def peer_roll_call(stale_minutes=90):
         info = fetch_peer(slug, url)
         prev = seen.get(slug, {})
         if info.get("valid"):
-            same = prev.get("heads") == info["heads"] and prev.get("heads") is not None
-            info["advancing"] = not same
+            if prev.get("heads") is None:
+                # Never seen this peer's heads before — including a live
+                # install's peers-seen.json written by old code, whose records
+                # always carry "heads", so existing peers are unaffected.
+                info["advancing"] = None
+                info["advancing_basis"] = "first-sight"
+            else:
+                info["advancing"] = prev["heads"] != info["heads"]
+                info["advancing_basis"] = "compared"
             info["alive"] = (info.get("age_minutes") is not None
                              and info["age_minutes"] < stale_minutes)
             seen[slug] = {"heads": info["heads"], "at": utc_now()}
         out[slug] = info
     seen_path.write_text(json.dumps(seen, indent=2) + "\n", encoding="utf-8")
     return out
+
+
+def stalled_peers(peer_report):
+    """The peers KNOWN to be stalled — advancing is False, not merely un-True.
+
+    This is the classifier consumers must use instead of `not v.get("advancing")`.
+    `advancing` is three-valued: True (heads moved), False (heads did not move),
+    None (first sight — no prior head to compare, so no verdict either way).
+    Truthiness collapses None into False, which would report a peer as stalled
+    the moment it is first observed — the mirror image of the bug this fixes.
+    Only an identity check on False keeps "we watched it not move" distinct
+    from "we have not watched it long enough to say".
+    """
+    return [k for k, v in peer_report.items()
+            if v.get("valid") and v.get("advancing") is False]
 
 
 if __name__ == "__main__":
