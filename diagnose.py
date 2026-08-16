@@ -33,8 +33,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-HOME = Path(__file__).resolve().parent
-
 TOKEN_ENVS = ("GITHUB_TOKEN", "GH_TOKEN", "GH_PAT", "COPILOT_GITHUB_TOKEN")
 
 _SECRETS = []

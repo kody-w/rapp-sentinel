@@ -31,8 +31,8 @@ def scenario(name, cond, observed):
         FAILURES.append(name)
 
 
-REAL_HOME = H.HOME
-COMMITTED = json.loads((REAL_HOME / "required_checks.json").read_text(
+REAL_CODE = H.CODE
+COMMITTED = json.loads((REAL_CODE / "required_checks.json").read_text(
     encoding="utf-8"))
 
 
@@ -43,14 +43,14 @@ def with_manifest(doc_or_bytes):
         p.write_bytes(doc_or_bytes)
     else:
         p.write_text(json.dumps(doc_or_bytes), encoding="utf-8")
-    H.HOME = d
+    H.CODE = d
     return d
 
 
 try:
     # (1) The committed manifest passes, and the accepted gap is SAID, not
     # hidden — silently reclassifying ecosystem would break this assertion.
-    H.HOME = REAL_HOME
+    H.CODE = REAL_CODE
     r = H.check_freshness_pairing()
     scenario("(1) committed manifest: ok, and the ecosystem acceptance is named",
              r["ok"] and "accepted-unpaired" in r["detail"]
@@ -112,7 +112,7 @@ try:
              and "unreadable" in r["detail"],
              f"severity={r['severity']} {r['detail']}")
 finally:
-    H.HOME = REAL_HOME
+    H.CODE = REAL_CODE
 
 print(f"\n{len(FAILURES)} failing scenario(s)" if FAILURES
       else "\nall scenarios behaved as specified")

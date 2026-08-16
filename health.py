@@ -411,7 +411,10 @@ def check_freshness_pairing():
     here at warn (the repair arm cannot write a freshness check; a human
     can).
     """
-    manifest = HOME / "required_checks.json"
+    # CODE, not HOME: the required set and its kinds map are a property of
+    # checks.py, so they live with the code — same reasoning as
+    # check_completeness below (SENTINEL_HOME split, #1).
+    manifest = CODE / "required_checks.json"
     try:
         doc = json.loads(manifest.read_text(encoding="utf-8"))
     except Exception as e:
