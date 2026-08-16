@@ -469,6 +469,13 @@ def _attests_for():
         claims = cfg.get("attests_for") or {}
     except Exception:
         return {}
+    if not isinstance(claims, dict):
+        # A list-shaped attests_for used to AttributeError on .items() — an
+        # accidental crash instead of a deliberate refusal. Same verdict,
+        # said properly.
+        raise ValueError(
+            f"attests_for must be an object of {{watcher_slug: rappid}}, "
+            f"got {type(claims).__name__} - refusing to publish")
     out = {}
     for slug, rid in claims.items():
         if not isinstance(rid, str) or not rapp.rappid_valid(rid):

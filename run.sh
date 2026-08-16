@@ -20,10 +20,14 @@ cd "$(dirname "$0")" || exit 1
 # hung tick does not get overtaken, it stops the watch entirely, and the
 # heartbeat freezes at whatever it last wrote.
 #
-# macOS ships no timeout(1), so the ceiling is enforced here. It is set above
-# evolve_timeout_s (1800) so a legitimate long tick is never killed mid-repair;
-# anything past that is hung, not working.
-LIMIT="${SENTINEL_TICK_LIMIT:-2100}"
+# macOS ships no timeout(1), so the ceiling is enforced here. Sized against
+# the worst LEGITIMATE tick, so real work is never killed mid-flight:
+# health run (600) + dashboard (180) + the one model-spending arm the tick
+# is allowed (evolve, 1800 — smoke and evolve never stack, sentinel.py
+# defers evolve when a smoke ran) + overhead. Anything past that is hung,
+# not working. The old 2100 was sized when health was 180s and smoke did
+# not exist; it sat 60s from killing a legitimate health+evolve tick.
+LIMIT="${SENTINEL_TICK_LIMIT:-3000}"
 
 /usr/bin/python3 sentinel.py &
 TICK=$!

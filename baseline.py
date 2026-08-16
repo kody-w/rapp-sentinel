@@ -100,13 +100,24 @@ def world_writable_ancestor(path):
 def parse_failing_ids(output):
     """The NAMED set of failing tests, plus how many ran.
 
-    unittest reports 'FAIL: test_x (module.Class.test_x)' and
-    'ERROR: test_y (...)'. The id recorded is 'module.Class.test_x' —
-    the set is the claim; the count is derived, never primary.
+    Two header formats exist, and the difference is a working-vs-broken
+    recorder on the live runtime: Python >= 3.11 prints
+    'FAIL: test_x (module.Class.test_x)' while 3.9 — /usr/bin/python3, the
+    interpreter the scheduled comparator actually runs — prints
+    'FAIL: test_x (module.Class)', method OUTSIDE the parens. The first
+    version parsed only the parenthesized part, so on 3.9 every id lost its
+    method name and two different failing tests in one class collapsed to
+    one id — real regressions could read as already-known (found by the
+    2026-08-16 review sweep). The id recorded is 'module.Class.test_x'
+    under both formats; the set is the claim, the count derived.
     """
     ids = set()
-    for m in re.finditer(r"^(?:FAIL|ERROR): \S+ \(([^)]+)\)", output, re.M):
-        ids.add(m.group(1))
+    for m in re.finditer(r"^(?:FAIL|ERROR): (\S+) \(([^)]+)\)", output, re.M):
+        method, qual = m.group(1), m.group(2)
+        if qual == method or qual.endswith("." + method):
+            ids.add(qual)                      # 3.11+: parens carry the full id
+        else:
+            ids.add(f"{qual}.{method}")        # 3.9: parens carry module.Class
     ran = 0
     m = re.search(r"^Ran (\d+) tests?", output, re.M)
     if m:
