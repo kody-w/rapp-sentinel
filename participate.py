@@ -116,6 +116,36 @@ def open_delta_issue(repo: str, action: str, payload: dict,
     return True, out
 
 
+def agents_index(state_doc) -> dict:
+    """The agents collection as {id: row}, whatever shape the platform serves.
+
+    rappterbook serves `agents` as a dict keyed by agent id; rappterverse
+    serves it as a LIST of rows carrying their own `id`. participate.py
+    assumed dict everywhere, so the rappterverse verifier crashed with
+    `'list' object has no attribute 'get'` on its FIRST live run — inside
+    wait_for_state, where the crash was caught per-poll and surfaced as
+    "timed out", making an instrument defect look exactly like the platform
+    failure this tool exists to catch. A verifier that cannot read the state
+    it is verifying reports the wrong thing with full confidence (#45's
+    blind-instrument rule, one layer up).
+
+    Rows without a usable id are counted under a synthesized key rather than
+    dropped, so len() stays honest.
+    """
+    agents = state_doc.get("agents", {}) if isinstance(state_doc, dict) else {}
+    if isinstance(agents, dict):
+        return agents
+    if isinstance(agents, list):
+        out = {}
+        for i, row in enumerate(agents):
+            if isinstance(row, dict):
+                out[str(row.get("id") or row.get("name") or f"row-{i}")] = row
+            else:
+                out[f"row-{i}"] = {"value": row}
+        return out
+    return {}
+
+
 def wait_for_state(url: str, predicate, timeout_s: int = 420,
                    interval_s: int = 30) -> tuple[bool, str]:
     """Poll PUBLISHED state until the change is really visible.
@@ -149,7 +179,7 @@ def cmd_smoke(args) -> int:
     # 1. Is the platform's own state readable without credentials?
     try:
         agents = fetch_json(url)
-        n = len(agents.get("agents", {}))
+        n = len(agents_index(agents))
         print(f"  ✓ public state readable — {n} agents")
         record("smoke.read", args.platform, True, f"{n} agents")
     except Exception as e:
@@ -162,7 +192,7 @@ def cmd_smoke(args) -> int:
     if me != REQUESTED_ID:
         print(f"  ! platform will bind this to '{me}', not '{REQUESTED_ID}'")
         print(f"    (agent_id is overridden by the authenticated issue author)")
-    already = me in agents.get("agents", {})
+    already = me in agents_index(agents)
     action = "heartbeat" if already else "register_agent"
     print(f"  {'already registered' if already else 'not yet registered'}"
           f" → {action}")
@@ -189,7 +219,7 @@ def cmd_smoke(args) -> int:
     print("  waiting for the change to appear in published state…")
 
     def landed(data):
-        a = data.get("agents", {}).get(me)
+        a = agents_index(data).get(me)
         if not a:
             return False, "not in agents.json yet"
         return True, f"present, status={a.get('status')}, joined={a.get('joined')}"
@@ -249,7 +279,7 @@ def gather_observations(platform: str) -> str:
     lines = []
     try:
         agents = fetch_json(plat["state_url"])
-        a = agents.get("agents", {})
+        a = agents_index(agents)
         active = sum(1 for v in a.values() if v.get("status") == "active")
         lines.append(f"  agents: {len(a)} registered, {active} active")
     except Exception as e:
@@ -289,7 +319,7 @@ def cmd_contribute(args) -> int:
 
     try:
         agents = fetch_json(plat["state_url"])
-        n_agents = len(agents.get("agents", {}))
+        n_agents = len(agents_index(agents))
     except Exception:
         n_agents = "unknown"
 
