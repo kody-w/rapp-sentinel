@@ -1990,11 +1990,23 @@ def alerts_can_actually_reach_you():
         return fail("alert_delivery", f"outbox unreadable: {e}", critical=False)
     n, age = st.get("pending", 0), st.get("oldest_minutes")
     missing = int(st.get("missing_attachments") or 0)
+    unverified = int(st.get("unverified") or 0)
+    dead_letter = int(st.get("dead_letter") or 0)
     last = st.get("last_drain") or {}
     why = (last.get("why") or "").strip()
     if missing:
         return fail("alert_delivery",
                     f"{missing} queued static report attachment(s) are missing",
+                    critical=False)
+    if dead_letter:
+        return fail("alert_delivery",
+                    f"{dead_letter} alert(s) exhausted delivery retries and "
+                    "remain in the dead-letter ledger",
+                    critical=False)
+    if unverified:
+        return fail("alert_delivery",
+                    f"{unverified} alert send(s) remain explicitly unverified; "
+                    f"last drain: {why[:120] or 'unknown'}",
                     critical=False)
 
     # A drain that failed already knows which failure it was. Waiting 180
@@ -2008,6 +2020,8 @@ def alerts_can_actually_reach_you():
         return fail("alert_delivery",
                     f"{n} alert(s) queued; last drain failed: {why[:150]}",
                     critical=False)
+    if not n and why.startswith("delivery unverified:"):
+        return fail("alert_delivery", why[:180], critical=False)
     if not n:
         return ok("alert_delivery", "no queued alerts")
     if age and age > 180:

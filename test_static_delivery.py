@@ -271,18 +271,22 @@ class OutboxAttachmentTests(unittest.TestCase):
         root = Path(self.temp.name)
         self.old = (
             outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
-            outbox.LOCK, outbox.DRAIN_LOCK)
+            outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
+            outbox.DEAD_LETTER)
         outbox.QUEUE = root / "outbox.jsonl"
         outbox.SENT = root / "sent.jsonl"
         outbox.LAST_DRAIN = root / "last.json"
         outbox.REPORTS = root / "reports"
         outbox.LOCK = root / "outbox.lock"
         outbox.DRAIN_LOCK = root / "outbox-drain.lock"
+        outbox.UNVERIFIED = root / "outbox-unverified.jsonl"
+        outbox.DEAD_LETTER = root / "outbox-dead-letter.jsonl"
         outbox.REPORTS.mkdir()
 
     def tearDown(self):
         (outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
-         outbox.LOCK, outbox.DRAIN_LOCK) = self.old
+         outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
+         outbox.DEAD_LETTER) = self.old
         self.temp.cleanup()
 
     def test_drain_passes_attachment_and_cleans_generated_snapshot(self):
@@ -377,6 +381,14 @@ class OutboxAttachmentTests(unittest.TestCase):
             script.index('tell application "Messages"', script.index("repeat with")),
         )
 
+    def test_unreadable_delivery_ledger_never_becomes_success(self):
+        completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        with mock.patch.object(outbox, "_delivered_count", return_value=None), \
+                mock.patch.object(outbox.subprocess, "run", return_value=completed):
+            ok, reason = outbox._send("alert", "recipient")
+        self.assertFalse(ok)
+        self.assertIn("unverifiable", reason)
+
     def test_drain_keeps_enqueue_from_another_process(self):
         outbox.enqueue("first", "recipient")
         cmd = "\n".join([
@@ -417,19 +429,26 @@ class WatcherOutboxTests(unittest.TestCase):
         root = Path(self.temp.name)
         self.old = (
             outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
-            outbox.LOCK, outbox.DRAIN_LOCK, watcher_outbox.CLAIMS)
+            outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
+            outbox.DEAD_LETTER, watcher_outbox.CLAIMS,
+            watcher_outbox.ATTEMPTS)
         outbox.QUEUE = root / "outbox.jsonl"
         outbox.SENT = root / "sent.jsonl"
         outbox.LAST_DRAIN = root / "last.json"
         outbox.REPORTS = root / "reports"
         outbox.LOCK = root / "outbox.lock"
         outbox.DRAIN_LOCK = root / "outbox-drain.lock"
+        outbox.UNVERIFIED = root / "outbox-unverified.jsonl"
+        outbox.DEAD_LETTER = root / "outbox-dead-letter.jsonl"
         watcher_outbox.CLAIMS = root / "watcher-claims"
+        watcher_outbox.ATTEMPTS = root / "outbox-attempts.json"
         outbox.REPORTS.mkdir()
 
     def tearDown(self):
         (outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
-         outbox.LOCK, outbox.DRAIN_LOCK, watcher_outbox.CLAIMS) = self.old
+         outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
+         outbox.DEAD_LETTER, watcher_outbox.CLAIMS,
+         watcher_outbox.ATTEMPTS) = self.old
         self.temp.cleanup()
 
     def _claim(self):
@@ -469,6 +488,57 @@ class WatcherOutboxTests(unittest.TestCase):
                          [row["text"] for row in outbox._pending()])
         self.assertFalse(outbox.SENT.exists())
 
+    def test_uncertain_send_leaves_a_durable_unverified_record(self):
+        outbox.enqueue("uncertain", "recipient")
+        claim = self._claim()
+
+        watcher_outbox.uncertain(claim, "chat.db unreadable")
+
+        self.assertEqual([], outbox._pending())
+        self.assertFalse(outbox.SENT.exists())
+        record = json.loads(outbox.UNVERIFIED.read_text().splitlines()[0])
+        self.assertEqual("uncertain", record["text"])
+        self.assertIn("chat.db unreadable", record["reason"])
+        self.assertEqual(1, outbox.status()["unverified"])
+
+    def test_failed_send_backs_off_instead_of_immediate_resend(self):
+        outbox.enqueue("retry", "recipient")
+        claim = self._claim()
+
+        watcher_outbox.fail(claim, "Messages unavailable")
+
+        self.assertEqual(5, watcher_outbox.claim())
+        attempts = json.loads(watcher_outbox.ATTEMPTS.read_text())
+        self.assertEqual(1, next(iter(attempts.values()))["count"])
+        self.assertEqual(["retry"], [row["text"] for row in outbox._pending()])
+
+    def test_third_failed_send_moves_to_dead_letter(self):
+        outbox.enqueue("dead", "recipient")
+        raw_line = outbox._queue_lines_unlocked()[0]
+        digest = watcher_outbox._digest(raw_line)
+        watcher_outbox.ATTEMPTS.write_text(json.dumps({
+            digest: {"count": 2, "reason": "prior failures"},
+        }))
+        claim = self._claim()
+
+        watcher_outbox.fail(claim, "still unavailable")
+
+        self.assertEqual([], outbox._pending())
+        record = json.loads(outbox.DEAD_LETTER.read_text().splitlines()[0])
+        self.assertEqual(3, record["attempts"])
+        self.assertEqual("dead", record["text"])
+        self.assertEqual(1, outbox.status()["dead_letter"])
+
+    def test_corrupt_attempt_ledger_fails_closed(self):
+        outbox.enqueue("do not send", "recipient")
+        watcher_outbox.ATTEMPTS.write_text("{broken", encoding="utf-8")
+
+        with self.assertRaises(RuntimeError):
+            watcher_outbox.claim()
+
+        self.assertEqual(["do not send"],
+                         [row["text"] for row in outbox._pending()])
+
 
 class SmokePolicyTests(unittest.TestCase):
     def test_read_only_instance_declares_smoke_disabled(self):
@@ -485,6 +555,34 @@ class SmokePolicyTests(unittest.TestCase):
 
         self.assertTrue(result["ok"])
         self.assertIn("read-only", result["detail"])
+
+
+class AlertDeliveryTests(unittest.TestCase):
+    def test_unverified_send_is_not_reported_healthy(self):
+        with mock.patch.object(outbox, "status", return_value={
+            "pending": 0,
+            "oldest_minutes": None,
+            "missing_attachments": 0,
+            "unverified": 1,
+            "dead_letter": 0,
+            "last_drain": {"why": "delivery unverified: chat.db unreadable"},
+        }):
+            result = checks.alerts_can_actually_reach_you()
+        self.assertFalse(result["ok"])
+        self.assertIn("explicitly unverified", result["detail"])
+
+    def test_dead_letter_is_not_reported_healthy(self):
+        with mock.patch.object(outbox, "status", return_value={
+            "pending": 0,
+            "oldest_minutes": None,
+            "missing_attachments": 0,
+            "unverified": 0,
+            "dead_letter": 1,
+            "last_drain": {"why": "dead-lettered"},
+        }):
+            result = checks.alerts_can_actually_reach_you()
+        self.assertFalse(result["ok"])
+        self.assertIn("dead-letter", result["detail"])
 
 
 class MeaningfulActivityTests(unittest.TestCase):

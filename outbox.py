@@ -43,6 +43,8 @@ STATE = HOME / "state"
 STATE.mkdir(exist_ok=True)
 QUEUE = STATE / "outbox.jsonl"
 SENT = STATE / "outbox-sent.jsonl"
+UNVERIFIED = STATE / "outbox-unverified.jsonl"
+DEAD_LETTER = STATE / "outbox-dead-letter.jsonl"
 REPORTS = STATE / "reports"
 LOCK = STATE / "outbox.lock"
 DRAIN_LOCK = STATE / "outbox-drain.lock"
@@ -204,9 +206,9 @@ def _send(text, to, attachments=None):
     count did not happen." The unattended path is where it matters more.
 
     Messages writes the row, not osascript, so the count is polled briefly
-    rather than read once. An unreadable chat.db yields None and falls back to
-    the return code -- an unverifiable send is still better attempted than
-    dropped.
+    rather than read once. An unreadable chat.db yields an explicitly
+    unverifiable failure; a process exit code must never destroy the only copy
+    of an alert.
     """
     attachment_paths = [Path(p) for p in (attachments or [])]
     missing = [p.name for p in attachment_paths if not p.is_file()]
@@ -231,7 +233,7 @@ def _send(text, to, attachments=None):
     if p.returncode != 0:
         return False, p.stderr.strip()[:160]
     if before is None or any(v is None for v in attachment_before.values()):
-        return True, "sent (delivery unverifiable: chat.db unreadable)"
+        return False, "delivery unverifiable: chat.db unreadable"
 
     for _ in range(40):                      # attachments can take longer to index
         text_landed = not text or (_delivered_count(to) or 0) > before
@@ -348,11 +350,23 @@ def last_drain():
 def status():
     pending = _pending()
     last = last_drain()
+    def count_lines(path):
+        try:
+            return sum(1 for line in path.read_text(encoding="utf-8").splitlines()
+                       if line.strip())
+        except Exception:
+            return 0
+
     missing = sum(
         1 for message in pending for raw in message.get("attachments", [])
         if not Path(raw).is_file()
     )
-    base = {"last_drain": last, "missing_attachments": missing}
+    base = {
+        "last_drain": last,
+        "missing_attachments": missing,
+        "unverified": count_lines(UNVERIFIED),
+        "dead_letter": count_lines(DEAD_LETTER),
+    }
     if not pending:
         return {**base, "pending": 0, "oldest_minutes": None}
     oldest = min(datetime.fromisoformat(m["at"]) for m in pending)
