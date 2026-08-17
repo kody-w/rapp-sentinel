@@ -284,3 +284,7 @@ Stated plainly because the whole argument here is that unverifiable claims are w
 | `BLOG-the-agent-that-refused.md` | the long-form writeup |
 
 MIT. The `rapp/1` reference implementation is vendored from [kody-w/rapp-1](https://github.com/kody-w/rapp-1) under its own terms.
+
+## The pattern, generalized
+
+Three watchers is the smallest case. For the general one — **any number of AIs, from any vendors, as mutually-verifying peers** — see [N-AIS-WALK-INTO-A-BAR.md](N-AIS-WALK-INTO-A-BAR.md). Seat your own cast in `config.json`'s `neighbors` map; no code edit.
