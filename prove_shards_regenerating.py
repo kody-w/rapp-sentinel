@@ -8,9 +8,16 @@ current. The first scenario below reproduces that blindness against the old
 logic (a 200 carrying git conflict markers read as ok), then every branch of
 the new check is broken one condition at a time, with a healthy control.
 
-Freshness evidence: the shard's `_meta` carries no timestamp (verified
-2026-08-16), so the check judges the path's newest commit against 15h —
-three times the worst regeneration gap measured across 2026-08-15/16 (4.9h).
+Freshness evidence: individual shard bytes carry no timestamp, but the
+generator's own manifest (`state/cache_shards/index.json`) carries
+`_meta.generated_at`, written on every run. The check judges that stamp
+against 15h — three times the worst regeneration gap measured across
+2026-08-15/16 (4.9h).
+
+The rollover scenario below is the regression that took this check critical-red
+on 2026-08-17: shards are range-partitioned, so the shard the check used to be
+pinned to went immutable when discussion ids crossed 21000, while the generator
+kept running perfectly.
 
 Run: python3 prove_shards_regenerating.py   (exit 0 only on all-behaved)
 """
@@ -19,6 +26,7 @@ import io
 import json
 import sys
 import urllib.request
+import urllib.error
 from datetime import datetime, timedelta, timezone
 
 import checks as C
@@ -48,24 +56,39 @@ class FakeResponse(io.BytesIO):
         return False
 
 
-def serve(body):
+def serve(routes):
+    """Route by URL fragment. A fragment with no route 404s, so 'the index
+    names a shard the site does not serve' is expressible."""
+    if not isinstance(routes, dict):
+        routes = {"": routes}
+
     def opener(req, timeout=None):
-        if isinstance(body, Exception):
-            raise body
-        return FakeResponse(body)
+        url = getattr(req, "full_url", None) or str(req)
+        for frag, val in routes.items():
+            if frag in url:
+                if isinstance(val, Exception):
+                    raise val
+                return FakeResponse(val)
+        raise urllib.error.HTTPError(url, 404, "Not Found", {}, None)
     return opener
 
 
-def gh_dates(rows):
-    def gh(args, default=None):
-        if rows is None:
-            return default
-        return list(rows)
-    return gh
+def index_bytes(generated_h_ago, shards, omit_stamp=False):
+    meta = {"shard_size": 250, "total_shards": len(shards)}
+    if not omit_stamp:
+        meta["generated_at"] = iso_hours_ago(generated_h_ago)
+    return json.dumps({"_meta": meta, "shards": shards}).encode()
 
 
-GOOD = json.dumps({"_meta": {"range_start": 20750, "range_end": 20999,
-                             "count": 213}, "discussions": []}).encode()
+def shard_bytes(count):
+    return json.dumps({"_meta": {"range_start": 21000, "range_end": 21249,
+                                 "count": count}, "discussions": []}).encode()
+
+
+# The live shape on 2026-08-17: 20750 full and frozen, 21000 active.
+SHARDS = {"20500": {"file": "shard_20500.json", "count": 218},
+          "20750": {"file": "shard_20750.json", "count": 213},
+          "21000": {"file": "shard_21000.json", "count": 15}}
 CONFLICTED = b'<<<<<<< HEAD\n{"_meta": {"count": 213}}\n=======\n'
 
 real_urlopen = urllib.request.urlopen
@@ -84,50 +107,77 @@ C.http_status = real_http_status
 
 # ── the new check, one broken condition at a time ───────────────────────────
 
-urllib.request.urlopen = serve(GOOD)
-C.gh = gh_dates([iso_hours_ago(3)])
+urllib.request.urlopen = serve({"index.json": index_bytes(3, SHARDS),
+                                "shard_21000.json": shard_bytes(15)})
 r = C.derived_data_regenerating()
-scenario("control: parses, 213 discussions, regenerated 3h ago -> ok",
-         r["ok"] and "213 discussions" in r["detail"] and "3.0h old" in r["detail"],
+scenario("control: index parses, newest shard served, generated 3h ago -> ok",
+         r["ok"] and "shard_21000.json" in r["detail"]
+         and "15 discussions" in r["detail"] and "3.0h old" in r["detail"],
          r["detail"])
 
-C.gh = gh_dates([iso_hours_ago(16)])
+# The regression this fix exists for: the OLD check pinned shard_20750.json and
+# read freshness from that path's commit history. Here that shard is frozen
+# (ids rolled past its range_end) while the generator is demonstrably healthy —
+# the old logic went critical-red, the new logic must stay green.
+urllib.request.urlopen = serve({"index.json": index_bytes(0.5, SHARDS),
+                                "shard_21000.json": shard_bytes(15)})
+r = C.derived_data_regenerating()
+scenario("ROLLOVER: pinned shard frozen but generator fresh -> ok (was false red)",
+         r["ok"] and "shard_21000.json" in r["detail"], r["detail"])
+
+urllib.request.urlopen = serve({"index.json": index_bytes(16, SHARDS),
+                                "shard_21000.json": shard_bytes(15)})
 r = C.derived_data_regenerating()
 scenario("stale: 16h against the 15h bar -> CRITICAL",
          (not r["ok"]) and r["severity"] == C.CRITICAL and "stale" in r["detail"],
          f"severity={r['severity']} {r['detail']}")
 
-urllib.request.urlopen = serve(CONFLICTED)
-C.gh = gh_dates([iso_hours_ago(3)])
+urllib.request.urlopen = serve({"index.json": CONFLICTED})
 r = C.derived_data_regenerating()
 scenario("conflict markers -> CRITICAL unparseable (the old check passed this)",
          (not r["ok"]) and r["severity"] == C.CRITICAL
          and "unparseable" in r["detail"], f"severity={r['severity']} {r['detail']}")
 
-urllib.request.urlopen = serve(json.dumps({"_meta": {"count": 0}}).encode())
+# The original outage: the index names a shard the site 404s on.
+urllib.request.urlopen = serve({"index.json": index_bytes(1, SHARDS)})
 r = C.derived_data_regenerating()
-scenario("zero-count shard -> CRITICAL 'reports no discussions'",
+scenario("newest shard 404s -> CRITICAL (the outage this check was built for)",
+         (not r["ok"]) and r["severity"] == C.CRITICAL
+         and "not served" in r["detail"], f"severity={r['severity']} {r['detail']}")
+
+urllib.request.urlopen = serve({"index.json": index_bytes(1, SHARDS),
+                                "shard_21000.json": shard_bytes(0)})
+r = C.derived_data_regenerating()
+scenario("zero-count newest shard -> CRITICAL 'reports no discussions'",
          (not r["ok"]) and r["severity"] == C.CRITICAL
          and "no discussions" in r["detail"], f"severity={r['severity']} {r['detail']}")
 
-urllib.request.urlopen = serve(OSError("connection dropped"))
+urllib.request.urlopen = serve({"index.json": index_bytes(1, SHARDS),
+                                "shard_21000.json": CONFLICTED})
 r = C.derived_data_regenerating()
-scenario("unreachable shard -> WARN blind-not-broken",
-         (not r["ok"]) and r["severity"] == C.WARN
-         and "cannot read shard" in r["detail"], f"severity={r['severity']} {r['detail']}")
+scenario("newest shard unparseable -> CRITICAL",
+         (not r["ok"]) and r["severity"] == C.CRITICAL
+         and "unparseable" in r["detail"], f"severity={r['severity']} {r['detail']}")
 
-urllib.request.urlopen = serve(GOOD)
-C.gh = gh_dates(None)
+urllib.request.urlopen = serve({"index.json": OSError("connection dropped")})
 r = C.derived_data_regenerating()
-scenario("commit history unreadable -> WARN (freshness unknown, no repair budget)",
+scenario("unreachable index -> WARN blind-not-broken",
          (not r["ok"]) and r["severity"] == C.WARN
-         and "cannot read" in r["detail"], f"severity={r['severity']} {r['detail']}")
+         and "cannot read shard index" in r["detail"],
+         f"severity={r['severity']} {r['detail']}")
 
-C.gh = gh_dates([])
+urllib.request.urlopen = serve({"index.json": index_bytes(1, SHARDS, omit_stamp=True),
+                                "shard_21000.json": shard_bytes(15)})
 r = C.derived_data_regenerating()
-scenario("path never committed -> CRITICAL 'carries no timestamp'",
+scenario("index carries no generated_at -> CRITICAL 'carries no timestamp'",
          (not r["ok"]) and r["severity"] == C.CRITICAL
          and "no timestamp" in r["detail"], f"severity={r['severity']} {r['detail']}")
+
+urllib.request.urlopen = serve({"index.json": json.dumps({"_meta": {}}).encode()})
+r = C.derived_data_regenerating()
+scenario("index with no shards map -> CRITICAL unusable (never silently green)",
+         (not r["ok"]) and r["severity"] == C.CRITICAL
+         and "unusable" in r["detail"], f"severity={r['severity']} {r['detail']}")
 
 urllib.request.urlopen = real_urlopen
 C.gh = real_gh
