@@ -191,6 +191,7 @@ The worker (`evolve_worker.py`, `com.rapp.evolve-worker`, every 30 min):
 | fail-closed ledgers | a corrupt or truncated history **stops the pass**; it is never read as "no spend" |
 | health at start, before the push, before the merge | any **critical** check aborts; degraded proceeds only when *every* failing id is in `degraded_allowlist` — `evolve_on_degraded` is ignored here |
 | temp clone | the model works only in a worker-made clone and is told, explicitly, that it may not commit, push, open a PR, or merge |
+| bounded sub-sentinel fan-out | optional: 3-5 read-only children in separate processes with no repo, no token and no ability to spawn children, aggregated deterministically into exactly 10 finalists — see below |
 | deterministic gate | exactly one new `submissions/<slug>/`, exactly `meta.json` + `piece.<ext>`, no existing path touched, valid slug/schema/kind/extension/license, piece ≤ 50 KB, SVG parses with no script, no `on*` handler and no external reference, and `_dada_cycle` proving 1-5 rounds of **exactly 10** scored candidates with a winner that names the piece |
 | controller-owned publish | the branch, commit, PR, PR **file scope as GitHub reports it**, squash merge, and the re-read of `origin/main` and the merge commit afterwards are all done by code |
 | honest outcomes | only a re-read merge sends a 🎨; a timeout, failure, rejection or decline is recorded as what it was |
@@ -203,6 +204,65 @@ passed the gate. The temporary clone is removed on every path out.
 Honest limit: the deterministic gate encodes the submission protocol *as it
 was read* — a repo that changes its protocol needs the gate updated with it,
 on purpose, so a PR cannot relax the rules that judge it.
+
+#### Sub-sentinels: a bounded fan-out before the maker
+
+One model deciding alone what to make is one model's blind spot, published. So
+a cycle can start by spending a small, capped cast of **sub-sentinels** —
+separate `copilot` processes with separate contexts:
+
+```jsonc
+"fanout": {
+  "enabled": true,
+  "children": 3,          // max_children caps it; the maker counts too
+  "max_depth": 1,         // children may never spawn children
+  "daily_child_budget": 24
+}
+```
+
+The default cast is three, and one of them exists to argue:
+
+| Role | Wave | Job |
+|---|---|---|
+| `novelty-archaeologist` | 1 | reads every prior submission and vetoes repeats |
+| `execution-designer` | 1 | thinks in the medium — can this actually be built under 50 KB? |
+| `adversarial-verifier` | 2 | sees wave one's candidates and attacks them |
+
+Roles, briefs and waves are configurable; a critic that never sees the
+candidates would be decoration, which is why waves exist.
+
+**A sub-sentinel cannot publish anything.** Not by instruction — by
+construction: it gets no git clone (the parent hands it `prior.json`, read
+from the clone), no GitHub token (`GH_TOKEN`, `GITHUB_TOKEN`, `SSH_AUTH_SOCK`
+are stripped and `gh` is pointed at an empty config dir), its own temporary
+workspace, its own process group, a hard timeout, and `RAPP_SENTINEL_DEPTH`
+set — which the worker checks and refuses to run under, so a child cannot
+start a cycle inside a cycle. The maker inherits the same marker.
+
+Each child writes exactly one file: a `rapp-subsentinel-report/1.0` JSON
+report, parsed strictly — bounded candidates, six numeric score dimensions,
+bounded evidence and critique, no unknown keys, size-capped. Then the parent
+aggregates **deterministically**: high-severity critiques are vetoes, medium
+ones demote, and the survivors are ranked by mean score into **exactly ten
+finalists** — which the gate then requires to *be* round one of the published
+`_dada_cycle`. A maker that ignores its sub-sentinels is rejected.
+
+Failure is explicit at every step. A child that times out, crashes, writes
+nothing, or breaks one bound is a named failure carried into the ledger, the
+chain frame and the maker's own prompt. Enough healthy children may continue —
+but only if ten finalists still survive; nine is a failed cycle, never a
+rounded-up ten. And if the fan-out is enabled but cannot run (spent child
+credit, no slots), the cycle is **skipped**, not quietly made alone: "the
+collective deliberated" and "one model had a think" are different claims.
+
+Everything the fan-out produces is still just text. The parent controller
+remains the only thing in this system that touches git or GitHub, after the
+same deterministic gates and the same health re-probe.
+
+Honest limit: stripping `GH_TOKEN` is what makes a child unable to publish, so
+on a machine whose Copilot CLI authenticates *through* that variable the
+children will fail explicitly rather than quietly gain write access — that
+direction is the intended one, and `strip_env` is where an operator decides.
 
 ---
 

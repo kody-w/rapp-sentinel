@@ -17,3 +17,4 @@ public/sentinel-head.json
 
 # local-only: the strings you are hiding must never ship
 sensitive/
+.tmp-subsentinel-tests/

@@ -50,6 +50,7 @@ from pathlib import Path
 
 import neighborhood as NB
 import sentinel
+import subsentinels as SS
 from paths import HOME
 
 STATE = HOME / "state"
@@ -83,6 +84,9 @@ WORKER_DEFAULTS = {
     "max_meta_bytes": 262144,
     "max_state_bytes": 262144,
     "notify_declines": False,
+    # Bounded sub-sentinel fan-out (subsentinels.py). Off by default; see
+    # FANOUT_DEFAULTS there for the caps every key inherits.
+    "fanout": {},
 }
 
 # ── the submission protocol, as code ────────────────────────────────────────
@@ -115,6 +119,7 @@ OUTCOME_TIMEOUT = "timeout"
 OUTCOME_FAILED = "failed"
 OUTCOME_REJECTED = "rejected"
 OUTCOME_ABORTED = "aborted"
+OUTCOME_FANOUT = "fanout-failed"
 
 # Only a verified merge is allowed to wear the paintbrush. Every other outcome
 # gets a shape a human reads as "something did not happen" (#7).
@@ -443,7 +448,9 @@ Search first, build once. Run between {min_rounds} and {max_rounds} rounds. In
 EVERY round produce EXACTLY {candidates} distinct candidate premises and score
 each on all six dimensions ({dimensions}), each a number from {score_min} to
 {score_max}. Pick one winner per round; the final round's winner is the piece
-you actually build.
+you actually build. {round_one}
+
+{fanout}
 
 {{
   "cycle": {cycle},
@@ -496,7 +503,7 @@ CONTRIBUTED, DECLINED or BLOCKED, then one sentence on what you decided and why.
 
 
 def build_prompt(cfg, wcfg, slug, workspace, expected_cycle,
-                 expected_previous, history):
+                 expected_previous,                  history, finalists=None, digest=None):
     ids = NB.identities()
     roll = NB.roll_call()
     recent = [
@@ -506,6 +513,21 @@ def build_prompt(cfg, wcfg, slug, workspace, expected_cycle,
     ]
     state_in = Path(workspace) / "state-in.json"
     example = ", ".join(f'"{d}": 7' for d in SCORE_DIMENSIONS)
+    if finalists:
+        # The fan-out already ran the first round, in separate contexts, and
+        # its ten survivors are binding: the gate checks round one against
+        # these exact ids, so the piece cannot quietly ignore the deliberation
+        # that justified it.
+        fanout_block = (
+            SS.finalists_block(finalists, digest or {})
+            + "\n\nYour sub-sentinels are finished and cannot be consulted "
+              "again. Do not start any further agents; you are the maker.\n")
+        round_one = ('Round 1 MUST contain exactly the ten finalist ids above, '
+                     'verbatim. Later rounds (up to 5) may use ids of your own.')
+    else:
+        fanout_block = ""
+        round_one = ("Round 1 is yours to populate; every round needs exactly "
+                     f"{CANDIDATES_PER_ROUND} candidates.")
     return WORKER_SITUATION.format(
         instance_name=sentinel.instance_name(cfg),
         slug=slug,
@@ -534,6 +556,8 @@ def build_prompt(cfg, wcfg, slug, workspace, expected_cycle,
         previous_slug=json.dumps(expected_previous),
         chain_path=str(NB.chain_path(slug)),
         recent="\n".join(recent) or "  (none yet)",
+        fanout=fanout_block,
+        round_one=round_one,
         brief=sentinel.evolve_brief(cfg) or
         "No additional standing directive. Decide from your role and memory.",
     )
@@ -577,12 +601,18 @@ def run_model(workspace, prompt, wcfg):
     Outcome is only ever "ok", "timeout" or "failed" here — whether the model
     actually CONTRIBUTED is not something its exit code or its last line is
     allowed to decide (R1).
+
+    The maker inherits a depth marker too: if it shells back into
+    evolve_worker.py, that run refuses itself rather than starting a second
+    cycle inside this one.
     """
     cmd = ["copilot", "-p", prompt, "--allow-all", "--model", wcfg["model"]]
     timeout_s = int(wcfg["timeout_s"])
+    env = dict(os.environ)
+    env[SS.DEPTH_ENV] = str(SS.current_depth() + 1)
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout_s, cwd=str(workspace))
+                           timeout=timeout_s, cwd=str(workspace), env=env)
     except subprocess.TimeoutExpired:
         return OUTCOME_TIMEOUT, f"copilot timed out after {timeout_s}s"
     except FileNotFoundError:
@@ -715,7 +745,8 @@ def _check_number(value, where):
         raise GateError(f"{where} is outside {SCORE_MIN}..{SCORE_MAX}")
 
 
-def validate_dada_cycle(cycle, slug, expected_cycle, expected_previous):
+def validate_dada_cycle(cycle, slug, expected_cycle, expected_previous,
+                        expected_round1_ids=None):
     """The cycle block is the search, checked. Reject on the first doubt."""
     if not isinstance(cycle, dict):
         raise GateError("meta._dada_cycle is missing or not an object")
@@ -769,6 +800,20 @@ def validate_dada_cycle(cycle, slug, expected_cycle, expected_previous):
         if selected not in seen:
             raise GateError(f"round {index} selected {selected!r}, which is not "
                             f"one of its candidates")
+        if index == 1 and expected_round1_ids is not None:
+            # The fan-out's ten finalists ARE round one. Without this the
+            # sub-sentinels would be theatre: a maker could run three child
+            # processes, ignore every one of them, and publish whatever it
+            # already had in mind with a deliberation section attached.
+            wanted = set(expected_round1_ids)
+            if seen != wanted:
+                missing = sorted(wanted - seen)
+                added = sorted(seen - wanted)
+                raise GateError(
+                    "round 1 must be exactly the ten finalists the "
+                    "sub-sentinels produced"
+                    + (f"; missing {missing}" if missing else "")
+                    + (f"; unexpected {added}" if added else ""))
     winner = cycle.get("winner")
     if not isinstance(winner, dict):
         raise GateError("_dada_cycle.winner is missing or not an object")
@@ -785,7 +830,8 @@ def validate_dada_cycle(cycle, slug, expected_cycle, expected_previous):
 
 
 def validate_submission(clone, wcfg, expected_cycle, expected_previous,
-                        base_branch="main", base_sha=None):
+                        base_branch="main", base_sha=None,
+                        expected_round1_ids=None):
     """Everything the controller must prove before a single remote call.
 
     Returns a dict describing the submission. Raises GateError otherwise.
@@ -874,7 +920,7 @@ def validate_submission(clone, wcfg, expected_cycle, expected_previous,
 
     raw = _check_piece(piece_path, kind, int(wcfg.get("max_piece_bytes", 51200)))
     validate_dada_cycle(meta.get("_dada_cycle"), slug, expected_cycle,
-                        expected_previous)
+                        expected_previous, expected_round1_ids)
 
     return {
         "slug": slug,
@@ -1140,6 +1186,13 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         return _skip("evolve_worker.enabled is false — the tick still owns art")
     if int(cfg.get("level", 1)) < 3:
         return _skip(f"level {cfg.get('level')} < 3; evolution is a level-3 act")
+    # A worker that finds itself already inside a sentinel's process tree is a
+    # recursion, not a cycle. Refuse the whole pass, not just the fan-out: a
+    # nested run would try to publish, and one cycle must mean one submission.
+    depth = SS.current_depth()
+    if depth > 0:
+        return _skip(f"nested run refused — {SS.DEPTH_ENV}={depth}; "
+                     f"sub-sentinels may not run the worker")
 
     lock = acquire_lock()
     if lock is None:
@@ -1174,9 +1227,12 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         expected_previous = creative.get("last_slug")
 
         if dry_run:
+            depth = SS.current_depth()
+            specs, note = SS.plan_children(SS.fanout_config(wcfg), history, depth)
             return {"outcome": "dry-run", "role": slug_role,
                     "cycle": expected_cycle, "previous_slug": expected_previous,
-                    "budget": f"{used}/{cap}", "health": why}
+                    "budget": f"{used}/{cap}", "health": why, "depth": depth,
+                    "children": [s["name"] for s in specs], "fanout": note}
 
         workspace = _make_workspace(wcfg)
         clone = workspace / "clone"
@@ -1184,21 +1240,11 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         if creative:
             atomic_write_json(workspace / "state-in.json", creative)
 
-        prompt = build_prompt(cfg, wcfg, slug_role, workspace, expected_cycle,
-                              expected_previous, history)
-        (workspace / "prompt.txt").write_text(prompt, encoding="utf-8")
-        log(f"handing {slug_role} its situation (cycle {expected_cycle}, "
-            f"budget {used + 1}/{cap})")
-        status, output = run_model(workspace, prompt, wcfg)
+        # One row per cycle, written BEFORE the first model process of any
+        # kind. A crash between here and the end must never look like free
+        # budget, and children cost real credits even when the maker never
+        # runs (fan-out accounting rides on this row's "children" count).
         stamp = sentinel.now()
-        try:
-            (LOGS / f"evolve-worker-{slug_role}-{stamp:%Y%m%d-%H%M%S}.log"
-             ).write_text(output, encoding="utf-8")
-        except OSError:
-            pass
-
-        # The spend is recorded BEFORE any conclusion is drawn about it: a
-        # crash between here and the end must never look like free budget.
         row = {
             "id": uuid.uuid4().hex,
             "at": stamp.isoformat(timespec="seconds"),
@@ -1206,11 +1252,57 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             "role": slug_role,
             "cycle": expected_cycle,
             "outcome": "pending",
-            "result": sentinel.result_line(output)[:300],
+            "children": 0,
+            "result": "",
         }
         record(history, row)
         turn["i"] = int(turn.get("i", 0)) + 1
         atomic_write_json(TURN_PATH, turn)
+
+        finalists, digest = None, None
+        fcfg = SS.fanout_config(wcfg)
+        if SS.enabled(fcfg):
+            depth = SS.current_depth()
+            specs, note = SS.plan_children(fcfg, history, depth)
+            if not specs:
+                # Fan-out enabled but unable to run is NOT a licence to make
+                # art alone: "the collective deliberated" and "one model had a
+                # think" are different claims, and only one would be true.
+                row["outcome"] = "skipped"
+                row["skipped"] = True
+                row["detail"] = f"fan-out unavailable: {note}"
+                save_history(history)
+                return _skip(f"fan-out unavailable: {note}")
+            log(f"fanning out to {len(specs)} sub-sentinels ({note})")
+            results = SS.run_children(specs, fcfg, workspace, expected_cycle,
+                                      sentinel.instance_name(cfg), slug_role,
+                                      _prior_submissions(clone), depth, log)
+            row["children"] = len(results)
+            row["child_failures"] = [f"{r['role']}: {r['error']}"
+                                     for r in results if not r["ok"]]
+            save_history(history)
+            try:
+                finalists, digest = SS.aggregate(results, fcfg)
+            except SS.FanoutError as e:
+                return _finish(cfg, wcfg, history, row, OUTCOME_FANOUT, str(e))
+            atomic_write_json(workspace / "finalists.json",
+                              {"finalists": finalists, "digest": digest})
+            log(f"aggregated {len(finalists)} finalists from "
+                f"{digest['healthy']}/{len(results)} healthy children")
+
+        prompt = build_prompt(cfg, wcfg, slug_role, workspace, expected_cycle,
+                              expected_previous, history, finalists, digest)
+        (workspace / "prompt.txt").write_text(prompt, encoding="utf-8")
+        log(f"handing {slug_role} its situation (cycle {expected_cycle}, "
+            f"budget {used + 1}/{cap})")
+        status, output = run_model(workspace, prompt, wcfg)
+        try:
+            (LOGS / f"evolve-worker-{slug_role}-{sentinel.now():%Y%m%d-%H%M%S}.log"
+             ).write_text(output, encoding="utf-8")
+        except OSError:
+            pass
+        row["result"] = sentinel.result_line(output)[:300]
+        save_history(history)
 
         if status != "ok":
             return _finish(cfg, wcfg, history, row,
@@ -1223,7 +1315,9 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             submission = validate_submission(clone, wcfg, expected_cycle,
                                              expected_previous,
                                              wcfg.get("base_branch", "main"),
-                                             base_sha)
+                                             base_sha,
+                                             [c["id"] for c in finalists]
+                                             if finalists else None)
         except GateError as e:
             if str(line).upper().startswith("DECLINED") and "no new submission" in str(e):
                 return _finish(cfg, wcfg, history, row, OUTCOME_DECLINED, line)
@@ -1294,6 +1388,8 @@ def _finish(cfg, wcfg, history, row, outcome, detail, receipts=None,
         "result": row["detail"][:300], "model": wcfg.get("model"),
         "merged": bool(receipts and receipts.get("merge_commit")),
         "pr": (receipts or {}).get("pr_url", ""),
+        "children": int(row.get("children") or 0),
+        "child_failures": row.get("child_failures") or [],
     })
 
     text = notification_for(outcome, row["role"], str(detail), receipts)
@@ -1333,6 +1429,39 @@ def _repo_url(repo):
     if "://" in text or text.startswith(("git@", "/", ".", "~")):
         return os.path.expanduser(text)
     return f"https://github.com/{text}.git"
+
+
+def _prior_submissions(clone, limit=200):
+    """Every published submission, bounded, for the children to dig through.
+
+    Read from the clone by the PARENT and handed over as plain JSON: a child
+    that never sees a repository cannot be tempted to write to one.
+    """
+    root = Path(clone) / "submissions"
+    prior = []
+    if not root.is_dir():
+        return prior
+    for directory in sorted(p for p in root.iterdir() if p.is_dir()):
+        meta_path = directory / "meta.json"
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            prior.append({"slug": directory.name, "title": "", "kind": "",
+                          "statement": "(meta.json unreadable)"})
+            continue
+        statement = str(meta.get("_artist_statement")
+                        or meta.get("_inspired_by") or "")
+        prior.append({
+            "slug": str(meta.get("slug") or directory.name),
+            "title": str(meta.get("title") or ""),
+            "kind": str(meta.get("kind") or ""),
+            "submitted_at": str(meta.get("submitted_at") or ""),
+            "remix_of": meta.get("remix_of"),
+            "statement": statement[:600],
+        })
+        if len(prior) >= limit:
+            break
+    return prior
 
 
 def main(argv=None):

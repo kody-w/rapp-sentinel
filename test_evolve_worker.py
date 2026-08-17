@@ -8,6 +8,7 @@ touches the live instance, GitHub, or a model.
 """
 
 import json
+import os
 import shutil
 import subprocess
 import unittest
@@ -18,6 +19,7 @@ from unittest import mock
 
 import evolve_worker as EW
 import sentinel
+import subsentinels as SS
 
 SCRATCH = Path(__file__).resolve().parent / ".tmp-evolve-worker-tests"
 NOW = datetime(2026, 8, 17, 22, 0, tzinfo=timezone.utc)
@@ -49,23 +51,27 @@ SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
 
 def dada_cycle(slug, cycle=1, previous=None, rounds=1,
                candidates=EW.CANDIDATES_PER_ROUND,
-               dimensions=EW.SCORE_DIMENSIONS):
+               dimensions=EW.SCORE_DIMENSIONS, round1_ids=None):
     body = []
     for r in range(1, rounds + 1):
-        cands = [{"id": f"r{r}c{i}", "premise": f"premise {r}.{i}",
+        ids = ([str(i) for i in round1_ids] if (r == 1 and round1_ids)
+               else [f"r{r}c{i}" for i in range(1, candidates + 1)])
+        cands = [{"id": cid, "premise": f"premise {r}.{n}",
                   "scores": {d: 5 for d in dimensions}}
-                 for i in range(1, candidates + 1)]
+                 for n, cid in enumerate(ids, start=1)]
         body.append({"round": r, "candidates": cands,
-                     "selected": f"r{r}c1" if cands else None})
+                     "selected": cands[0]["id"] if cands else None})
     return {
         "cycle": cycle,
         "previous_slug": previous,
         "rounds": body,
-        "winner": {"round": rounds, "candidate": f"r{rounds}c1", "slug": slug},
+        "winner": {"round": rounds,
+                   "candidate": body[-1]["selected"] if body else None,
+                   "slug": slug},
     }
 
 
-def meta_for(slug, cycle=1, previous=None, **overrides):
+def meta_for(slug, cycle=1, previous=None, round1_ids=None, **overrides):
     meta = {
         "schema": EW.SUBMISSION_SCHEMA,
         "title": slug.replace("-", " ").title(),
@@ -75,7 +81,8 @@ def meta_for(slug, cycle=1, previous=None, **overrides):
         "submitted_at": "2026-08-17T22:00:00Z",
         "remix_of": None,
         "license": "CC0-1.0",
-        "_dada_cycle": dada_cycle(slug, cycle=cycle, previous=previous),
+        "_dada_cycle": dada_cycle(slug, cycle=cycle, previous=previous,
+                                  round1_ids=round1_ids),
     }
     meta.update(overrides)
     return meta
@@ -658,7 +665,9 @@ class FakeGh:
         return any(call[:len(prefix)] == prefix for call in self.calls)
 
 
-class WorkerRunTests(ScratchCase):
+class WorkerEnv(ScratchCase):
+    """A worker pointed at a temp origin repo with a scripted GitHub."""
+
     def setUp(self):
         super().setUp()
         self.origin = self.home / "origin.git"
@@ -711,6 +720,8 @@ class WorkerRunTests(ScratchCase):
         root = self.home / "state" / "evolve-workspaces"
         return sorted(p.name for p in root.iterdir()) if root.exists() else []
 
+
+class WorkerRunTests(WorkerEnv):
     # ── the verified success path ──
     def test_a_verified_merge_updates_every_ledger_exactly_once(self):
         with mock.patch.object(EW, "run_model", self.model_that_submits()):
@@ -925,8 +936,198 @@ class WorkerRunTests(ScratchCase):
         model.assert_not_called()
 
 
-# ── the tick keeps ticking ──────────────────────────────────────────────────
+def child_result(role, n=6, ok=True, wave=1, error="", critique=()):
+    """A sub-sentinel report in the shape subsentinels.run_children returns."""
+    report = None
+    if ok:
+        report = {
+            "role": role,
+            "candidates": [
+                {"id": f"c{i}", "premise": f"{role} premise {i}",
+                 "rationale": "because",
+                 "scores": {d: 5 + (i % 3) for d in SS.SCORE_DIMENSIONS}}
+                for i in range(1, n + 1)],
+            "evidence": [{"claim": "checked", "source": "prior.json"}],
+            "critique": list(critique),
+        }
+    return {"role": role, "wave": wave, "ok": ok, "error": error,
+            "timed_out": False, "exit_code": 0 if ok else 1, "elapsed_s": 2.0,
+            "report": report}
 
+
+class FanoutIntegrationTests(WorkerEnv):
+    """The fan-out inside a real cycle: bounded, binding, and never silent."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = worker_cfg(evolve_worker={
+            "repo": str(self.origin),
+            "git_author_name": "test",
+            "git_author_email": "t@example.com",
+            "fanout": {"enabled": True, "children": 3},
+        })
+
+    def maker_using_finalists(self, slug="new-piece", cycle=1, previous=None,
+                              honour=True):
+        """A maker that reads the finalists the controller wrote for it."""
+        def fake(workspace, prompt, wcfg):
+            self.prompt = prompt
+            data = json.loads((Path(workspace) / "finalists.json").read_text())
+            self.finalists = [c["id"] for c in data["finalists"]]
+            clone = Path(workspace) / "clone"
+            write_submission(clone, slug, meta_for(
+                slug, cycle=cycle, previous=previous,
+                round1_ids=self.finalists if honour else None))
+            (Path(workspace) / "state-out.json").write_text(json.dumps({
+                "cycle": cycle, "last_slug": slug, "notes": "n"}), encoding="utf-8")
+            return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
+        return fake
+
+    def patched_children(self, results):
+        return mock.patch.object(EW.SS, "run_children", return_value=results)
+
+    def test_the_finalists_bind_round_one_and_the_cycle_merges(self):
+        results = [child_result("novelty-archaeologist"),
+                   child_result("execution-designer"),
+                   child_result("adversarial-verifier", wave=2)]
+        with self.patched_children(results), \
+             mock.patch.object(EW, "run_model", self.maker_using_finalists()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        self.assertEqual(10, len(self.finalists))
+        self.assertIn("THE TEN FINALISTS", self.prompt)
+        self.assertIn("MUST be exactly these ten ids", self.prompt)
+        for cid in self.finalists:
+            self.assertIn(cid, self.prompt)
+        row = json.loads(EW.HISTORY_PATH.read_text())[0]
+        self.assertEqual(3, row["children"])
+        self.assertEqual([], row["child_failures"])
+        self.assertEqual(3, SS.children_spent([row]))
+
+    def test_a_maker_that_ignores_its_sub_sentinels_is_rejected(self):
+        results = [child_result("a"), child_result("b"),
+                   child_result("c", wave=2)]
+        with self.patched_children(results), \
+             mock.patch.object(EW, "run_model",
+                               self.maker_using_finalists(honour=False)):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+        self.assertIn("exactly the ten finalists", summary["detail"])
+        self.assertFalse(self.gh.calls, "nothing reaches GitHub")
+        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.notifications))
+
+    def test_a_partial_failure_that_still_yields_ten_continues(self):
+        results = [child_result("a"), child_result("b"),
+                   child_result("c", wave=2, ok=False, error="timed out after 600s")]
+        with self.patched_children(results), \
+             mock.patch.object(EW, "run_model", self.maker_using_finalists()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        row = json.loads(EW.HISTORY_PATH.read_text())[0]
+        self.assertEqual(["c: timed out after 600s"], row["child_failures"])
+        self.assertIn("CHILDREN THAT FAILED", self.prompt,
+                      "the maker is told what it did not get")
+
+    def test_a_failed_fanout_never_reaches_the_maker(self):
+        results = [child_result("a", ok=False, error="wrote no report.json"),
+                   child_result("b", ok=False, error="exited 1"),
+                   child_result("c", wave=2, ok=False, error="timed out")]
+        with self.patched_children(results), \
+             mock.patch.object(EW, "run_model") as maker:
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+        self.assertEqual(EW.OUTCOME_FANOUT, summary["outcome"])
+        maker.assert_not_called()
+        self.assertFalse(self.gh.calls)
+        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.notifications))
+        self.assertEqual(1, len(self.notifications))
+        self.assertIn("fanout-failed", self.notifications[0])
+        row = json.loads(EW.HISTORY_PATH.read_text())[0]
+        self.assertEqual(EW.OUTCOME_FANOUT, row["outcome"])
+        self.assertEqual(3, row["children"], "children cost credit even so")
+        self.assertEqual(3, len(row["child_failures"]))
+        self.assertFalse((self.state / "evolve-creative-state.json").exists())
+        self.assertEqual([], self.workspaces())
+
+    def test_too_few_survivors_is_a_named_failure_not_nine_finalists(self):
+        results = [child_result("a", n=5), child_result("b", n=4)]
+        with self.patched_children(results), \
+             mock.patch.object(EW, "run_model") as maker:
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_FANOUT, summary["outcome"])
+        self.assertIn("9 candidate(s) survived", summary["detail"])
+        maker.assert_not_called()
+
+    def test_an_unavailable_fanout_skips_instead_of_making_art_alone(self):
+        cfg = worker_cfg(evolve_worker={
+            "repo": str(self.origin),
+            "fanout": {"enabled": True, "children": 3, "daily_child_budget": 0},
+        })
+        with mock.patch.object(EW, "run_model") as maker, \
+             mock.patch.object(EW.SS, "run_children") as children:
+            summary = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+
+        self.assertEqual("skipped", summary["outcome"])
+        self.assertIn("child budget spent", summary["reason"])
+        maker.assert_not_called()
+        children.assert_not_called()
+        row = json.loads(EW.HISTORY_PATH.read_text())[0]
+        self.assertTrue(row["skipped"], "a skipped cycle must not spend budget")
+        self.assertEqual(0, len(EW.spend_rows(json.loads(
+            EW.HISTORY_PATH.read_text()))))
+
+    def test_a_nested_worker_run_refuses_itself(self):
+        with mock.patch.dict(os.environ, {SS.DEPTH_ENV: "1"}), \
+             mock.patch.object(EW, "run_model") as maker, \
+             mock.patch.object(EW.SS, "run_children") as children:
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("skipped", summary["outcome"])
+        self.assertIn("nested run refused", summary["reason"])
+        maker.assert_not_called()
+        children.assert_not_called()
+
+    def test_children_are_planned_but_never_spawned_by_a_child(self):
+        fcfg = SS.fanout_config(EW.worker_config(self.cfg))
+        self.assertEqual(3, len(SS.plan_children(fcfg, [], 0)[0]))
+        self.assertEqual([], SS.plan_children(fcfg, [], 1)[0])
+
+    def test_children_receive_every_prior_submission_but_no_repository(self):
+        results = [child_result("a"), child_result("b"),
+                   child_result("c", wave=2)]
+        with self.patched_children(results) as children, \
+             mock.patch.object(EW, "run_model", self.maker_using_finalists()):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+        prior = children.call_args.args[6]
+        self.assertEqual(["already-here"], [p["slug"] for p in prior])
+        self.assertIn("title", prior[0])
+        workspace = children.call_args.args[2]
+        self.assertFalse((Path(workspace) / "children" / "a" / ".git").exists(),
+                         "a child never gets a repository of its own")
+
+    def test_the_dry_run_reports_the_planned_cast(self):
+        summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy(),
+                              dry_run=True)
+        self.assertEqual("dry-run", summary["outcome"])
+        self.assertEqual(0, summary["depth"])
+        self.assertEqual(["novelty-archaeologist", "execution-designer",
+                          "adversarial-verifier"], summary["children"])
+
+    def test_a_solo_cycle_still_works_when_the_fanout_is_off(self):
+        cfg = worker_cfg(evolve_worker={
+            "repo": str(self.origin), "fanout": {"enabled": False}})
+        with mock.patch.object(EW, "run_model", self.model_that_submits()), \
+             mock.patch.object(EW.SS, "run_children") as children:
+            summary = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        children.assert_not_called()
+        self.assertNotIn("THE TEN FINALISTS", self.prompt)
+
+
+# ── the tick keeps ticking ──────────────────────────────────────────────────
 class TickDelegationTests(unittest.TestCase):
     """Requirement 1: a delegated tick spends no model on art, and still
     diagnoses a critical platform failure."""
