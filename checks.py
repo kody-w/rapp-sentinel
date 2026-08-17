@@ -1228,9 +1228,18 @@ def outsider_can_join():
             # dropped connection, and that string is the entire diagnosis the
             # repair arm is woken with. Carry the reason.
             last = f"{type(e).__name__}: {e}"
+    # Warn, not critical. Exhausting the retries means we do not KNOW whether
+    # an outsider can join -- it is not evidence that they cannot. This branch
+    # kept the default severity while the retry loop above was added, so the
+    # check was taught to doubt one sample and then paged on the doubt anyway;
+    # on 2026-08-17 a GitHub-side 503 fired it while diagnose.py read this same
+    # URL 200 in 0.4s. It is also the same table rb_content_moving already
+    # follows against this host: a failed fetch is warn, an observed bad read
+    # still pages (#45, #51, #58, #59, #60). There is no repair the repair arm
+    # can perform against GitHub's CDN.
     return fail("rb_public_surface",
                 f"an outsider cannot read platform state "
-                f"after {attempts} attempts: {last}")
+                f"after {attempts} attempts: {last}", critical=False)
 
 
 @check
