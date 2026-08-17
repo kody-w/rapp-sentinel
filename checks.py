@@ -2348,6 +2348,15 @@ def _smoke_interval_hours():
         return 72.0
 
 
+def _smoke_enabled():
+    """Whether this instance is authorized to exercise public write paths."""
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        return bool(cfg.get("smoke_enabled", True))
+    except Exception:
+        return True
+
+
 @check
 def outsider_smoke_exercised():
     """The front door stays EXERCISED, not just theoretically open (#5).
@@ -2376,6 +2385,9 @@ def outsider_smoke_exercised():
     front door nobody has ever opened is not a green), and the detail
     carries the priming command so the page is actionable.
     """
+    if not _smoke_enabled():
+        return ok("w_outsider_smoke",
+                  "disabled by config; this instance is read-only on watched platforms")
     import participate
     platforms = sorted(participate.PLATFORMS)
     try:

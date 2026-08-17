@@ -470,6 +470,23 @@ class WatcherOutboxTests(unittest.TestCase):
         self.assertFalse(outbox.SENT.exists())
 
 
+class SmokePolicyTests(unittest.TestCase):
+    def test_read_only_instance_declares_smoke_disabled(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "config.json").write_text(
+                '{"smoke_enabled": false}\n', encoding="utf-8")
+            old_home = checks.HOME
+            checks.HOME = root
+            try:
+                result = checks.outsider_smoke_exercised()
+            finally:
+                checks.HOME = old_home
+
+        self.assertTrue(result["ok"])
+        self.assertIn("read-only", result["detail"])
+
+
 class MeaningfulActivityTests(unittest.TestCase):
     def test_single_repetitive_actor_and_stale_chat_fail(self):
         stale = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
