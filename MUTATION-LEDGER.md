@@ -166,6 +166,7 @@ check keeps its history.*
 | `page_fetch` | `prove_page_fetch.py` (ships with the check, #12) | proven |
 | `cadence_honest` | `prove_cadence_honest.py` (ships with the check, #12) | proven |
 | `w_test_baseline` | `prove_test_baseline.py` (ships with the check, #13) | proven |
+| `ip_hygiene` | `prove_publication_hygiene.py` (ships with the check) | proven |
 | `w_outsider_smoke` | `prove_outsider_smoke.py` | proven |
 
 The two UNPROVEN rows are the honest debt: both ids landed in #62 with unit
