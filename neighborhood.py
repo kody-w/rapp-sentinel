@@ -56,11 +56,17 @@ Frames follow `rapp/1` exactly, via the vendored reference implementation
 """
 
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 import rapp
 from paths import HOME
+
+# A neighbor slug becomes a §7 kind segment ("<slug>.tick"), so it must be a
+# lowercase-hyphen segment: this is what a config-declared AI's name has to
+# satisfy to be seated at the bar.
+_SLUG_OK = re.compile(r"^[a-z][a-z0-9-]*[a-z0-9]$")
 
 NBHD = HOME / "neighborhood"
 NBHD.mkdir(exist_ok=True)
@@ -83,15 +89,53 @@ NEIGHBORHOOD = {
                  "kody-w/rappvision-field-notes"],
 }
 
-# §3 uniform peers — a person, a brainstem, a vTwin and Copilot are all just
-# Neighbors on the wire. These three are the watchers of this estate.
-NEIGHBORS = {
+# §3 uniform peers — a person, a brainstem, a vTwin and any model are all just
+# Neighbors on the wire. This is the "N AIs walk into a bar" pattern: whatever
+# cast of AIs you name here becomes a neighborhood of mutually-verifying peers,
+# and no one of them can quietly lie because each keeps a rapp/1 chain the
+# others re-verify from genesis. See N-AIS-WALK-INTO-A-BAR.md.
+#
+# The default cast is this estate's watch — the openrappter daemon plus four
+# AIs (scout, copilot, claude-code, brainstem). Any install can add its own
+# AIs (gpt, gemini, grok, a bespoke agent, a human) via config.json's
+# "neighbors" map WITHOUT editing this file — the roster below merges them in.
+_DEFAULT_NEIGHBORS = {
     "openrappter": "the local daemon that schedules and supervises",
     "brainstem":   "the local RAPP brainstem that answers turns",
     "copilot":     "the repair arm that actually fixes things",
     "scout":       "the explorer that goes and finds what the others need to know",
     "claude-code": "the reasoner that plans, builds, and gates the work",
 }
+
+
+def _load_roster():
+    """The default cast, plus whatever AIs config.json declares.
+
+    config.json's optional "neighbors" map is merged ON TOP of the defaults,
+    so an install can seat any set of AIs at the bar — {"gemini": "...",
+    "grok": "..."} — by editing config, never this file. Defaults are never
+    dropped: the sentinel's own chains are load-bearing, and identities()
+    backfills a rappid for every newly-declared slug on the next call. A
+    malformed config leaves the defaults exactly as they are (never fewer
+    watchers than we started with).
+    """
+    roster = dict(_DEFAULT_NEIGHBORS)
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        extra = cfg.get("neighbors") or {}
+        if isinstance(extra, dict):
+            for slug, desc in extra.items():
+                # §7 kind grammar rides on the slug (used in frame kinds like
+                # "<slug>.tick"), so only accept slugs that can form one.
+                if (isinstance(slug, str) and isinstance(desc, str)
+                        and _SLUG_OK.match(slug)):
+                    roster[slug] = desc
+    except Exception:
+        pass
+    return roster
+
+
+NEIGHBORS = _load_roster()
 
 
 def utc_now():

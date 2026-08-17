@@ -86,6 +86,35 @@ try:
     scenario("publish_head includes scout with no head violations",
              "scout" in doc["heads"] and NB.head_violations(doc) == [],
              str(NB.head_violations(doc)))
+
+    # ── the universal pattern: any AIs join by config, not by editing code ──
+    home = TMP / "home"
+    home.mkdir()
+    real_home = NB.HOME
+    NB.HOME = home
+    try:
+        (home / "config.json").write_text(json.dumps({"neighbors": {
+            "gemini": "google's model, on the wire like everyone else",
+            "grok-4": "xai's model",
+            "BadCaps": "must be rejected — not a valid §7 slug",
+            "human-molly": "a person is a peer too",
+        }}), encoding="utf-8")
+        roster = NB._load_roster()
+        scenario("config-declared AIs join the roster (gemini, grok-4, a human)",
+                 {"gemini", "grok-4", "human-molly"} <= set(roster),
+                 f"roster now has {len(roster)}: {sorted(roster)}")
+        scenario("the estate's default watch is never dropped by config",
+                 set(_DEFAULT := NB._DEFAULT_NEIGHBORS) <= set(roster),
+                 "all five defaults survive")
+        scenario("a slug that cannot form a §7 kind is refused",
+                 "BadCaps" not in roster, "invalid slug rejected")
+        # A malformed config must never leave fewer watchers than we started.
+        (home / "config.json").write_text("{ not json", encoding="utf-8")
+        scenario("a broken config falls back to the defaults, never fewer",
+                 set(NB._load_roster()) == set(NB._DEFAULT_NEIGHBORS),
+                 "defaults intact on bad config")
+    finally:
+        NB.HOME = real_home
 finally:
     NB.NBHD, NB.IDENTITY = real["NBHD"], real["IDENTITY"]
     NB.NEIGHBORS = real["NEIGHBORS"]
