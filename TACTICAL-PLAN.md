@@ -141,3 +141,59 @@ ledger, `peers-seen.json`, its own `config.json` — and it picks up new code by
 | #16 | stays open as the method record; MUTATION-LEDGER.md (T2) and CHECK-AUDIT.md (T1) give its findings a durable home |
 | #23 | T2 launchd truth + spin check; closes with T2 |
 | #38 | ledger complete in-issue; T2 publishes MUTATION-LEDGER.md, closes |
+
+## After the issues: what the estate sweep found
+
+The issue work above finished, and a question about protecting the project's
+IP turned into the larger finding of the session. Recording it here because
+the next person will otherwise re-derive it the expensive way.
+
+**A 194-repo sweep of the public estate confirmed 42 live leaks in 13
+repositories** — unfiled patent claim text described in plain English, matter
+numbers, a clickable link into a private legal directory, filing budgets and
+deadlines, 92 private-repo descriptions mirrored verbatim into a public JSON
+map, and a private individual's name, title and email. Several carried the
+words *"private, not for public spec"* while being served publicly.
+
+All 13 were remediated (135 edits, independently audited 12/13 clean and
+coherent). Two repos are **contained by being private rather than fixed**,
+and both are owner decisions:
+
+- `rapp-trademarks` — the whole repo was the public mark policy.
+- `rapp-god` — its `versions/CONSTITUTION.md/` archive holds the claim text
+  in 14 **content-addressed** snapshots whose filenames are their own hashes,
+  bound by `registry.json` and `observatory-baseline.json` and guarded by
+  oracles built to catch exactly the kind of silent edit a redaction would
+  require. The repo's own policy reads
+  `existing_public_history: unresolved-owner-remediation-no-rewrite`. The
+  real fix is a native-frame redaction mechanism mirroring the one that
+  already exists for imported files, or republishing under new hashes.
+
+**Three lessons worth keeping:**
+
+1. `gh search code` is not authoritative for "is this public" — it missed a
+   public repo while returning private ones. Verify per repo with the
+   contents API or a fresh clone, and never with `raw.githubusercontent`,
+   which caches for about five minutes and will show you stale bytes.
+2. Deleting a file does not unpublish it. Git history stays public; only
+   making the repo private, or purging history, actually removes it.
+3. The denylist is the disclosure. A committed list of the strings you are
+   suppressing is a better search index than the content it suppresses —
+   which is why `ipscan.py`'s rules are injected and never shipped, and why
+   the mirror's gate refuses to publish its own rules file.
+
+**Now guarded, not just cleaned:** `ipscan.py` + the `ip_hygiene` check
+(PRs #89–#92). Latest full run: 418 public repos, zero findings.
+
+## rapp-monorepo
+
+Built the same night, on the same discipline: one public repo that captures
+every public RAPP repo at HEAD in a single pass, so a reader gets the whole
+estate with no drift between its pieces. 192 repos, ~666MB, daily refresh,
+verified from a clean clone and with its workflow observed running green.
+
+Its gate **withholds whole files rather than redacting them** — a rewritten
+file would quietly break the mirror's one promise, that what you have is what
+upstream has — and it fails closed when unconfigured, because a gate that
+screens nothing while reporting success launders content through a step that
+looks like diligence.
