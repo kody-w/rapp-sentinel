@@ -138,6 +138,33 @@ try:
              not ipscan._allowed(A, "other", "docs/deck.html", "A Person"),
              "still caught")
 
+    # ── a big repo gets a second, longer chance ─────────────────────────────
+    # The first estate run wrote off the two LARGEST repos at the short
+    # timeout. Honest ("unscanned"), but it left the biggest surfaces
+    # unchecked, which is the wrong place to have a gap.
+    attempts = []
+
+    def slow_then_ok(cmd, **kw):
+        if cmd[:2] == ["git", "clone"]:
+            attempts.append(kw.get("timeout"))
+            if len(attempts) == 1:
+                raise subprocess.TimeoutExpired(cmd=cmd, timeout=kw.get("timeout"))
+            Path(cmd[-1]).mkdir(parents=True, exist_ok=True)
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return real_run(cmd, **kw)
+
+    work2 = TMP / "work2"
+    work2.mkdir(exist_ok=True)
+    real_run = subprocess.run
+    subprocess.run = slow_then_ok
+    try:
+        hits, err = ipscan.scan_repo("o", "huge", [], [], work2, slow=900)
+    finally:
+        subprocess.run = real_run
+    scenario("a clone that times out is retried once with a longer budget",
+             err == "" and attempts == [ipscan.MAX_CLONE_SECONDS, 900],
+             f"attempts={attempts} err={err!r}")
+
     # ── a failed clone must not leave its bytes behind ──────────────────────
     # Found on the first full estate run: a clone killed at the timeout left
     # 195MB of partial checkout in the work dir, and every later failure

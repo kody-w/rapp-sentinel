@@ -46,9 +46,13 @@ DENYLIST = HOME / "sensitive" / "publication-denylist.json"
 RECEIPT = HOME / "state" / "ipscan.json"
 DEFAULT_OWNER = "kody-w"
 
-# A repo whose whole working tree is bigger than this is cloned tree-only and
-# reported as partially scanned rather than silently skipped.
-MAX_CLONE_SECONDS = 120
+# First attempt is short so 400 small repos stay fast. A repo that times out
+# gets ONE retry with a much longer budget rather than being written off: the
+# estate's two largest repos (multi-GB) both failed at 120s and landed in
+# `unscanned`, which is honest but leaves exactly the biggest surfaces
+# unchecked. A separate aggregation proved 600s is enough for them.
+MAX_CLONE_SECONDS = int(os.environ.get("IPSCAN_CLONE_TIMEOUT", "120"))
+SLOW_CLONE_SECONDS = int(os.environ.get("IPSCAN_SLOW_TIMEOUT", "900"))
 
 
 def utc_now():
@@ -114,14 +118,25 @@ def _allowed(allow, repo, path, pattern):
     return False
 
 
-def scan_repo(owner, repo, patterns, allow, workdir):
+def _clone(owner, repo, dest, budget):
+    return subprocess.run(
+        ["git", "clone", "-q", "--depth", "1", "--single-branch",
+         f"https://github.com/{owner}/{repo}.git", str(dest)],
+        capture_output=True, text=True, timeout=budget)
+
+
+def scan_repo(owner, repo, patterns, allow, workdir, slow=SLOW_CLONE_SECONDS):
     """(hits, error). hits = [{file, count}] — never the matched text."""
     dest = workdir / repo
     try:
-        r = subprocess.run(
-            ["git", "clone", "-q", "--depth", "1", "--single-branch",
-             f"https://github.com/{owner}/{repo}.git", str(dest)],
-            capture_output=True, text=True, timeout=MAX_CLONE_SECONDS)
+        try:
+            r = _clone(owner, repo, dest, MAX_CLONE_SECONDS)
+        except subprocess.TimeoutExpired:
+            # Big repo, not a broken one. Give it the long budget once — the
+            # largest repos are exactly the ones worth not skipping.
+            shutil.rmtree(dest, ignore_errors=True)
+            print(f"      {repo}: slow, retrying with {slow}s", flush=True)
+            r = _clone(owner, repo, dest, slow)
         if r.returncode != 0:
             shutil.rmtree(dest, ignore_errors=True)
             return [], f"clone failed: {(r.stderr or '').strip()[:80]}"
@@ -133,7 +148,7 @@ def scan_repo(owner, repo, patterns, allow, workdir):
         # the scan. The failure paths have to clean up after themselves or a
         # long scan becomes a disk-filler.
         shutil.rmtree(dest, ignore_errors=True)
-        return [], f"clone exceeded {MAX_CLONE_SECONDS}s"
+        return [], f"clone exceeded {slow}s even on the slow retry"
     except Exception as e:
         shutil.rmtree(dest, ignore_errors=True)
         return [], f"{type(e).__name__}: {e}"
