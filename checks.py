@@ -1297,24 +1297,28 @@ def rb_rollup_covers_corpus():
                  critical=False))
 
 
-_SHARD_PATH = "state/cache_shards/shard_20750.json"
+_SHARD_INDEX_PATH = "state/cache_shards/index.json"
 
 
-def _shard_last_regenerated():
-    """ISO date of the commit that last touched the probe shard.
+def _newest_shard(index):
+    """The ACTIVE shard — highest range_start in the generator's own manifest.
 
-    The shard's own bytes carry no timestamp (`_meta` is range_start /
-    range_end / count only — verified 2026-08-16), so freshness has to come
-    from the commit history of the path. Raises when that history cannot be
-    read, so moving() reports blind-not-broken instead of guessing (#45).
+    Shards are range-partitioned (250 discussion ids each). A shard goes
+    permanently immutable the moment ids roll past its range_end, so only the
+    newest one is still a write target. Raises rather than guessing when the
+    manifest cannot be read as a shards map (#45).
     """
-    rows = gh(["api", f"repos/{RB}/commits?path={_SHARD_PATH}&per_page=1",
-               "--jq", '[.[].commit.committer.date]'], default=None)
-    if rows is None:
-        raise RuntimeError("commit history for the shard path unreadable")
-    if not rows:
-        return None      # path never committed — no stamp to stand on
-    return rows[0]
+    shards = index.get("shards") if isinstance(index, dict) else None
+    if not isinstance(shards, dict) or not shards:
+        raise RuntimeError("shard index carries no shards map")
+    numeric = [k for k in shards if str(k).lstrip("-").isdigit()]
+    if not numeric:
+        raise RuntimeError("shard index has no numeric ranges")
+    key = max(numeric, key=int)
+    row = shards[key]
+    if not isinstance(row, dict):
+        raise RuntimeError(f"shard entry {key} is not an object")
+    return key, row
 
 
 @check
@@ -1323,37 +1327,79 @@ def derived_data_regenerating():
     404'd on this exact file for weeks.
 
     A bare 200-check was the full #11 triple in one line: reachable is not
-    parseable is not current. The bytes are now required to parse and to
+    parseable is not current. The bytes are still required to parse and to
     claim a positive discussion count, and freshness is judged against the
-    shard's MEASURED regeneration cadence: commits touching this path landed
-    every ~2-5h across 2026-08-15/16 (worst observed gap 4.9h), so 15h is
-    three times the worst gap — the same headroom reasoning as
-    rb_content_moving's 12h bar. If the generator is ever redesigned to
-    write shards immutably, this bar becomes a permanent false red and must
-    be replaced with a newest-shard-exists assertion, not silenced.
+    generator's MEASURED cadence: it commits every ~2-5h (worst observed gap
+    4.9h across 2026-08-15/16), so 15h is three times the worst gap — the same
+    headroom reasoning as rb_content_moving's 12h bar.
+
+    This probe used to be pinned to shard_20750.json and took freshness from
+    that one path's commit history. Shards are range-partitioned (250 ids
+    each), so a shard goes PERMANENTLY immutable once discussion ids roll past
+    its range_end — which happened at 2026-08-17T05:22Z when ids crossed
+    21000. The generator never faltered: it kept writing and committing
+    shard_21000.json every run. But the pinned path could not move again, so
+    the check went critical-red at 16.1h and would have stayed red forever.
+    That is exactly the "permanent false red" this docstring already warned
+    about, arriving by range rollover rather than by a redesign, and the
+    remedy it prescribed was a newest-shard-exists assertion rather than a
+    silenced bar — which is what this now is.
+
+    Freshness comes from index.json's `_meta.generated_at`, a stamp the
+    generator writes INTO the bytes every run, so the verdict no longer
+    depends on which shard happened to change, nor on commit history at all.
+    The newest shard named by that index is then fetched, because an index
+    naming a shard is not the site serving it — a 404 there is the original
+    outage and stays critical.
     """
     import json as _j
     import urllib.request
-    url = f"https://raw.githubusercontent.com/{RB}/main/{_SHARD_PATH}"
-    try:
+    import urllib.error
+    base = f"https://raw.githubusercontent.com/{RB}/main/state/cache_shards"
+
+    def _get(url):
         req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
         with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            body = r.read().decode("utf-8")
+            return r.read().decode("utf-8")
+
+    try:
+        body = _get(f"https://raw.githubusercontent.com/{RB}/main/{_SHARD_INDEX_PATH}")
     except Exception as e:
         # Blind, not broken: one dropped connection must not read as a jammed
         # write path (#45/#51).
         return fail("rb_shards",
-                    f"cannot read shard ({type(e).__name__}: {str(e)[:60]})",
+                    f"cannot read shard index ({type(e).__name__}: {str(e)[:60]})",
                     critical=False)
     try:
         doc = _j.loads(body)
     except Exception as e:
-        return fail("rb_shards", f"shard unparseable ({str(e)[:60]})")
-    count = (doc.get("_meta") or {}).get("count")
+        return fail("rb_shards", f"shard index unparseable ({str(e)[:60]})")
+    try:
+        key, row = _newest_shard(doc)
+    except Exception as e:
+        return fail("rb_shards", f"shard index unusable ({str(e)[:70]})")
+
+    name = row.get("file") or f"shard_{int(key):05d}.json"
+    try:
+        sbody = _get(f"{base}/{name}")
+    except urllib.error.HTTPError as e:
+        # The index names a shard the site does not serve — the outage.
+        return fail("rb_shards", f"newest shard {name} not served (HTTP {e.code})")
+    except Exception as e:
+        return fail("rb_shards",
+                    f"cannot read newest shard {name} "
+                    f"({type(e).__name__}: {str(e)[:50]})", critical=False)
+    try:
+        sdoc = _j.loads(sbody)
+    except Exception as e:
+        return fail("rb_shards", f"newest shard {name} unparseable ({str(e)[:50]})")
+    count = (sdoc.get("_meta") or {}).get("count")
     if not isinstance(count, int) or count <= 0:
-        return fail("rb_shards", "shard reports no discussions")
-    return moving("rb_shards", _shard_last_regenerated, 15,
-                  what=f"cache shard ({count} discussions)")
+        return fail("rb_shards", f"newest shard {name} reports no discussions")
+
+    return moving("rb_shards",
+                  lambda: (doc.get("_meta") or {}).get("generated_at"), 15,
+                  what=f"cache shards (newest {name}, {count} discussions)")
 
 
 # ── issue #6: guardrails built for weaker models expire ─────────────────────
