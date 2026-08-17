@@ -187,6 +187,14 @@ def scan(owner=DEFAULT_OWNER):
             if hits:
                 findings.append({"repo": repo, "files": hits})
                 print(f"  [{i}/{len(repos)}] {repo}: {len(hits)} file(s) MATCH")
+            elif i % 25 == 0 or i == len(repos):
+                # A clean repo is silent, so a long clean scan printed nothing
+                # at all for twenty-five minutes and looked wedged - which is
+                # how a useful scan gets killed by the operator watching it.
+                # A heartbeat every 25 repos costs nothing and says it is alive.
+                print(f"  [{i}/{len(repos)}] scanning… "
+                      f"{len(findings)} match(es), {len(unscanned)} unscanned",
+                      flush=True)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
