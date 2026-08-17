@@ -89,6 +89,8 @@ NEIGHBORS = {
     "openrappter": "the local daemon that schedules and supervises",
     "brainstem":   "the local RAPP brainstem that answers turns",
     "copilot":     "the repair arm that actually fixes things",
+    "scout":       "the explorer that goes and finds what the others need to know",
+    "claude-code": "the reasoner that plans, builds, and gates the work",
 }
 
 
@@ -99,11 +101,27 @@ def utc_now():
 
 
 def identities():
-    """Mint-once rappids (§6.2). Never a name-hash — minted from uuid4."""
+    """Mint-once rappids (§6.2). Never a name-hash — minted from uuid4.
+
+    Backfills. A live install's neighbors.json was written when NEIGHBORS had
+    three entries; declaring a fourth or fifth neighbor must MINT it and add
+    it, not be ignored because the file already exists. Without this, adding
+    a neighbor is a latent KeyError the moment emit()/publish_head() reach for
+    its rappid — the exact 'a new member joins by being declared' promise,
+    broken by a cache. Existing rappids are never re-minted: an identity is
+    mint-once, and a backfill only ever grows the map.
+    """
+    ids = {}
     if IDENTITY.exists():
-        return json.loads(IDENTITY.read_text(encoding="utf-8"))
-    ids = {slug: rapp.mint_rappid(OWNER, f"watcher-{slug}") for slug in NEIGHBORS}
-    IDENTITY.write_text(json.dumps(ids, indent=2) + "\n", encoding="utf-8")
+        try:
+            ids = json.loads(IDENTITY.read_text(encoding="utf-8"))
+        except Exception:
+            ids = {}
+    missing = [slug for slug in NEIGHBORS if slug not in ids]
+    if missing:
+        for slug in missing:
+            ids[slug] = rapp.mint_rappid(OWNER, f"watcher-{slug}")
+        IDENTITY.write_text(json.dumps(ids, indent=2) + "\n", encoding="utf-8")
     return ids
 
 
