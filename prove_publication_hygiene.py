@@ -124,6 +124,47 @@ try:
     scenario("the check surfaces that refusal instead of reading green",
              (not r["ok"]) and "unusable" in r["detail"], r["detail"][:100])
 
+    # ── a reviewed exception must be narrow ─────────────────────────────────
+    # The first allowlist exempted a whole FILE, so reviewing one string in a
+    # marketing page would also have blinded the scanner to a matter number
+    # landing in that same page tomorrow. Exceptions pin the pattern.
+    A = [{"repo": "rb", "pattern": "A Person"}]
+    scenario("a pattern-scoped exception applies to its own pattern",
+             ipscan._allowed(A, "rb", "docs/deck.html", "A Person"), "allowed")
+    scenario("...and does NOT blind the file to every other pattern",
+             not ipscan._allowed(A, "rb", "docs/deck.html", "SOME-MATTER-NO"),
+             "still caught")
+    scenario("...nor apply to a different repo",
+             not ipscan._allowed(A, "other", "docs/deck.html", "A Person"),
+             "still caught")
+
+    # ── a failed clone must not leave its bytes behind ──────────────────────
+    # Found on the first full estate run: a clone killed at the timeout left
+    # 195MB of partial checkout in the work dir, and every later failure
+    # would have stacked on it. A scan that fills the disk is a scan that
+    # stops running.
+    work = TMP / "work"
+    work.mkdir(exist_ok=True)
+    real_run = subprocess.run
+
+    def fake_clone(cmd, **kw):
+        if cmd[:2] == ["git", "clone"]:
+            dest = Path(cmd[-1])
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "partial.bin").write_text("x" * 4096, encoding="utf-8")
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=1)
+        return real_run(cmd, **kw)
+
+    subprocess.run = fake_clone
+    try:
+        hits, err = ipscan.scan_repo("o", "big-repo", ["PAT"], [], work)
+    finally:
+        subprocess.run = real_run
+    scenario("a clone killed at the timeout leaves nothing behind",
+             hits == [] and "exceeded" in err
+             and not (work / "big-repo").exists(),
+             f"err={err!r} leftover={(work / 'big-repo').exists()}")
+
     # ── and the real repo must not be shipping a denylist today ─────────────
     tracked = subprocess.run(
         ["git", "ls-files", "sensitive/"], capture_output=True, text=True,
