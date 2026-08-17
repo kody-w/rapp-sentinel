@@ -8,6 +8,7 @@
     "channel",
     "eco_sweep",
     "gh_status",
+    "ip_hygiene",
     "page_fetch",
     "rails_fresh",
     "rb_content_moving",
@@ -158,6 +159,10 @@
     "w_outsider_smoke": {
       "domain": "watchers",
       "kind": "watcher"
+    },
+    "ip_hygiene": {
+      "domain": "self",
+      "kind": "consistency"
     }
   },
   "_unpaired_accepted_why": "An accepted pairing gap is a DECISION with a diff, not a silence. A permanently-red pairing check would hold the verdict at degraded forever, which silently disables the level-3 evolve arm (sentinel only evolves while healthy) and trains readers to scroll past the channel. Each entry names the domain and why its gap is accepted; deleting an entry re-arms the check for that domain.",

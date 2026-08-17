@@ -9,3 +9,6 @@ __pycache__/
 *.pyc
 public/sentinel-head.json
 .claude/
+
+# local-only: the strings you are hiding must never ship
+sensitive/

@@ -1745,6 +1745,77 @@ def test_baseline_honest():
 
 
 @check
+def publication_hygiene():
+    """Did anything you meant to keep private end up in a public repo?
+
+    Every individual commit looks reasonable, which is why this class of
+    mistake is never caught by review: an internal matter number in a
+    changelog, a path into a private repo in a test fixture, a person's name
+    in a config file. Nothing in the estate noticed any of it until someone
+    went looking on purpose, and by then it had been served publicly for
+    months.
+
+    ipscan.py does the expensive part on a schedule (clone every public repo,
+    grep a LOCAL-ONLY denylist); this reads the receipt every tick. The
+    denylist never ships and ipscan refuses to run against one that git
+    tracks — a committed list of the strings you are hiding is a better
+    disclosure than the leak it prevents. The receipt records file paths and
+    counts, never the matched text, so this check can name where to look
+    without republishing what it found.
+
+    Unconfigured is not a failure: an install with no denylist says so in its
+    passing detail rather than holding the verdict at degraded forever (the
+    same opt-in shape as w_test_baseline, and for the same reason — a
+    permanent warn silently disables the evolve arm).
+    """
+    import ipscan
+    try:
+        doc = json.loads(ipscan.RECEIPT.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        patterns, _, err = ipscan.load_denylist()
+        if err:
+            return fail("ip_hygiene", f"denylist unusable: {err[:120]}",
+                        critical=False)
+        if not patterns:
+            return ok("ip_hygiene", "no publication denylist configured")
+        return fail("ip_hygiene",
+                    "denylist configured but never scanned - run "
+                    "`python3 ipscan.py scan`", critical=False)
+    except Exception as e:
+        return fail("ip_hygiene",
+                    f"scan receipt unreadable: {type(e).__name__}", critical=False)
+
+    if not doc.get("configured"):
+        return ok("ip_hygiene", "no publication denylist configured")
+    age_h = hours_since(doc.get("utc"))
+    findings = doc.get("findings") or []
+    unscanned = doc.get("unscanned") or []
+    if findings:
+        # Critical: this is the one finding whose cost grows every hour it
+        # stays up, and unlike an upstream outage there is always an action.
+        where = "; ".join(
+            f"{f['repo']}: " + ", ".join(x["file"] for x in f["files"][:3])
+            for f in findings[:4])
+        return fail("ip_hygiene",
+                    f"denylisted content live in {len(findings)} public "
+                    f"repo(s) - {where}")
+    if age_h is None:
+        return fail("ip_hygiene", "scan receipt is undated", critical=False)
+    if age_h >= 24 * 8:
+        return fail("ip_hygiene",
+                    f"last scan {age_h / 24:.1f}d ago - the estate has moved "
+                    f"since", critical=False)
+    note = (f"{doc.get('scanned', 0)} public repos clean "
+            f"({doc.get('pattern_count', 0)} patterns, {age_h / 24:.1f}d ago)")
+    if unscanned:
+        # Coverage gaps are stated, never rounded away (R3).
+        return fail("ip_hygiene",
+                    note + f"; {len(unscanned)} UNSCANNED: "
+                    + ", ".join(u["repo"] for u in unscanned[:5]), critical=False)
+    return ok("ip_hygiene", note)
+
+
+@check
 def github_status_operational():
     """Distinguish OUR outage from GitHub's.
 
