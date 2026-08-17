@@ -93,10 +93,24 @@ def public_repos(owner):
                   if x["visibility"] == "PUBLIC" and not x["isArchived"])
 
 
-def _allowed(allow, repo, path):
+def _allowed(allow, repo, path, pattern):
+    """Is this (repo, path, pattern) a reviewed exception?
+
+    An entry may pin `repo`, `path` and `pattern` (each optional, "*" or
+    absent means any). Pinning the PATTERN is the point: an exception that
+    exempts a whole file from every pattern is how a reviewed decision about
+    one string quietly becomes a blind spot for the next one. Reviewing "the
+    CEO is named on the company's own marketing page" must not also stop the
+    scanner noticing a matter number in that same file tomorrow.
+    """
     for a in allow:
-        if a.get("repo") in (repo, "*") and (a.get("path") in (None, path)):
-            return True
+        if a.get("repo") not in (repo, "*", None):
+            continue
+        if a.get("path") not in (path, "*", None):
+            continue
+        if a.get("pattern") not in (pattern, "*", None):
+            continue
+        return True
     return False
 
 
@@ -109,10 +123,19 @@ def scan_repo(owner, repo, patterns, allow, workdir):
              f"https://github.com/{owner}/{repo}.git", str(dest)],
             capture_output=True, text=True, timeout=MAX_CLONE_SECONDS)
         if r.returncode != 0:
+            shutil.rmtree(dest, ignore_errors=True)
             return [], f"clone failed: {(r.stderr or '').strip()[:80]}"
     except subprocess.TimeoutExpired:
+        # A clone killed at the timeout leaves whatever it had already
+        # fetched on disk. Measured on the first full estate run: one
+        # timed-out clone of a large repo left 195MB behind, and every
+        # subsequent failure would have stacked on top of it for the rest of
+        # the scan. The failure paths have to clean up after themselves or a
+        # long scan becomes a disk-filler.
+        shutil.rmtree(dest, ignore_errors=True)
         return [], f"clone exceeded {MAX_CLONE_SECONDS}s"
     except Exception as e:
+        shutil.rmtree(dest, ignore_errors=True)
         return [], f"{type(e).__name__}: {e}"
 
     hits = {}
@@ -123,7 +146,7 @@ def scan_repo(owner, repo, patterns, allow, workdir):
                 capture_output=True, text=True, timeout=180)
             for line in (g.stdout or "").splitlines():
                 rel = str(Path(line).relative_to(dest))
-                if _allowed(allow, repo, rel):
+                if _allowed(allow, repo, rel, pat):
                     continue
                 hits[rel] = hits.get(rel, 0) + 1
     except Exception as e:
