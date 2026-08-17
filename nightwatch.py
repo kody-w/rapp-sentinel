@@ -69,6 +69,7 @@ def send(text, to):
 
 def build(since):
     """Everything that happened after `since`, as a short shift update."""
+    name = str(cfg().get("instance_name") or "Neighborhood Watch").strip()
     events = []
     for slug in NB.NEIGHBORS:
         for f in NB.read_chain(slug):
@@ -98,7 +99,7 @@ def build(since):
         pass
 
     now = datetime.now().astimezone()
-    lines = [f"Neighborhood Watch — {now:%-I:%M %p}"]
+    lines = [f"{name} — {now:%-I:%M %p}"]
 
     if not events:
         lines.append("")

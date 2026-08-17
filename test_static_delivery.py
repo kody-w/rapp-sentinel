@@ -1,4 +1,5 @@
 import http.client
+import io
 import json
 import os
 import plistlib
@@ -10,6 +11,7 @@ import tempfile
 import threading
 import unittest
 import zipfile
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -25,6 +27,7 @@ import retro
 import sentinel
 import serve
 import standup
+import watcher_outbox
 
 
 class PortableReportTests(unittest.TestCase):
@@ -406,6 +409,65 @@ class OutboxAttachmentTests(unittest.TestCase):
         self.assertEqual((1, 1, ""), (sent, kept, why))
         pending = outbox._pending()
         self.assertEqual(["late"], [m["text"] for m in pending])
+
+
+class WatcherOutboxTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.old = (
+            outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
+            outbox.LOCK, outbox.DRAIN_LOCK, watcher_outbox.CLAIMS)
+        outbox.QUEUE = root / "outbox.jsonl"
+        outbox.SENT = root / "sent.jsonl"
+        outbox.LAST_DRAIN = root / "last.json"
+        outbox.REPORTS = root / "reports"
+        outbox.LOCK = root / "outbox.lock"
+        outbox.DRAIN_LOCK = root / "outbox-drain.lock"
+        watcher_outbox.CLAIMS = root / "watcher-claims"
+        outbox.REPORTS.mkdir()
+
+    def tearDown(self):
+        (outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
+         outbox.LOCK, outbox.DRAIN_LOCK, watcher_outbox.CLAIMS) = self.old
+        self.temp.cleanup()
+
+    def _claim(self):
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(0, watcher_outbox.claim())
+        return Path(output.getvalue().strip())
+
+    def test_acknowledge_removes_only_the_claimed_head(self):
+        outbox.enqueue("first", "recipient")
+        claim = self._claim()
+        outbox.enqueue("second", "recipient")
+
+        watcher_outbox.acknowledge(claim, "sent by authorized watcher")
+
+        self.assertEqual(["second"], [row["text"] for row in outbox._pending()])
+        sent = [json.loads(line) for line in outbox.SENT.read_text().splitlines()]
+        self.assertEqual(["first"], [row["text"] for row in sent])
+        self.assertEqual("sent by authorized watcher",
+                         outbox.last_drain()["why"])
+
+    def test_changed_head_is_never_acknowledged(self):
+        outbox.enqueue("first", "recipient")
+        claim = self._claim()
+        with outbox._locked(outbox.LOCK):
+            outbox._rewrite_queue_unlocked([
+                json.dumps({
+                    "at": outbox.now(), "to": "recipient",
+                    "text": "replacement", "attachments": [],
+                }),
+            ])
+
+        with self.assertRaises(RuntimeError):
+            watcher_outbox.acknowledge(claim)
+
+        self.assertEqual(["replacement"],
+                         [row["text"] for row in outbox._pending()])
+        self.assertFalse(outbox.SENT.exists())
 
 
 class MeaningfulActivityTests(unittest.TestCase):

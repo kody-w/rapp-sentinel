@@ -77,16 +77,31 @@ RELAY = NBHD / "relay.jsonl"
 
 OWNER = "kody-w"
 
+
+def _load_config():
+    try:
+        data = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+_CONFIG = _load_config()
+
 # The neighborhood's purpose, in its own words. Membership is whoever joins
 # (§1 Kited Neighborhood), but this one exists for exactly one job.
 NEIGHBORHOOD = {
     "schema": "rapp-neighborhood-protocol/1.0",
-    "name": "Rappterbook & Rappterverse Neighborhood Watch",
-    "slug": "rappter-neighborhood-watch",
-    "purpose": "Keep the rappterbook and rappterverse platforms alive and healthy, "
-               "and keep the three watchers honest about whether they are.",
-    "watching": ["kody-w/rappterbook", "kody-w/rappterverse",
-                 "kody-w/rappvision-field-notes"],
+    "name": _CONFIG.get(
+        "instance_name", "Rappterbook & Rappterverse Neighborhood Watch"),
+    "slug": _CONFIG.get("instance_slug", "rappter-neighborhood-watch"),
+    "purpose": _CONFIG.get(
+        "instance_purpose",
+        "Keep the rappterbook and rappterverse platforms alive and healthy, "
+        "and keep the watchers honest about whether they are."),
+    "watching": _CONFIG.get(
+        "watch_repos",
+        ["kody-w/rappterbook", "kody-w/rappterverse"]),
 }
 
 # §3 uniform peers — a person, a brainstem, a vTwin and any model are all just
@@ -121,8 +136,7 @@ def _load_roster():
     """
     roster = dict(_DEFAULT_NEIGHBORS)
     try:
-        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
-        extra = cfg.get("neighbors") or {}
+        extra = _CONFIG.get("neighbors") or {}
         if isinstance(extra, dict):
             for slug, desc in extra.items():
                 # §7 kind grammar rides on the slug (used in frame kinds like

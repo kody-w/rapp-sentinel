@@ -47,6 +47,11 @@ def _cfg():
         return {}
 
 
+def instance_name():
+    return str(_cfg().get("instance_name") or
+               "Rappterbook & Rappterverse Neighborhood Watch").strip()
+
+
 # Which repos to surface commits from, and (optionally) a commons to show
 # contributions from. Both live in config.json so this file stays generic.
 REPOS = _cfg().get("watch_repos", [])
@@ -286,13 +291,14 @@ def render(hours=14):
         if (HOME / "state" / "last_verdict.json").exists() else {"status": "unknown", "summary": ""}
 
     now = datetime.now().astimezone()
+    name = instance_name()
     p = [f'<!doctype html><html lang="en"><head><meta charset="utf-8">',
          '<meta name="viewport" content="width=device-width,initial-scale=1">',
          '<meta http-equiv="refresh" content="300">',
-         '<title>Overnight Shift Report — Neighborhood Watch</title>',
+         f'<title>Overnight Shift Report — {esc(name)}</title>',
          f'<style>{CSS}</style></head><body><div class="wrap">']
 
-    p.append('<div class="mono">Rappterbook &amp; Rappterverse Neighborhood Watch</div>')
+    p.append(f'<div class="mono">{esc(name)}</div>')
     p.append('<h1>Overnight shift report</h1>')
     p.append(f'<p class="sub">Last {hours} hours &middot; generated '
              f'{now:%a %d %b %Y, %H:%M %Z}. Every claim below links to something you can check.</p>')

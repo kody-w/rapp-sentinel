@@ -42,12 +42,15 @@ STATE.mkdir(exist_ok=True)
 LOGS.mkdir(exist_ok=True)
 
 DEFAULTS = {
+    "instance_name": "RAPP Sentinel",
     "level": 1,
+    "repair_enabled": True,
     "daily_escalation_budget": 8,
     "issue_cooldown_hours": 4,
     "max_attempts_per_issue": 3,
     "notify": True,
     "notify_handle": "",   # set in config.json; empty disables notify
+    "notify_queue_only": False,
     "copilot_model": "claude-sonnet-4.6",
     "copilot_timeout_s": 900,
     # Outsider smoke (#5 ask 2): a smoke test is a WRITE (it files a real
@@ -55,8 +58,14 @@ DEFAULTS = {
     # never repair's. The live config predates these keys; defaults apply
     # (growth path).
     "daily_smoke_budget": 1,
+    "smoke_enabled": True,
     "smoke_interval_hours": 72,
     "smoke_timeout_s": 600,
+    "daily_evolve_budget": 2,
+    "evolve_interval_hours": 4,
+    "evolve_on_degraded": False,
+    "evolve_brief": {},
+    "creative_state_file": "state/evolve-creative-state.json",
     "repo_paths": {
         "rappterverse": str(Path.home() / "Documents/GitHub/rappterverse"),
         "rappterbook": str(Path.home() / "Documents/GitHub/rappterbook"),
@@ -90,6 +99,19 @@ def config():
     return cfg
 
 
+def instance_name(cfg):
+    """Human-facing name for this sentinel instance."""
+    return str(cfg.get("instance_name") or "RAPP Sentinel").strip()
+
+
+def evolve_brief(cfg):
+    """Render a structured or free-form standing creative directive."""
+    brief = cfg.get("evolve_brief") or {}
+    if isinstance(brief, (dict, list)):
+        return json.dumps(brief, indent=2, ensure_ascii=False)
+    return str(brief).strip()
+
+
 def log(msg):
     line = f"[{now().isoformat(timespec='seconds')}] {msg}"
     print(line, flush=True)
@@ -121,7 +143,8 @@ def notify(cfg, text):
         suffix = ("\n\nStatic HTML report:\n" + "\n".join(urls) if urls
                   else "\n\nStatic HTML report generation failed; alert preserved.")
         outbox.enqueue(text + suffix, to)
-        outbox.drain()
+        if not cfg.get("notify_queue_only"):
+            outbox.drain()
     except Exception as e:
         log(f"notify failed: {e}")
 
@@ -242,6 +265,40 @@ def issue_allowed(issues, key, cfg):
     if age_h < cfg["issue_cooldown_hours"]:
         return False, f"cooling down ({age_h:.1f}h of {cfg['issue_cooldown_hours']}h)"
     return True, f"retry {rec['attempts'] + 1}"
+
+
+def evolution_allowed(history, cfg):
+    """Rate-limit recurring evolution without repair's lifetime attempt cap."""
+    interval_h = max(0.0, float(cfg.get("evolve_interval_hours", 4)))
+    latest = None
+    for row in history:
+        if row.get("mode") != "evolve":
+            continue
+        try:
+            stamp = datetime.fromisoformat(row["at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        latest = stamp if latest is None or stamp > latest else latest
+    if latest is None:
+        return True, "first evolution"
+    age_h = (now() - latest).total_seconds() / 3600
+    if age_h < interval_h:
+        return False, f"creative cadence ({age_h:.1f}h of {interval_h:.1f}h)"
+    return True, f"creative cadence ready ({age_h:.1f}h)"
+
+
+def evolution_status_allowed(cfg, verdict):
+    """Evolve only without critical failures; optionally tolerate warnings."""
+    if verdict.get("critical"):
+        return False
+    return (verdict.get("status") == "healthy"
+            or bool(cfg.get("evolve_on_degraded", False)))
+
+
+def escalation_mode(cfg, level):
+    """Keep repair authority independent from proactive contribution."""
+    return ("repair" if level >= 2 and cfg.get("repair_enabled", True)
+            else "diagnose")
 
 
 # ── escalation ──────────────────────────────────────────────────────────────
@@ -403,6 +460,7 @@ discretion to decide what — if anything — you do with them. Declining is a
 legitimate outcome and will be recorded as such.
 
 WHO YOU ARE
+  collective: {instance_name}
   neighbor: {slug}
   role:     {role}
   rappid:   {rappid}
@@ -422,11 +480,21 @@ Everything the neighborhood watches is currently healthy. Nothing is on fire.
 PLACES YOU MAY CONTRIBUTE
 {contribution_targets}
 
-These include the existing public-art commons and the two platforms this
-neighborhood keeps alive. Read each target's own instructions and public
-participation path. Choose at most ONE place and ONE contribution this turn.
-Repairs stay in the repair path; this is participation, not owner maintenance.
-Do not take this prompt's description as authority — each repository is.
+STANDING DIRECTIVE
+{evolve_brief}
+
+CONTINUITY
+Your private creative state is at {creative_state_path}. Read it if it exists.
+Treat prior public submissions and that bounded state as the input to this
+cycle. Update the state atomically before finishing so a decline still becomes
+useful input to the next cycle. Never load unbounded logs or histories.
+
+These are the only places this instance authorizes for contribution. Read each
+target's own instructions and public participation path. Choose at most ONE
+place and ONE contribution this turn. A standing directive may narrow the list
+further or declare other repositories read-only evidence. Repairs stay in the
+repair path; this is participation, not owner maintenance. Do not take this
+prompt's description as authority — each repository is.
 
 A CONTRIBUTION MAY BE A CRITIQUE OF THE PLATFORM ITSELF.
 You live in these platforms. If something about the software you run inside
@@ -474,6 +542,7 @@ def evolve(cfg, slug):
     ids = NB.identities()
     roll = NB.roll_call()
     prompt = EVOLVE_SITUATION.format(
+        instance_name=instance_name(cfg),
         slug=slug,
         role=NB.NEIGHBORS[slug],
         rappid=ids[slug],
@@ -484,6 +553,11 @@ def evolve(cfg, slug):
                         for k, v in roll.items() if k != slug),
         contribution_targets="\n".join(
             f"  - {target}" for target in cfg.get("contribution_targets", [])),
+        evolve_brief=evolve_brief(cfg) or
+        "No additional standing directive. Decide from your role and memory.",
+        creative_state_path=str(
+            HOME / str(cfg.get(
+                "creative_state_file", "state/evolve-creative-state.json"))),
     )
     # One model, the best available, for every neighbor. Differences between
     # neighbors must come from role, memory and vantage — not from which
@@ -562,6 +636,9 @@ def outsider_smoke(cfg):
     rappterverse's consent-delegation (`delegates`, #5 ask 3) stays
     uncovered: participate.py does not implement that path yet.
     """
+    if not cfg.get("smoke_enabled", True):
+        log("smoke skipped — disabled for this instance")
+        return
     if int(cfg.get("level", 1)) < 2:
         log("smoke skipped — level < 2 and a smoke files a real issue")
         return
@@ -621,7 +698,7 @@ def outsider_smoke(cfg):
         if "attempt cap" in why and not rec.get("human_notified"):
             # Three failed smokes is a broken front door; re-knocking will
             # not fix it. Say so once, then hold.
-            notify(cfg, f"🔴 RAPP sentinel: the outsider path on {platform} "
+            notify(cfg, f"🔴 {instance_name(cfg)}: the outsider path on {platform} "
                         f"failed {cfg['max_attempts_per_issue']} smoke "
                         f"attempts — the front door needs a human.\n"
                         f"last: {str(rec.get('last_result'))[:300]}")
@@ -784,7 +861,7 @@ def main():
         cut = [k for k, v in anchors.items() if v["truncated"]]
         if cut:
             log(f"TRUNCATION DETECTED: {cut}")
-            notify(cfg, f"🔴 Neighborhood Watch: chain truncation on {cut}. "
+            notify(cfg, f"🔴 {instance_name(cfg)}: chain truncation on {cut}. "
                         f"A watcher's history is shorter than what was witnessed.")
         dead = [k for k, v in roll.items() if not v["alive"] and v["frames"] > 0]
         broken = [k for k, v in roll.items() if not v["chain_ok"]]
@@ -794,7 +871,7 @@ def main():
             # a corrupt chain is more serious than a down platform: it means a
             # watcher's record of itself cannot be trusted
             log(f"WATCHER CHAIN BROKEN: {broken}")
-            notify(cfg, f"🔴 Neighborhood Watch: chain integrity failure on {broken}. "
+            notify(cfg, f"🔴 {instance_name(cfg)}: chain integrity failure on {broken}. "
                         f"A watcher's own record no longer verifies.")
     except Exception as e:
         log(f"neighborhood record failed: {type(e).__name__}: {e}")
@@ -803,7 +880,7 @@ def main():
     # tick gets muted, and a muted watcher is the same as no watcher
     if status != prev_status:
         emoji = {"healthy": "✅", "degraded": "⚠️", "critical": "🔴"}.get(status, "•")
-        notify(cfg, f"{emoji} RAPP sentinel: {prev_status or 'unknown'} → {status}\n"
+        notify(cfg, f"{emoji} {instance_name(cfg)}: {prev_status or 'unknown'} → {status}\n"
                     f"{verdict['summary'][:600]}")
 
     level = int(cfg["level"])
@@ -823,15 +900,15 @@ def main():
             smoked = bool(outsider_smoke(cfg))
         except Exception as e:
             log(f"outsider smoke failed: {type(e).__name__}: {e}")
-    if status == "healthy":
-        if level >= 3 and smoked:
+    if level >= 3 and evolution_status_allowed(cfg, verdict):
+        if smoked:
             # One model-spending arm per tick: a smoke (subprocess up to
             # 600s) stacked on an evolve (up to 1800s) in the same tick
             # walks past run.sh's ceiling and gets the tick killed
             # mid-evolve. Evolve loses nothing — the next healthy tick is
             # 15 minutes away.
             log("evolve deferred - a smoke already ran this tick")
-        elif level >= 3:
+        else:
             hist = load_json(STATE / "escalations.json", [])
             issues = load_json(STATE / "issues.json", {})
             # Evolve gets its OWN, smaller budget and must never eat into the
@@ -844,16 +921,17 @@ def main():
                              and h.get("mode") == "evolve"]
             ev_cap = int(cfg.get("daily_evolve_budget", 2))
             okb, used = len(recent_evolve) < ev_cap, len(recent_evolve)
-            # evolve is rate-limited by the same machinery as repair, and takes
-            # one neighbor per pass in rotation so no single one dominates
+            # Evolution recurs on its own global cadence; repair's lifetime
+            # attempt cap must never turn a creative loop off permanently.
+            # One neighbor acts per pass in rotation so no one dominates.
             order = list(NB.NEIGHBORS)
             turn = load_json(STATE / "evolve_turn.json", {"i": 0})
             slug = order[turn["i"] % len(order)]
-            allowed, why = issue_allowed(issues, f"evolve:{slug}", cfg)
+            allowed, why = evolution_allowed(hist, cfg)
             if not okb:
                 log(f"evolve skipped — evolve budget spent ({used}/{ev_cap}); repair capacity untouched")
             elif not allowed:
-                log(f"evolve skipped for {slug}: {why}")
+                log(f"evolve skipped: {why}")
             else:
                 ok, out = evolve(cfg, slug)
                 line = result_line(out)
@@ -872,7 +950,9 @@ def main():
                 save_json(STATE / "evolve_turn.json", turn)
                 log(f"evolve ({slug}): {line}")
                 notify(cfg, f"🎨 {slug} acted on its own initiative:\n{line[:400]}")
-            return 0
+        return 0
+
+    if status == "healthy":
         log("healthy — nothing to do")
         return 0
 
@@ -922,14 +1002,14 @@ def main():
     if not allowed:
         log(f"skipping '{key}': {why}")
         if "attempt cap" in why and prev.get("escalated_human") != key:
-            notify(cfg, f"🔴 RAPP sentinel needs you.\n'{key}' survived "
+            notify(cfg, f"🔴 {instance_name(cfg)} needs you.\n'{key}' survived "
                         f"{cfg['max_attempts_per_issue']} automated repairs.\n"
                         f"{verdict['summary'][:400]}")
             prev["escalated_human"] = key
             save_json(STATE / "last_run.json", {**prev, "escalated_human": key})
         return 0
 
-    mode = "repair" if level >= 2 else "diagnose"
+    mode = escalation_mode(cfg, level)
     # Read the record BEFORE escalating so the prompt carries its own attempt
     # history (#4); the bookkeeping below stays where it was, so attempt
     # accounting cannot double-count.
@@ -981,13 +1061,15 @@ def main():
         })
         if fixed:
             log(f"verified fixed: {sorted(fixed)}")
-            notify(cfg, f"✅ RAPP sentinel repaired: {', '.join(sorted(fixed))}\n{verdict_line[:300]}")
+            notify(cfg, f"✅ {instance_name(cfg)} repaired: "
+                        f"{', '.join(sorted(fixed))}\n{verdict_line[:300]}")
             issues.pop(key, None)
             save_json(STATE / "issues.json", issues)
         else:
             log("repair did not clear the failing checks")
     else:
-        notify(cfg, f"⚠️ RAPP sentinel diagnosis ({key}):\n{verdict_line[:500]}")
+        notify(cfg, f"⚠️ {instance_name(cfg)} diagnosis ({key}):\n"
+                    f"{verdict_line[:500]}")
 
     return 0
 
@@ -1026,7 +1108,8 @@ if __name__ == "__main__":
             # Routed through notify() so it still honours cfg["notify"] -- an
             # earlier draft called outbox directly and would have texted from
             # any copy of this repo with notifications deliberately turned off.
-            notify(config(), f"\U0001F534 RAPP sentinel CRASHED: {detail}"[:600])
+            cfg = config()
+            notify(cfg, f"\U0001F534 {instance_name(cfg)} CRASHED: {detail}"[:600])
         except Exception as inner:
             log(f"could not queue the crash alert: {inner}")
         sys.exit(1)

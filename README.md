@@ -138,6 +138,14 @@ Three rules, learned the hard way:
 
 **Run at level 0 for a week.** It isn't a toy setting. If it reports things you disagree with, your checks are wrong — and level 2 would have "fixed" the wrong thing eight times a day.
 
+Level 3 can be specialized without weakening repair safety. `instance_name`
+brands reports and chain metadata, `evolve_brief` supplies a standing
+structured directive, and `evolve_interval_hours` sets a recurring global
+cadence. Evolution has its own rolling daily budget and does not inherit the
+repair arm's lifetime attempt cap. Set `repair_enabled: false` when an instance
+may contribute to its allowlisted commons but must only diagnose watched
+platforms.
+
 ---
 
 ## Why three watchers
