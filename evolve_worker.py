@@ -47,6 +47,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.parse import quote, urlsplit
 
 import neighborhood as NB
 import sentinel
@@ -1122,7 +1123,11 @@ def _pr_body(submission, wcfg):
 # ── bookkeeping ─────────────────────────────────────────────────────────────
 
 def notification_for(outcome, role, detail, receipts=None):
-    """The alert text, or None. Only a verified merge gets the paintbrush."""
+    """The alert text, or None. Only a verified merge gets the paintbrush.
+
+    The merged case is built by art_notification() instead — it is the only
+    outcome that has a URL a human can tap.
+    """
     if outcome == OUTCOME_CONTRIBUTED:
         url = (receipts or {}).get("pr_url", "")
         return (f"{SUCCESS_PREFIX} {role} contributed and it is merged:\n"
@@ -1130,6 +1135,112 @@ def notification_for(outcome, role, detail, receipts=None):
     if outcome == OUTCOME_DECLINED:
         return f"\u2022 {role} considered a contribution and declined:\n{detail[:300]}"
     return (f"\u26A0\uFE0F {role} evolution {outcome}:\n{detail[:400]}")
+
+
+def _looks_like_a_path(repo):
+    text = str(repo).strip()
+    return text.startswith(("/", ".", "~")) or text.startswith("file://")
+
+
+def art_repo(cfg, wcfg):
+    """owner/name for the commons this instance publishes art to.
+
+    commons_repo is the configured name for "the repository this instance
+    contributes to", so it wins; the worker's own repo key is the fallback so
+    an instance that set only one of them still gets links.
+    """
+    for candidate in (cfg.get("commons_repo"), wcfg.get("repo")):
+        text = str(candidate or "").strip().rstrip("/")
+        if not text or _looks_like_a_path(text):
+            continue
+        if text.endswith(".git"):
+            text = text[:-4]
+        if "://" in text:
+            text = urlsplit(text).path
+        elif text.startswith("git@") and ":" in text:
+            text = text.split(":", 1)[1]
+        parts = [p for p in text.strip("/").split("/") if p]
+        if len(parts) >= 2:
+            return parts[-2], parts[-1]
+    return "", ""
+
+
+def art_urls(cfg, wcfg, submission):
+    """(view, source) for a merged piece, derived, never guessed at send time.
+
+    The view URL is the GitHub Pages copy of the piece itself: one tap, the
+    artwork, no navigation. The source URL is the same bytes on GitHub, which
+    is what makes the message checkable by someone who does not trust it.
+    """
+    owner, name = art_repo(cfg, wcfg)
+    if not owner or not name:
+        return "", ""
+    path = "/".join(quote(seg, safe="")
+                    for seg in str(submission["piece_path"]).split("/"))
+    branch = quote(str(wcfg.get("base_branch", "main")), safe="")
+    return (f"https://{owner.lower()}.github.io/{name}/{path}",
+            f"https://github.com/{owner}/{name}/blob/{branch}/{path}")
+
+
+def _first_sentence(text, limit=220):
+    collapsed = " ".join(str(text).split())
+    if not collapsed:
+        return ""
+    match = re.search(r"(?<=[.!?])\s", collapsed)
+    sentence = (collapsed[:match.start()] if match else collapsed).rstrip()
+    if len(sentence) > limit:
+        sentence = sentence[:limit - 1].rstrip() + "\u2026"
+    return sentence
+
+
+def concept_sentence(meta, limit=220):
+    """One sentence about what the thing IS, from the piece's own record.
+
+    Preference order is "what the maker said about it", then the premise of
+    the candidate that actually won its cycle — never a generated summary,
+    because a summary nobody wrote is a claim nobody made.
+    """
+    for key in ("_concept", "_artist_statement", "_inspired_by"):
+        value = meta.get(key)
+        if isinstance(value, str) and value.strip():
+            return _first_sentence(value, limit)
+    cycle = meta.get("_dada_cycle") or {}
+    rounds = cycle.get("rounds") or []
+    winner = (cycle.get("winner") or {}).get("candidate")
+    if rounds:
+        for cand in rounds[-1].get("candidates") or []:
+            if cand.get("id") == winner and isinstance(cand.get("premise"), str):
+                return _first_sentence(cand["premise"], limit)
+    return _first_sentence(meta.get("title") or "a new piece", limit)
+
+
+def art_recipient(cfg):
+    """Where art news goes: the reports number, else the alert handle."""
+    for key in ("report_number", "notify_handle"):
+        value = str(cfg.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def art_notification(cfg, wcfg, submission, receipts):
+    """The message a verified merge earns. One message, one tap to the art."""
+    view, source = art_urls(cfg, wcfg, submission)
+    lines = [f"{SUCCESS_PREFIX} {sentinel.instance_name(cfg)}: "
+             f"\u201c{submission['title']}\u201d is merged.",
+             "",
+             concept_sentence(submission["meta"])]
+    if view:
+        lines += ["", f"View: {view}"]
+    if source:
+        lines.append(f"Source: {source}")
+    pr_url = (receipts or {}).get("pr_url", "")
+    if pr_url:
+        lines.append(f"PR: {pr_url}")
+    if not view and not source:
+        # Say so rather than send a triumphant message with nowhere to go.
+        lines += ["", "(no public URL derivable — set commons_repo to owner/name)"]
+    return "\n".join(lines)
 
 
 def record(history, row, path=None):
@@ -1393,7 +1504,18 @@ def _finish(cfg, wcfg, history, row, outcome, detail, receipts=None,
     })
 
     text = notification_for(outcome, row["role"], str(detail), receipts)
-    if text and (outcome != OUTCOME_DECLINED or wcfg.get("notify_declines")):
+    if outcome == OUTCOME_CONTRIBUTED and submission and receipts:
+        # The one message a human wants: the title, the artwork itself, and
+        # the evidence. Sent HERE and nowhere else, because here is after the
+        # merge commit was fetched back and the merged bytes were compared —
+        # a message that says "merged" for anything less is a lie with a link.
+        #
+        # rebuild=True: the static report attached to this alert renders the
+        # chains this cycle just wrote. Rebuilding first is the difference
+        # between linked evidence and linked yesterday.
+        sentinel.notify(cfg, art_notification(cfg, wcfg, submission, receipts),
+                        to=art_recipient(cfg), rebuild=True)
+    elif text and (outcome != OUTCOME_DECLINED or wcfg.get("notify_declines")):
         sentinel.notify(cfg, text)
     log(f"{row['role']}: {outcome} — {row['detail'][:200]}")
     return {"outcome": outcome, "role": row["role"], "detail": row["detail"],

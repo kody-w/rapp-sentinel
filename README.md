@@ -195,6 +195,7 @@ The worker (`evolve_worker.py`, `com.rapp.evolve-worker`, every 30 min):
 | deterministic gate | exactly one new `submissions/<slug>/`, exactly `meta.json` + `piece.<ext>`, no existing path touched, valid slug/schema/kind/extension/license, piece ≤ 50 KB, SVG parses with no script, no `on*` handler and no external reference, and `_dada_cycle` proving 1-5 rounds of **exactly 10** scored candidates with a winner that names the piece |
 | controller-owned publish | the branch, commit, PR, PR **file scope as GitHub reports it**, squash merge, and the re-read of `origin/main` and the merge commit afterwards are all done by code |
 | honest outcomes | only a re-read merge sends a 🎨; a timeout, failure, rejection or decline is recorded as what it was |
+| one text per merge | a verified merge sends exactly one iMessage: title, a tappable Pages URL for the piece itself, the GitHub source and PR URLs, and one sentence of concept — see below |
 
 `SENTINEL_RESULT: CONTRIBUTED` is a claim, not a receipt. The creative ledger,
 the cadence history, the chain frame and the notification move only after the
@@ -204,6 +205,41 @@ passed the gate. The temporary clone is removed on every path out.
 Honest limit: the deterministic gate encodes the submission protocol *as it
 was read* — a repo that changes its protocol needs the gate updated with it,
 on purpose, so a PR cannot relax the rules that judge it.
+
+#### The one text a merge earns
+
+A verified merge — and *only* a verified merge — sends a single iMessage to
+`report_number` (falling back to `notify_handle`):
+
+```
+🎨 Dada Collective: “Nine Sworn Assurances” is merged.
+
+Nine consecutive attestations so identical that each one's prev equals its own payload_hash.
+
+View: https://kody-w.github.io/public-art-collective/submissions/nine-sworn-assurances/piece.svg
+Source: https://github.com/kody-w/public-art-collective/blob/main/submissions/nine-sworn-assurances/piece.svg
+PR: https://github.com/kody-w/public-art-collective/pull/12
+```
+
+- **View** is the GitHub Pages copy of the piece itself: one tap, the artwork,
+  no navigation. Derived deterministically from `commons_repo` (falling back to
+  `evolve_worker.repo`) plus the merged slug and extension — never guessed at
+  send time, and URL-encoded per path segment.
+- **Concept** is one sentence taken from the piece's own record: `_concept`,
+  else the first sentence of `_artist_statement`, else the premise of the
+  candidate that actually won its cycle. Nothing is summarised on the piece's
+  behalf, because a summary nobody wrote is a claim nobody made.
+- The static HTML report is **rebuilt before** the message is queued, so the
+  evidence links in it render the chain frames this cycle just wrote.
+
+Nothing else sends it. `SENTINEL_RESULT: CONTRIBUTED` does not; a PR that was
+opened does not; an abort after the PR does not. The message is built inside
+the same branch that already re-read the merge commit from `origin/main` and
+compared the merged bytes to the gated bytes — so if the text arrives, the art
+is live at the URL in it.
+
+Set `commons_repo` to `owner/name` to get the links; without it the message
+still sends with the PR URL and says plainly that no public URL was derivable.
 
 #### Sub-sentinels: a bounded fan-out before the maker
 

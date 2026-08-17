@@ -25,6 +25,14 @@ SCRATCH = Path(__file__).resolve().parent / ".tmp-evolve-worker-tests"
 NOW = datetime(2026, 8, 17, 22, 0, tzinfo=timezone.utc)
 
 
+def _history_snapshot():
+    """What the ledger held at the moment a notification was sent."""
+    try:
+        return json.loads(EW.HISTORY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
 def scratch_dir(name):
     SCRATCH.mkdir(exist_ok=True)
     path = SCRATCH / f"{name}-{uuid.uuid4().hex[:8]}"
@@ -122,8 +130,12 @@ class ScratchCase(unittest.TestCase):
             p.start()
             self.addCleanup(p.stop)
         self.notifications = []
-        p = mock.patch.object(EW.sentinel, "notify",
-                              side_effect=lambda cfg, text: self.notifications.append(text))
+        p = mock.patch.object(
+            EW.sentinel, "notify",
+            side_effect=lambda cfg, text, to=None, rebuild=False:
+            self.notifications.append({"text": text, "to": to,
+                                       "rebuild": rebuild,
+                                       "history": _history_snapshot()}))
         p.start()
         self.addCleanup(p.stop)
         self.frames = []
@@ -132,6 +144,9 @@ class ScratchCase(unittest.TestCase):
                               self.frames.append((slug, kind, payload)))
         p.start()
         self.addCleanup(p.stop)
+
+    def texts(self):
+        return [n["text"] for n in self.notifications]
 
     def tearDown(self):
         shutil.rmtree(self.home, ignore_errors=True)
@@ -249,7 +264,7 @@ class CorruptLedgerTests(ScratchCase):
         self.assertEqual(raw, EW.HISTORY_PATH.read_text(encoding="utf-8"),
                          "a corrupt ledger must never be rewritten as empty")
         self.assertTrue(self.notifications, "fail-closed must be said out loud")
-        self.assertNotIn(EW.SUCCESS_PREFIX, self.notifications[0])
+        self.assertNotIn(EW.SUCCESS_PREFIX, self.texts()[0])
 
     def test_corrupt_creative_state_fails_closed_before_the_model(self):
         (self.state / "evolve-creative-state.json").write_text("{;", encoding="utf-8")
@@ -604,6 +619,10 @@ def worker_cfg(**overrides):
         "evolve_timeout_s": 60,
         "daily_evolve_budget": 10,
         "evolve_interval_hours": 0,
+        "notify": True,
+        "notify_handle": "+15550000001",
+        "report_number": "+15550000002",
+        "commons_repo": "kody-w/public-art-collective",
         "creative_state_file": "state/evolve-creative-state.json",
         "evolve_worker": {"enabled": True, "degraded_allowlist": ["w_openrappter_spin"]},
     }
@@ -749,7 +768,7 @@ class WorkerRunTests(WorkerEnv):
         self.assertTrue(self.frames[0][2]["merged"])
 
         self.assertEqual(1, len(self.notifications))
-        self.assertIn(EW.SUCCESS_PREFIX, self.notifications[0])
+        self.assertIn(EW.SUCCESS_PREFIX, self.texts()[0])
         self.assertEqual([], self.workspaces(), "the temp clone must be removed")
 
     def test_the_second_cycle_must_continue_the_first(self):
@@ -789,7 +808,7 @@ class WorkerRunTests(WorkerEnv):
         self.assertTrue(self.gh.called("pr", "close"), "the open PR must be closed")
         self.assertNotIn("submissions/new-piece",
                          git_bare(self.origin, "ls-tree", "--name-only", "-r", "main"))
-        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.notifications))
+        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
         self.assertFalse((self.state / "evolve-creative-state.json").exists(),
                          "an aborted cycle must not advance the creative ledger")
         history = json.loads(EW.HISTORY_PATH.read_text())
@@ -828,7 +847,7 @@ class WorkerRunTests(WorkerEnv):
         self.assertIn("index.json", summary["detail"])
         self.assertFalse(self.gh.called("pr", "merge"))
         self.assertTrue(self.gh.called("pr", "close"))
-        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.notifications))
+        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
 
     def test_a_failed_pr_creation_does_not_orphan_the_pushed_branch(self):
         def failing_create(*args, timeout=None):
@@ -844,7 +863,7 @@ class WorkerRunTests(WorkerEnv):
                             "refs/heads/")
         self.assertEqual(["refs/heads/main"], branches.split(),
                          "a pushed branch with no PR must be deleted again")
-        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.notifications))
+        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
 
     def test_a_timeout_is_recorded_without_a_success_shaped_alert(self):
         def timing_out(workspace, prompt, wcfg):
@@ -858,8 +877,8 @@ class WorkerRunTests(WorkerEnv):
         self.assertEqual(EW.OUTCOME_TIMEOUT, history[0]["outcome"])
         self.assertFalse(self.gh.calls, "nothing may reach GitHub after a timeout")
         self.assertEqual(1, len(self.notifications))
-        self.assertNotIn(EW.SUCCESS_PREFIX, self.notifications[0])
-        self.assertIn("timeout", self.notifications[0])
+        self.assertNotIn(EW.SUCCESS_PREFIX, self.texts()[0])
+        self.assertIn("timeout", self.texts()[0])
         self.assertFalse((self.state / "evolve-creative-state.json").exists())
         self.assertEqual([], self.workspaces(), "a timeout still cleans up")
 
@@ -896,7 +915,7 @@ class WorkerRunTests(WorkerEnv):
         self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
         self.assertIn("committed", summary["detail"])
         self.assertFalse(self.gh.calls)
-        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.notifications))
+        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
 
     def test_a_missing_next_state_file_is_rejected_before_any_remote_call(self):
         def no_state(workspace, prompt, wcfg):
@@ -1016,7 +1035,7 @@ class FanoutIntegrationTests(WorkerEnv):
         self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
         self.assertIn("exactly the ten finalists", summary["detail"])
         self.assertFalse(self.gh.calls, "nothing reaches GitHub")
-        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.notifications))
+        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
 
     def test_a_partial_failure_that_still_yields_ten_continues(self):
         results = [child_result("a"), child_result("b"),
@@ -1042,9 +1061,9 @@ class FanoutIntegrationTests(WorkerEnv):
         self.assertEqual(EW.OUTCOME_FANOUT, summary["outcome"])
         maker.assert_not_called()
         self.assertFalse(self.gh.calls)
-        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.notifications))
+        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
         self.assertEqual(1, len(self.notifications))
-        self.assertIn("fanout-failed", self.notifications[0])
+        self.assertIn("fanout-failed", self.texts()[0])
         row = json.loads(EW.HISTORY_PATH.read_text())[0]
         self.assertEqual(EW.OUTCOME_FANOUT, row["outcome"])
         self.assertEqual(3, row["children"], "children cost credit even so")
@@ -1125,6 +1144,193 @@ class FanoutIntegrationTests(WorkerEnv):
         self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
         children.assert_not_called()
         self.assertNotIn("THE TEN FINALISTS", self.prompt)
+
+
+class ArtNotificationTests(WorkerEnv):
+    """The message a merge earns — and the silence everything else earns."""
+
+    VIEW = ("https://kody-w.github.io/public-art-collective/"
+            "submissions/new-piece/piece.svg")
+    SOURCE = ("https://github.com/kody-w/public-art-collective/blob/main/"
+              "submissions/new-piece/piece.svg")
+
+    def test_exactly_one_message_on_a_verified_merge(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        self.assertEqual(1, len(self.notifications),
+                         "one merge, one message — not two, not zero")
+
+        note = self.notifications[0]
+        text = note["text"]
+        self.assertIn(EW.SUCCESS_PREFIX, text)
+        self.assertIn("New Piece", text, "the title a human recognises")
+        self.assertIn(f"View: {self.VIEW}", text, "one tap to the artwork")
+        self.assertIn(f"Source: {self.SOURCE}", text)
+        self.assertIn(f"PR: {summary['receipts']['pr_url']}", text)
+        self.assertEqual("+15550000002", note["to"],
+                         "art news goes to the configured report number")
+
+    def test_the_message_carries_a_one_sentence_concept(self):
+        meta = meta_for("new-piece", _artist_statement=(
+            "A clock that lies about the time. Then it goes on at length "
+            "about clocks for several more sentences nobody will read on a "
+            "phone."))
+
+        def maker(workspace, prompt, wcfg):
+            write_submission(Path(workspace) / "clone", "new-piece", meta)
+            (Path(workspace) / "state-out.json").write_text(json.dumps(
+                {"cycle": 1, "last_slug": "new-piece", "notes": "n"}),
+                encoding="utf-8")
+            return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
+
+        with mock.patch.object(EW, "run_model", maker):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        text = self.texts()[0]
+        self.assertIn("A clock that lies about the time.\n", text,
+                      "one sentence, no trailing whitespace before the links")
+        self.assertNotIn("nobody will read on a phone", text)
+
+    def test_a_long_statement_is_truncated_not_pasted(self):
+        self.assertEqual(80, len(EW.concept_sentence(
+            {"_concept": "x" * 500}, limit=80)))
+        self.assertTrue(EW.concept_sentence({"_concept": "x" * 500},
+                                            limit=80).endswith("\u2026"))
+
+    def test_the_concept_falls_back_to_the_winning_premise(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertIn("premise 1.1", self.texts()[0],
+                      "the premise that actually won its cycle")
+
+    def test_the_static_report_is_rebuilt_after_the_merge_is_recorded(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        note = self.notifications[0]
+        self.assertTrue(note["rebuild"], "linked evidence must be current")
+        self.assertEqual([EW.OUTCOME_CONTRIBUTED],
+                         [r["outcome"] for r in note["history"]],
+                         "the ledger is written before the message is built")
+
+    def test_commons_repo_wins_over_the_worker_repo(self):
+        cfg = dict(self.cfg, commons_repo="someone-else/other-commons")
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            EW.run_once(cfg=cfg, health=lambda phase: healthy())
+        text = self.texts()[0]
+        self.assertIn("https://someone-else.github.io/other-commons/"
+                      "submissions/new-piece/piece.svg", text)
+        self.assertIn("https://github.com/someone-else/other-commons/blob/main/"
+                      "submissions/new-piece/piece.svg", text)
+
+    def test_no_message_for_a_timeout(self):
+        with mock.patch.object(EW, "run_model",
+                               lambda ws, p, w: (EW.OUTCOME_TIMEOUT, "timed out")):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(1, len(self.notifications))
+        self.assertNotIn("View:", self.texts()[0])
+        self.assertNotIn(EW.SUCCESS_PREFIX, self.texts()[0])
+
+    def test_no_message_for_a_declined_cycle(self):
+        with mock.patch.object(
+                EW, "run_model",
+                lambda ws, p, w: ("ok", "SENTINEL_RESULT: DECLINED not today\n")):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual([], self.notifications)
+
+    def test_a_model_claiming_success_without_a_merge_gets_no_art_message(self):
+        # SENTINEL_RESULT is a claim; the health abort means nothing merged.
+        phases = {"start": healthy(), "pre-write": healthy(),
+                  "pre-merge": critical("rb_workflows")}
+        with mock.patch.object(EW, "run_model", self.model_that_submits(
+                result="CONTRIBUTED and it is live, I promise")):
+            summary = EW.run_once(cfg=self.cfg,
+                                  health=lambda phase: phases[phase])
+        self.assertEqual(EW.OUTCOME_ABORTED, summary["outcome"])
+        for text in self.texts():
+            self.assertNotIn("View:", text)
+            self.assertNotIn(EW.SUCCESS_PREFIX, text)
+
+    def test_no_art_message_when_the_gate_rejects(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits(
+                slug="second-piece", cycle=9)):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+        self.assertFalse(any("View:" in t for t in self.texts()))
+
+
+class ArtUrlTests(unittest.TestCase):
+    """URL derivation is deterministic, encoded, and per-extension correct."""
+
+    def urls(self, piece_path, commons="kody-w/public-art-collective",
+             base="main"):
+        return EW.art_urls({"commons_repo": commons},
+                           {"repo": "ignored/when-commons-set",
+                            "base_branch": base},
+                           {"piece_path": piece_path})
+
+    def test_every_supported_extension_maps_to_its_own_path(self):
+        for ext in sorted(EW.KIND_EXTENSIONS.values()):
+            with self.subTest(ext=ext):
+                view, source = self.urls(f"submissions/a-slug/piece{ext}")
+                self.assertEqual(
+                    f"https://kody-w.github.io/public-art-collective/"
+                    f"submissions/a-slug/piece{ext}", view)
+                self.assertEqual(
+                    f"https://github.com/kody-w/public-art-collective/blob/main/"
+                    f"submissions/a-slug/piece{ext}", source)
+
+    def test_path_separators_survive_and_segments_are_encoded(self):
+        view, source = self.urls("submissions/a b/piece.svg")
+        self.assertIn("/submissions/a%20b/piece.svg", view)
+        self.assertIn("/submissions/a%20b/piece.svg", source)
+        self.assertEqual(4, view.count("/") - 2, "slashes are not encoded away")
+
+    def test_a_non_default_branch_lands_in_the_source_url(self):
+        _, source = self.urls("submissions/a/piece.md", base="trunk")
+        self.assertIn("/blob/trunk/", source)
+
+    def test_the_pages_host_is_lowercased_but_the_repo_is_not(self):
+        view, source = self.urls("submissions/a/piece.svg",
+                                 commons="Kody-W/Public-Art-Collective")
+        self.assertTrue(view.startswith("https://kody-w.github.io/Public-Art-Collective/"))
+        self.assertIn("github.com/Kody-W/Public-Art-Collective/", source)
+
+    def test_a_full_url_or_git_remote_still_yields_owner_and_name(self):
+        for commons in ("https://github.com/kody-w/public-art-collective",
+                        "https://github.com/kody-w/public-art-collective.git",
+                        "git@github.com:kody-w/public-art-collective.git"):
+            with self.subTest(commons=commons):
+                view, _ = self.urls("submissions/a/piece.svg", commons=commons)
+                self.assertEqual("https://kody-w.github.io/public-art-collective/"
+                                 "submissions/a/piece.svg", view)
+
+    def test_a_local_path_is_not_a_public_url(self):
+        view, source = EW.art_urls(
+            {"commons_repo": ""}, {"repo": "/Users/someone/origin.git",
+                                   "base_branch": "main"},
+            {"piece_path": "submissions/a/piece.svg"})
+        self.assertEqual(("", ""), (view, source))
+
+    def test_the_worker_repo_is_used_when_commons_repo_is_unset(self):
+        view, _ = EW.art_urls({}, {"repo": "kody-w/public-art-collective",
+                                   "base_branch": "main"},
+                              {"piece_path": "submissions/a/piece.txt"})
+        self.assertEqual("https://kody-w.github.io/public-art-collective/"
+                         "submissions/a/piece.txt", view)
+
+    def test_a_message_without_a_derivable_url_says_so(self):
+        text = EW.art_notification(
+            {"instance_name": "Dada"}, {"repo": "/local/path"},
+            {"title": "Thing", "piece_path": "submissions/a/piece.svg",
+             "meta": {"title": "Thing"}}, {"pr_url": "https://example/pr/1"})
+        self.assertIn("no public URL derivable", text)
+        self.assertIn("PR: https://example/pr/1", text)
+
+    def test_the_recipient_prefers_the_report_number(self):
+        self.assertEqual("+1555", EW.art_recipient(
+            {"report_number": "+1555", "notify_handle": "+1999"}))
+        self.assertEqual("+1999", EW.art_recipient({"notify_handle": "+1999"}))
+        self.assertEqual("", EW.art_recipient({}))
 
 
 # ── the tick keeps ticking ──────────────────────────────────────────────────

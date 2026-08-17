@@ -12,6 +12,8 @@
   "max_attempts_per_issue": 3,
   "notify": false,
   "notify_handle": "you@example.com",
+  "_report_number_why": "iMessage/SMS destination for reports: nightwatch's play-by-play, and the evolve worker's one-text-per-verified-merge art update (title, tappable Pages URL, source, PR, one sentence). Falls back to notify_handle when unset.",
+  "report_number": "",
   "notify_queue_only": false,
   "copilot_model": "claude-opus-5",
   "copilot_timeout_s": 900,
@@ -79,7 +81,8 @@
     "kody-w/rapp-moment",
     "kody-w/public-art-collective"
   ],
-  "commons_repo": "",
+  "_commons_repo_why": "owner/name of the commons this instance publishes art to. The evolve worker derives the merge notification's tappable URLs from it: https://<owner>.github.io/<name>/submissions/<slug>/piece.<ext> to view and https://github.com/<owner>/<name>/blob/<branch>/... for the source. Unset, a verified merge still texts you the PR link and says no public URL was derivable. Only a merge verified against fresh origin/main sends that message - never a model's SENTINEL_RESULT line, never an aborted or rejected cycle.",
+  "commons_repo": "kody-w/public-art-collective",
   "_watchers_why": "health.py's probe_watchers reads its estate-probe targets from this block (issue #1 ask 2). Every key defaults to the previously hardcoded live values, so omitting the whole block changes nothing. Overrides merge per watcher - give only the keys you change. enabled:false skips that probe AND declares the omission in every verdict (w_checks_complete reports 'disabled by config'), never a silent green. openrappter.labels is the same key the spin scan unions into its candidate labels - one key, one read path.",
   "watchers": {
     "brainstem": {

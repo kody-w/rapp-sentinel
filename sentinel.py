@@ -123,16 +123,22 @@ def log(msg):
         fh.write(line + "\n")
 
 
-def notify(cfg, text):
+def notify(cfg, text, to=None, rebuild=False):
     """Queue the alert, then try to deliver it.
 
     Direct osascript hangs under launchd (TCC prompt, background context), so a
     state-change alert sent that way is silently lost — and silence is exactly
     what an alert is supposed to break.
+
+    `to` overrides the default handle for channels that have their own
+    destination (the art arm reports to report_number). `rebuild` forces the
+    static report to be re-rendered first, for callers that just changed the
+    record the report renders — a link to yesterday's evidence attached to
+    today's news is worse than no link.
     """
     if not cfg.get("notify"):
         return
-    to = cfg.get("notify_handle")
+    to = to or cfg.get("notify_handle")
     if not to:
         return
     try:
@@ -140,7 +146,7 @@ def notify(cfg, text):
         urls = []
         try:
             import standup
-            snapshot = standup.portable_snapshot(rebuild=False)
+            snapshot = standup.portable_snapshot(rebuild=rebuild)
             urls = standup.publish_snapshot(snapshot)
         except Exception as e:
             log(f"static report generation failed: {type(e).__name__}: {e}")
