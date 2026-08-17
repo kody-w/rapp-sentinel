@@ -10,5 +10,10 @@ __pycache__/
 public/sentinel-head.json
 .claude/
 
+# test scratch — the worker tests keep their temp repos beside the code, never
+# in /tmp, so a failed run leaves its evidence where you can read it
+.tmp-evolve-worker-tests/
+.scratch-home/
+
 # local-only: the strings you are hiding must never ship
 sensitive/

@@ -80,6 +80,13 @@ Background reporters remain queue-only; the drainer is the single serialized
 process allowed to drive Messages, so reports survive both producer failures
 and reboot without waiting for a terminal command.
 
+Proactive art (level 3) can run as its own job so it never blocks the
+15-minute health tick — opt-in, see [the evolve worker](#level-3-in-its-own-job-the-evolve-worker):
+
+```bash
+./install-launchd.sh --with-evolve-worker          # or --home DIR --with-evolve-worker
+```
+
 ### One instance per `SENTINEL_HOME`
 
 One checkout can serve several instances. Set `SENTINEL_HOME` to a directory
@@ -91,6 +98,10 @@ instead of beside the code:
 SENTINEL_HOME=~/vision-court python3 health.py     # a second neighborhood
 ./install-launchd.sh --home ~/vision-court         # …or under launchd
 ```
+
+`--home` stamps `SENTINEL_HOME` into every job it loads, including
+`com.rapp.evolve-worker`, so the art arm and the tick always serve the same
+instance.
 
 Unset, nothing changes: state lives beside the code, byte-for-byte the same
 paths as before the variable existed, so a live install picks this up by
@@ -145,6 +156,53 @@ cadence. Evolution has its own rolling daily budget and does not inherit the
 repair arm's lifetime attempt cap. Set `repair_enabled: false` when an instance
 may contribute to its allowlisted commons but must only diagnose watched
 platforms.
+
+### Level 3 in its own job: the evolve worker
+
+launchd **serialises** a `StartInterval` job. A 15-30 minute model call inside
+the 15-minute tick is therefore 15-30 minutes with nobody measuring the estate,
+and the next tick does not start early to make up for it. So proactive art can
+move out of the tick entirely:
+
+```jsonc
+"evolve_worker": {
+  "enabled": true,
+  "repo": "kody-w/public-art-collective",
+  "degraded_allowlist": ["w_openrappter_spin"]
+}
+```
+
+```bash
+./install-launchd.sh --with-evolve-worker        # or just set enabled:true and rerun
+python3 evolve_worker.py --dry-run               # what would it decide right now?
+```
+
+Enabled, the tick logs `evolve delegated to evolve_worker.py` and spends **no**
+model on art — while still diagnosing or repairing a critical failure on the
+same tick, still honouring `repair_enabled`. Absent or `false`, nothing about
+an existing install changes.
+
+The worker (`evolve_worker.py`, `com.rapp.evolve-worker`, every 30 min):
+
+| Guard | What it means |
+|---|---|
+| nonblocking `flock` | two passes never overlap; a killed pass leaves no stale lock |
+| global cadence + rolling daily budget | shared across roles, in its own ledger, never repair's |
+| fail-closed ledgers | a corrupt or truncated history **stops the pass**; it is never read as "no spend" |
+| health at start, before the push, before the merge | any **critical** check aborts; degraded proceeds only when *every* failing id is in `degraded_allowlist` — `evolve_on_degraded` is ignored here |
+| temp clone | the model works only in a worker-made clone and is told, explicitly, that it may not commit, push, open a PR, or merge |
+| deterministic gate | exactly one new `submissions/<slug>/`, exactly `meta.json` + `piece.<ext>`, no existing path touched, valid slug/schema/kind/extension/license, piece ≤ 50 KB, SVG parses with no script, no `on*` handler and no external reference, and `_dada_cycle` proving 1-5 rounds of **exactly 10** scored candidates with a winner that names the piece |
+| controller-owned publish | the branch, commit, PR, PR **file scope as GitHub reports it**, squash merge, and the re-read of `origin/main` and the merge commit afterwards are all done by code |
+| honest outcomes | only a re-read merge sends a 🎨; a timeout, failure, rejection or decline is recorded as what it was |
+
+`SENTINEL_RESULT: CONTRIBUTED` is a claim, not a receipt. The creative ledger,
+the cadence history, the chain frame and the notification move only after the
+merge commit has been fetched back and the merged bytes match the bytes that
+passed the gate. The temporary clone is removed on every path out.
+
+Honest limit: the deterministic gate encodes the submission protocol *as it
+was read* — a repo that changes its protocol needs the gate updated with it,
+on purpose, so a PR cannot relax the rules that judge it.
 
 ---
 

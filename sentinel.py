@@ -66,6 +66,10 @@ DEFAULTS = {
     "evolve_on_degraded": False,
     "evolve_brief": {},
     "creative_state_file": "state/evolve-creative-state.json",
+    # Proactive art out of the 15-minute tick (evolve_worker.py). Default off:
+    # an existing install must keep the behaviour it has until its operator
+    # says otherwise, and the worker needs its own launchd job to be useful.
+    "evolve_worker": {"enabled": False},
     "repo_paths": {
         "rappterverse": str(Path.home() / "Documents/GitHub/rappterverse"),
         "rappterbook": str(Path.home() / "Documents/GitHub/rappterbook"),
@@ -285,6 +289,22 @@ def evolution_allowed(history, cfg):
     if age_h < interval_h:
         return False, f"creative cadence ({age_h:.1f}h of {interval_h:.1f}h)"
     return True, f"creative cadence ready ({age_h:.1f}h)"
+
+
+def evolution_worker_enabled(cfg):
+    """True when proactive art belongs to evolve_worker.py, not to this tick.
+
+    launchd SERIALISES a StartInterval job, so a 15-30 minute model call
+    inside the tick is 15-30 minutes with nobody measuring the estate — and
+    the next tick does not start early to make up for it. When an instance
+    opts in, this loop never invokes Copilot for art at all: the worker has
+    its own job, its own lock and its own budget, and health keeps ticking
+    beside it. Diagnose and repair are untouched; a critical Rappterbook or
+    RAPPterverse failure still escalates on this tick, still honouring
+    repair_enabled.
+    """
+    block = cfg.get("evolve_worker")
+    return bool(isinstance(block, dict) and block.get("enabled"))
 
 
 def evolution_status_allowed(cfg, verdict):
@@ -900,7 +920,14 @@ def main():
             smoked = bool(outsider_smoke(cfg))
         except Exception as e:
             log(f"outsider smoke failed: {type(e).__name__}: {e}")
-    if level >= 3 and evolution_status_allowed(cfg, verdict):
+    if level >= 3 and evolution_worker_enabled(cfg):
+        # The art arm lives in its own launchd job now (evolve_worker.py). The
+        # tick states the delegation and moves on WITHOUT returning: a
+        # delegated instance still has to escalate a critical failure on this
+        # tick, which the old level-3 early return would have skipped.
+        log("evolve delegated to evolve_worker.py — this tick spends no model "
+            "on art and keeps measuring")
+    elif level >= 3 and evolution_status_allowed(cfg, verdict):
         if smoked:
             # One model-spending arm per tick: a smoke (subprocess up to
             # 600s) stacked on an evolve (up to 1800s) in the same tick

@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.rapp.evolve-worker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>__DIR__/run-evolve-worker.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__HOME__/.local/bin</string>
+  </dict>
+
+  <!-- Every 30 minutes, and the pass itself decides whether to do anything:
+       the creative cadence (evolve_interval_hours, default 4h) and the rolling
+       daily budget live in evolve_worker.py, not in this interval. Waking more
+       often than the cadence is deliberate — a pass skipped for a degraded
+       estate or a spent lock retries within half an hour instead of waiting
+       out a whole cadence window.
+
+       This job is SEPARATE from com.rapp.neighborhood-watch on purpose.
+       launchd serialises a StartInterval job, so an art run that takes 15-30
+       minutes inside the 15-minute health tick is 15-30 minutes with nobody
+       measuring the estate. Two jobs, two clocks: health keeps ticking while
+       this one thinks. Overlap between passes of THIS job is prevented by a
+       nonblocking flock, not by launchd. -->
+  <key>StartInterval</key>
+  <integer>1800</integer>
+
+  <!-- Not at load: installing or reloading the job must not immediately spend
+       a model. The first pass happens on the first interval, by which time the
+       health tick has published a fresh verdict for the worker to gate on. -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <!-- Deliberately NOT KeepAlive: a periodic task, not a daemon. -->
+  <key>StandardOutPath</key>
+  <string>__DIR__/logs/evolve-worker.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__DIR__/logs/evolve-worker.err.log</string>
+</dict>
+</plist>
