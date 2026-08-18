@@ -697,9 +697,108 @@ def _repo_owner(repo):
 
 # ── subprocess seams (patched in tests) ─────────────────────────────────────
 
-def _git(cwd, *args, timeout=600, check=True):
+# Environment that can redirect, rewrite, proxy or execute on git's behalf.
+# All of it is removed rather than trusted: GIT_CONFIG_PARAMETERS alone can
+# inject arbitrary config into a single invocation.
+GIT_ENV_STRIP = (
+    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_DIR", "GIT_WORK_TREE",
+    "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_SSH", "GIT_SSH_COMMAND",
+    "GIT_PROXY_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_TEMPLATE_DIR",
+    "GIT_ATTR_NOSYSTEM", "GIT_EDITOR", "GIT_PAGER",
+    "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+    "ALL_PROXY", "all_proxy",
+)
+
+# Only these protocols. `ext::` in particular runs a command of the URL's
+# choosing, which is a remote that executes.
+GIT_ALLOWED_PROTOCOLS = "https:file"
+
+_GIT_ENV = None
+
+
+def _credential_helper():
+    """The operator's credential helper VALUE, read once and validated.
+
+    The sanitized config below has to keep exactly one thing from the real
+    machine — how to authenticate a push — or the controller cannot publish
+    at all. A `!command` helper is refused: that is not a credential store,
+    it is arbitrary execution wearing one's coat.
+    """
+    try:
+        r = subprocess.run(["git", "config", "--global", "--get-all",
+                            "credential.helper"], capture_output=True,
+                           text=True, timeout=30)
+    except Exception:
+        return ""
+    for line in (r.stdout or "").splitlines():
+        value = line.strip()
+        if not value:
+            continue
+        if value.startswith("!"):
+            log("ignoring a shell credential.helper from global git config — "
+                "a helper that executes is not a credential store")
+            continue
+        return value
+    return ""
+
+
+def controller_git_env(home=None):
+    """The environment EVERY controller git call runs in.
+
+    The finding this closes: `_clone_repo` shelled out to `git clone` with the
+    ambient environment, so a global `url.<attacker>.insteadOf <canonical>`
+    silently cloned the attacker's repository, and the integrity check — which
+    only ever reads LOCAL config — found a perfectly consistent clone of the
+    wrong thing. Isolation has to come before the first network byte, not
+    after it.
+
+    So: no system config, no global config except a file this code writes
+    containing at most a credential helper, an isolated HOME and XDG so
+    `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config` are not found, no proxy
+    variables, no config injection via the environment, no interactive
+    prompts, and only https/file protocols.
+    """
+    global _GIT_ENV
+    if _GIT_ENV is not None and home is None:
+        return dict(_GIT_ENV)
+    base = {k: v for k, v in os.environ.items() if k not in GIT_ENV_STRIP}
+    for key in list(base):
+        if key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
+            base.pop(key, None)
+
+    git_home = Path(home) if home else (STATE / "git-home")
+    git_home.mkdir(parents=True, exist_ok=True)
+    config = git_home / "sanitized.gitconfig"
+    helper = _credential_helper()
+    config.write_text(
+        "# written by evolve_worker: the ONLY global git config the\n"
+        "# controller runs with. No includes, no url rewrites, no proxy,\n"
+        "# no hooksPath, no alternates.\n"
+        + (f"[credential]\n\thelper = {helper}\n" if helper else ""),
+        encoding="utf-8")
+
+    base.update({
+        "HOME": str(git_home),
+        "XDG_CONFIG_HOME": str(git_home / "xdg"),
+        "GIT_CONFIG_GLOBAL": str(config),
+        "GIT_CONFIG_SYSTEM": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "/usr/bin/false",
+        "GIT_ALLOW_PROTOCOL": GIT_ALLOWED_PROTOCOLS,
+        "GIT_PROTOCOL_FROM_USER": "0",
+    })
+    (git_home / "xdg").mkdir(parents=True, exist_ok=True)
+    if home is None:
+        _GIT_ENV = dict(base)
+    return base
+
+
+def _git(cwd, *args, timeout=600, check=True, env=None):
     r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
-                       text=True, timeout=timeout)
+                       text=True, timeout=timeout,
+                       env=env if env is not None else controller_git_env())
     if check and r.returncode != 0:
         raise CommandError(f"git {' '.join(args)} exited {r.returncode}: "
                            f"{(r.stderr or r.stdout or '').strip()[:300]}")
@@ -708,13 +807,67 @@ def _git(cwd, *args, timeout=600, check=True):
 
 def _git_bytes(cwd, *args, timeout=600):
     r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
-                       timeout=timeout)
+                       timeout=timeout, env=controller_git_env())
     if r.returncode != 0:
         raise CommandError(f"git {' '.join(args)} exited {r.returncode}")
     return r.stdout
 
 
-NETWORK_GIT_VERBS = ("fetch", "push", "pull", "ls-remote", "clone", "remote")
+LOCAL_REPO_RE = re.compile(r"^/[^\0]+$")
+REPO_SEGMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def validate_repo_url(repo, wcfg=None):
+    """The canonical URL, checked for shape before it is ever handed to git.
+
+    A URL is an instruction. `ext::sh -c ...` is a remote that executes,
+    `-u./payload` is an argument pretending to be a host, and
+    `https://user:token@host/` leaks a credential into every reflog that
+    records it. An explicit absolute path is allowed — the tests use local
+    bare repositories on purpose — but nothing implicit is.
+    """
+    raw = str(repo).strip()
+    if raw.startswith("-"):
+        raise GateError(f"repo {raw!r} starts with a dash — that is an "
+                        f"argument, not a repository")
+    url = _repo_url(repo)
+    allowed_hosts = tuple((wcfg or {}).get("allowed_repo_hosts")
+                          or ("github.com",))
+    if url.startswith("-"):
+        raise GateError(f"repo {url!r} starts with a dash — that is an argument, "
+                        f"not a repository")
+    if "\n" in url or "\r" in url:
+        raise GateError("repo url contains a newline")
+    lowered = url.lower()
+    for scheme in ("ext::", "ssh://", "git://", "http://", "git+ssh://"):
+        if lowered.startswith(scheme):
+            raise GateError(f"repo url uses {scheme} — only https and explicit "
+                            f"local paths are allowed")
+    if lowered.startswith("https://"):
+        parts = urlsplit(url)
+        if "@" in parts.netloc:
+            raise GateError("repo url embeds credentials")
+        if parts.hostname not in allowed_hosts:
+            raise GateError(f"repo host {parts.hostname!r} is not one of "
+                            f"{', '.join(allowed_hosts)}")
+        segments = [p for p in parts.path.split("/") if p]
+        if len(segments) != 2:
+            raise GateError(f"repo path {parts.path!r} is not owner/name")
+        for segment in segments:
+            if not REPO_SEGMENT_RE.match(segment.removesuffix(".git")):
+                raise GateError(f"repo path segment {segment!r} is not a plain "
+                                f"owner or repository name")
+        return url
+    if LOCAL_REPO_RE.match(url):
+        if not Path(url).exists():
+            raise GateError(f"local repo {url!r} does not exist")
+        return url
+    raise GateError(f"repo {url!r} is neither an https url on an allowed host "
+                    f"nor an existing absolute path")
+
+
+NETWORK_GIT_VERBS = ("fetch", "push", "pull", "ls-remote", "clone",
+                     "submodule", "archive")
 
 
 def _git_remote(clone, wcfg, *args, timeout=600, check=True):
@@ -1303,7 +1456,7 @@ def assert_repo_integrity(clone, wcfg):
     """
     clone = Path(clone)
     git_t = int(wcfg.get("git_timeout_s", 600))
-    canonical = _repo_url(wcfg["repo"])
+    canonical = validate_repo_url(wcfg["repo"], wcfg)
 
     dot_git = clone / ".git"
     if not dot_git.is_dir():
@@ -1627,22 +1780,22 @@ def _delete_remote_branch(clone, branch, wcfg, timeout=None):
             f"{type(e).__name__}: {e}")
 
     scratch = Path(clone).parent / f"cleanup-{uuid.uuid4().hex[:8]}"
-    env = dict(os.environ)
-    env["GIT_CONFIG_GLOBAL"] = os.devnull
-    env["GIT_CONFIG_SYSTEM"] = os.devnull
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    env = controller_git_env()
     try:
+        canonical = validate_repo_url(wcfg["repo"], wcfg)
         scratch.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["git", "init", "-q"], cwd=str(scratch), env=env,
-                       capture_output=True, text=True, timeout=timeout,
-                       check=True)
-        subprocess.run(["git", "push", canonical, "--delete", branch],
-                       cwd=str(scratch), env=env, capture_output=True,
-                       text=True, timeout=timeout, check=True)
-        left = subprocess.run(["git", "ls-remote", "--heads", canonical, branch],
-                              cwd=str(scratch), env=env, capture_output=True,
-                              text=True, timeout=timeout)
-        if left.stdout.strip():
+        _git(scratch, "init", "-q", timeout=timeout, env=env)
+        # sanctioned-network-git: a fresh empty repo with no origin to
+        # verify, addressing the validated canonical url explicitly, in the
+        # sanitized environment. This is the path that exists BECAUSE the
+        # clone could not be trusted.
+        _git(scratch, "push", canonical, "--delete", branch, timeout=timeout,
+             env=env)
+        # sanctioned-network-git: read-back confirmation on the same
+        # sanitized repo and the same validated url.
+        left = _git(scratch, "ls-remote", "--heads", canonical, branch,
+                    timeout=timeout, env=env, check=False)
+        if left.strip():
             log(f"branch {branch} still exists on {canonical} after deletion")
             return False
         log(f"deleted {branch} from {canonical} through a sanitized repository")
@@ -2398,16 +2551,43 @@ def _make_workspace(wcfg):
 
 
 def _clone_repo(wcfg, clone):
-    """A clone the worker made, so the model never sees a real checkout."""
+    """Build the controller's clone without ever running `git clone`.
+
+    `git clone <url>` reads global and system config BEFORE it resolves the
+    url, so an `url.<attacker>.insteadOf <canonical>` rewrite produced a
+    flawless clone of somebody else's repository — and the integrity check,
+    which reads local config, then confirmed it. The repository has to be
+    assembled by the controller instead:
+
+      init an empty repo -> set origin to the validated canonical url ->
+      verify integrity (now meaningful: the config is ours and nothing has
+      touched the network) -> fetch through the chokepoint -> check out.
+
+    Every one of those commands runs in the sanitized environment, so no
+    rewrite, proxy, helper, template or alternates file from outside can
+    take part.
+    """
+    clone = Path(clone)
+    canonical = validate_repo_url(wcfg["repo"], wcfg)
+    base = wcfg.get("base_branch", "main")
+    git_t = int(wcfg.get("git_timeout_s", 600))
     depth = int(wcfg.get("clone_depth", 50) or 0)
-    args = ["clone"]
+
+    clone.mkdir(parents=True, exist_ok=True)
+    _git(clone, "init", "-q", "-b", base, timeout=git_t)
+    _git(clone, "config", "remote.origin.url", canonical, timeout=git_t)
+    _git(clone, "config", "remote.origin.fetch",
+         f"+refs/heads/{base}:refs/remotes/origin/{base}", timeout=git_t)
+    # Before the first network byte, not after it.
+    assert_repo_integrity(clone, wcfg)
+
+    fetch_args = ["fetch", "--no-tags"]
     if depth > 0:
-        args += ["--depth", str(depth)]
-    args += ["--branch", wcfg.get("base_branch", "main"),
-             _repo_url(wcfg["repo"]), str(clone)]
-    _git(Path(clone).parent, *args, timeout=int(wcfg.get("git_timeout_s", 600)))
-    return _git(clone, "rev-parse", "HEAD",
-                timeout=int(wcfg.get("git_timeout_s", 600))).strip()
+        fetch_args += ["--depth", str(depth)]
+    fetch_args += ["origin", base]
+    _git_remote(clone, wcfg, *fetch_args, timeout=git_t)
+    _git(clone, "checkout", "-q", "-B", base, f"origin/{base}", timeout=git_t)
+    return _git(clone, "rev-parse", "HEAD", timeout=git_t).strip()
 
 
 def _repo_url(repo):

