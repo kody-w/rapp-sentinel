@@ -85,7 +85,8 @@
       "github.com"
     ],
     "git_binary": "",
-    "gh_binary": ""
+    "gh_binary": "",
+    "creative_history_limit": 50
   },
   "smoke_enabled": true,
   "daily_smoke_budget": 1,

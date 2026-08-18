@@ -2551,7 +2551,7 @@ class CreativeContinuityTests(unittest.TestCase):
     def test_a_gapped_history_fails_closed(self):
         with self.assertRaises(EW.LedgerError) as cm:
             EW.next_creative_cycle({"cycles": [{"cycle": 1}, {"cycle": 3}]})
-        self.assertIn("not 1..N", str(cm.exception))
+        self.assertIn("contiguous run", str(cm.exception))
 
     def test_nonsense_types_fail_closed(self):
         for state in ({"cycle": "two"}, {"last_cycle": -1}, {"cycles": "many"},
@@ -2591,12 +2591,160 @@ class CreativeContinuityTests(unittest.TestCase):
         self.assertEqual([1], [c["cycle"] for c in merged["cycles"]])
         self.assertEqual("redone", merged["cycles"][0]["slug"])
 
-    def test_history_is_bounded(self):
-        state = {"cycles": [{"cycle": i, "slug": f"s{i}"} for i in range(1, 61)],
-                 "last_cycle": 60}
+    def test_history_is_bounded_and_still_readable(self):
+        state = {"cycles": [{"cycle": i, "slug": f"s{i}"}
+                            for i in range(11, 61)],
+                 "cycle": 60, "last_cycle": 60, "last_slug": "s60"}
         merged = EW.merge_creative_state(state, {}, 61, "new", {})
-        self.assertEqual(50, len(merged["cycles"]))
+        self.assertEqual(EW.CREATIVE_HISTORY_LIMIT, len(merged["cycles"]))
         self.assertEqual(61, merged["cycles"][-1]["cycle"])
+        self.assertEqual(12, merged["cycles"][0]["cycle"])
+        self.assertEqual((62, "new"), EW.next_creative_cycle(merged),
+                         "the writer must produce state the reader accepts")
+
+
+class LongHorizonContinuityTests(unittest.TestCase):
+    """The ledger must still be readable after the history is truncated.
+
+    The writer kept the last 50 cycles; the reader demanded 1..N. The first
+    state written after cycle 50 was therefore one the worker itself refused
+    to read — an instance that bricks its own continuity at cycle 51, on a
+    long-lived install, which is the worst possible place for it to surface.
+    """
+
+    LIMIT = EW.CREATIVE_HISTORY_LIMIT
+
+    def run_cycles(self, count, state=None):
+        state = dict(state or {})
+        for n in range(1, count + 1):
+            nxt, previous = EW.next_creative_cycle(state)
+            self.assertEqual(n, nxt, f"cycle {n} computed as {nxt}")
+            if n > 1:
+                self.assertEqual(f"piece-{n - 1}", previous)
+            state = EW.merge_creative_state(state, {"notes": f"n{n}"}, n,
+                                            f"piece-{n}",
+                                            {"merge_commit": f"c{n}"})
+        return state
+
+    def test_sixty_one_cycles_round_trip(self):
+        state = self.run_cycles(61)
+        self.assertEqual((62, "piece-61"), EW.next_creative_cycle(state))
+        self.assertEqual(self.LIMIT, len(state["cycles"]))
+        self.assertEqual(61, state["cycle"])
+        self.assertEqual(61, state["last_cycle"])
+        self.assertEqual("piece-61", state["last_slug"])
+
+    def test_two_hundred_cycles_round_trip(self):
+        state = self.run_cycles(200)
+        self.assertEqual((201, "piece-200"), EW.next_creative_cycle(state))
+        self.assertEqual(list(range(151, 201)),
+                         [c["cycle"] for c in state["cycles"]])
+
+    def test_the_boundary_at_fifty_is_still_a_prefix(self):
+        state = self.run_cycles(self.LIMIT)
+        self.assertEqual(1, state["cycles"][0]["cycle"])
+        self.assertEqual(self.LIMIT, len(state["cycles"]))
+        self.assertEqual((self.LIMIT + 1, f"piece-{self.LIMIT}"),
+                         EW.next_creative_cycle(state))
+
+    def test_the_boundary_at_fifty_one_becomes_a_tail(self):
+        state = self.run_cycles(self.LIMIT + 1)
+        self.assertEqual(2, state["cycles"][0]["cycle"],
+                         "the tail drops exactly one cycle")
+        self.assertEqual(self.LIMIT + 1, state["cycles"][-1]["cycle"])
+        self.assertEqual((self.LIMIT + 2, f"piece-{self.LIMIT + 1}"),
+                         EW.next_creative_cycle(state))
+
+    def test_every_state_written_is_readable(self):
+        state = {}
+        for n in range(1, 121):
+            state = EW.merge_creative_state(state, {}, n, f"p{n}",
+                                            {"merge_commit": "x"})
+            completed, previous = EW.creative_position(state)
+            self.assertEqual(n, completed, f"unreadable after cycle {n}")
+            self.assertEqual(f"p{n}", previous)
+
+    # ── tails that cannot be trusted ──
+    def tail(self, first, length, counter):
+        return {"cycles": [{"cycle": c, "slug": f"p{c}"}
+                           for c in range(first, first + length)],
+                "cycle": counter, "last_cycle": counter}
+
+    def test_a_tail_without_a_counter_fails_closed(self):
+        state = {"cycles": [{"cycle": c, "slug": f"p{c}"}
+                            for c in range(12, 62)]}
+        with self.assertRaises(EW.LedgerError) as cm:
+            EW.next_creative_cycle(state)
+        self.assertIn("no 'cycle' or 'last_cycle'", str(cm.exception))
+
+    def test_a_short_tail_fails_closed(self):
+        with self.assertRaises(EW.LedgerError) as cm:
+            EW.next_creative_cycle(self.tail(40, 10, 49))
+        self.assertIn(f"exactly {self.LIMIT} long", str(cm.exception))
+
+    def test_a_tail_that_does_not_end_at_the_counter_fails_closed(self):
+        with self.assertRaises(EW.LedgerError) as cm:
+            EW.next_creative_cycle(self.tail(12, self.LIMIT, 75))
+        self.assertIn("ends at cycle 61", str(cm.exception))
+
+    def test_a_tail_that_starts_in_the_wrong_place_fails_closed(self):
+        state = self.tail(20, self.LIMIT, 69)
+        state["cycles"] = state["cycles"][:-1] + [{"cycle": 69, "slug": "x"}]
+        state["cycles"] = [{"cycle": c, "slug": f"p{c}"}
+                           for c in range(20, 20 + self.LIMIT)]
+        state["cycle"] = state["last_cycle"] = 70
+        with self.assertRaises(EW.LedgerError):
+            EW.next_creative_cycle(state)
+
+    def test_a_gapped_history_fails_closed_either_way(self):
+        for state in ({"cycles": [{"cycle": 1}, {"cycle": 3}]},
+                      {"cycles": [{"cycle": 12}, {"cycle": 14}],
+                       "cycle": 14, "last_cycle": 14}):
+            with self.subTest(state=state):
+                with self.assertRaises(EW.LedgerError) as cm:
+                    EW.next_creative_cycle(state)
+                self.assertIn("contiguous run", str(cm.exception))
+
+    def test_an_out_of_order_history_fails_closed(self):
+        state = {"cycles": [{"cycle": 2}, {"cycle": 1}], "cycle": 2,
+                 "last_cycle": 2}
+        with self.assertRaises(EW.LedgerError) as cm:
+            EW.next_creative_cycle(state)
+        self.assertIn("strictly ordered", str(cm.exception))
+
+    def test_a_duplicate_cycle_fails_closed(self):
+        state = {"cycles": [{"cycle": 1}, {"cycle": 1}], "cycle": 1}
+        with self.assertRaises(EW.LedgerError):
+            EW.next_creative_cycle(state)
+
+    def test_a_prefix_shorter_than_the_counter_is_still_allowed(self):
+        # legacy states recorded only some cycles; a prefix does not claim
+        # to be the whole history the way a tail does
+        self.assertEqual((6, "p2"),
+                         EW.next_creative_cycle({"cycles": [{"cycle": 1, "slug": "p1"},
+                                                            {"cycle": 2, "slug": "p2"}],
+                                                 "last_cycle": 5}))
+
+    def test_the_limit_is_one_constant_shared_by_reader_and_writer(self):
+        merged = EW.merge_creative_state({}, {}, 1, "p1", {})
+        for n in range(2, self.LIMIT + 20):
+            merged = EW.merge_creative_state(merged, {}, n, f"p{n}", {})
+        self.assertLessEqual(len(merged["cycles"]), self.LIMIT)
+        self.assertEqual(EW.history_limit(), self.LIMIT)
+
+    def test_a_configured_limit_is_honoured_by_both_halves(self):
+        wcfg = {"creative_history_limit": 3}
+        state = {}
+        for n in range(1, 9):
+            nxt, _ = EW.next_creative_cycle(state, wcfg)
+            self.assertEqual(n, nxt)
+            state = EW.merge_creative_state(state, {}, n, f"p{n}", {}, wcfg)
+        self.assertEqual([6, 7, 8], [c["cycle"] for c in state["cycles"]])
+        self.assertEqual((9, "p8"), EW.next_creative_cycle(state, wcfg))
+
+    def test_a_nonpositive_configured_limit_fails_closed(self):
+        with self.assertRaises(EW.LedgerError):
+            EW.history_limit({"creative_history_limit": 0})
 
 
 class LiveRetryTests(WorkerEnv):

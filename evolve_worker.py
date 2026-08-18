@@ -1406,51 +1406,82 @@ META_NAME = "meta.json"
 STATE_OUT_NAME = "state-out.json"
 
 
+# One number, used by the writer and the reader. They disagreed before: the
+# writer kept the last 50 cycles, the reader demanded 1..N, so the first state
+# written after cycle 50 was one the worker itself refused to read — a ledger
+# that bricks its own instance at cycle 51 and only on a long-lived install,
+# which is the worst possible time to find out.
+CREATIVE_HISTORY_LIMIT = 50
+
+
+def history_limit(wcfg=None):
+    raw = (wcfg or {}).get("creative_history_limit")
+    if raw is None:
+        return CREATIVE_HISTORY_LIMIT
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise LedgerError(f"creative_history_limit {raw!r} is not an integer")
+    if raw < 1:
+        raise LedgerError(f"creative_history_limit {raw} is not positive")
+    return raw
+
+
 def _cycle_entries(state):
-    """The legacy `cycles` list, validated. Anything odd fails closed."""
+    """The `cycles` list, validated row by row. Anything odd fails closed."""
     raw = state.get("cycles")
     if raw is None:
         return []
     if not isinstance(raw, list):
         raise LedgerError("creative state 'cycles' is not a list")
     entries = []
-    for i, row in enumerate(raw, start=1):
+    for i, row in enumerate(raw):
         if not isinstance(row, dict):
-            raise LedgerError(f"creative state cycles[{i - 1}] is not an object")
-        number = row.get("cycle", row.get("n", i))
+            raise LedgerError(f"creative state cycles[{i}] is not an object")
+        number = row.get("cycle", row.get("n"))
         if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-            raise LedgerError(f"creative state cycles[{i - 1}].cycle is "
+            raise LedgerError(f"creative state cycles[{i}].cycle is "
                               f"{number!r}, not a positive integer")
         entries.append({**row, "cycle": number})
     return entries
 
 
-def creative_position(state):
+def _validated_history(state, limit):
+    """The history as a strictly ordered, unique, contiguous run.
+
+    Two shapes are legitimate and they are not interchangeable:
+
+      * a PREFIX starting at 1 — everything this instance has ever done.
+      * a SUFFIX starting above 1 — the bounded tail this loop keeps. A tail
+        is only readable if it says where it ends: it must carry an explicit
+        canonical counter, be exactly `limit` long, end AT that counter, and
+        therefore start at counter - limit + 1. A short or gapped tail is
+        indistinguishable from a corrupted history, so it fails closed rather
+        than being guessed at.
+    """
+    entries = _cycle_entries(state)
+    if not entries:
+        return entries, None
+    numbers = [e["cycle"] for e in entries]
+    expected = list(range(numbers[0], numbers[0] + len(numbers)))
+    if numbers != expected:
+        raise LedgerError(f"creative state cycles are not a strictly ordered "
+                          f"contiguous run: {numbers}")
+    return entries, numbers
+
+
+def creative_position(state, wcfg=None):
     """(completed_cycle, previous_slug) from any state this loop has written.
 
-    The live instance carried `{"cycles": [...], "last_cycle": 1}` from an
-    earlier shape, and the worker read `cycle` with a default of 0 — so it
-    proposed cycle 1 again, against a commons that already had cycle 1. A
-    default is a guess, and a guess about continuity is exactly the thing this
-    ledger exists to prevent.
-
-    Canonical order: `cycle`, else `last_cycle`, else the highest number in
-    `cycles`. Fields that disagree are not reconciled quietly — they fail
-    closed, because "which of these two numbers is the truth" is not a
-    question this code gets to answer on its own.
+    Canonical order: `cycle`, else `last_cycle`, else the history itself.
+    Fields that disagree are not reconciled quietly — they fail closed,
+    because "which of these numbers is the truth" is not a question this code
+    gets to answer on its own.
     """
     if not isinstance(state, dict):
         raise LedgerError("creative state is not an object")
     if not state:
         return 0, None
-
-    entries = _cycle_entries(state)
-    from_entries = max((e["cycle"] for e in entries), default=None)
-    if entries and from_entries != len(entries):
-        # A gap or a duplicate: the list cannot vouch for its own count.
-        numbers = sorted(e["cycle"] for e in entries)
-        if numbers != list(range(1, len(numbers) + 1)):
-            raise LedgerError(f"creative state cycles are not 1..N: {numbers}")
+    limit = history_limit(wcfg)
+    entries, numbers = _validated_history(state, limit)
 
     declared = []
     for key in ("cycle", "last_cycle"):
@@ -1464,16 +1495,38 @@ def creative_position(state):
     if len({v for _, v in declared}) > 1:
         raise LedgerError(f"creative state disagrees with itself: "
                           f"{', '.join(f'{k}={v}' for k, v in declared)}")
-    completed = declared[0][1] if declared else from_entries
+    counter = declared[0][1] if declared else None
+
+    if numbers and numbers[0] > 1:
+        if counter is None:
+            raise LedgerError(
+                f"creative state holds a bounded tail starting at cycle "
+                f"{numbers[0]} with no 'cycle' or 'last_cycle' to say where it "
+                f"ends")
+        if len(numbers) != limit:
+            raise LedgerError(
+                f"creative state holds {len(numbers)} cycles starting at "
+                f"{numbers[0]}; a tail must be exactly {limit} long")
+        if numbers[-1] != counter:
+            raise LedgerError(
+                f"creative state's tail ends at cycle {numbers[-1]} but the "
+                f"counter says {counter}")
+        if numbers[0] != counter - limit + 1:
+            raise LedgerError(
+                f"creative state's tail starts at {numbers[0]}, expected "
+                f"{counter - limit + 1} for a {limit}-cycle tail ending at "
+                f"{counter}")
+
+    completed = counter if counter is not None else (numbers[-1] if numbers else None)
     if completed is None:
         raise LedgerError("creative state has no cycle, last_cycle or cycles")
-    if from_entries is not None and completed < from_entries:
+    if numbers and completed < numbers[-1]:
         raise LedgerError(f"creative state says cycle {completed} but its "
-                          f"cycles list reaches {from_entries}")
+                          f"cycles list reaches {numbers[-1]}")
 
     previous = state.get("last_slug")
     if previous is None:
-        for entry in sorted(entries, key=lambda e: e["cycle"], reverse=True):
+        for entry in reversed(entries):
             candidate = entry.get("slug") or entry.get("last_slug")
             if isinstance(candidate, str) and candidate:
                 previous = candidate
@@ -1483,22 +1536,24 @@ def creative_position(state):
     return completed, previous
 
 
-def next_creative_cycle(state):
+def next_creative_cycle(state, wcfg=None):
     """What the next cycle number and previous slug must be."""
-    completed, previous = creative_position(state)
+    completed, previous = creative_position(state, wcfg)
     return completed + 1, previous
 
 
-def merge_creative_state(previous_state, next_state, cycle, slug, receipts):
+def merge_creative_state(previous_state, next_state, cycle, slug, receipts,
+                         wcfg=None):
     """The state to write after a verified merge, preserving legacy history.
 
-    An instance that has been running carries a `cycles` list nobody asked
-    this worker to understand. Dropping it would erase the collective's own
-    record of itself to make the schema tidier, so it is carried forward and
-    appended to, with the canonical fields written unambiguously.
+    Writes what the reader requires: a strictly ordered contiguous tail of at
+    most `limit` cycles, ending at the cycle just merged, with `cycle`,
+    `last_cycle` and `last_slug` all saying the same thing. The two halves of
+    this ledger now share one constant instead of two opinions.
     """
+    limit = history_limit(wcfg)
     merged = dict(next_state or {})
-    entries = _cycle_entries(previous_state or {})
+    entries, _ = _validated_history(previous_state or {}, limit)
     entries = [e for e in entries if e.get("cycle") != cycle]
     entries.append({
         "cycle": cycle,
@@ -1507,7 +1562,15 @@ def merge_creative_state(previous_state, next_state, cycle, slug, receipts):
         "pr": receipts.get("pr_url", ""),
         "at": sentinel.now().isoformat(timespec="seconds"),
     })
-    merged["cycles"] = sorted(entries, key=lambda e: e["cycle"])[-50:]
+    entries.sort(key=lambda e: e["cycle"])
+    # Keep the tail contiguous: an older run with a gap in it cannot be
+    # carried forward as history, because the reader would refuse it.
+    tail = [entries[-1]]
+    for entry in reversed(entries[:-1]):
+        if entry["cycle"] != tail[0]["cycle"] - 1 or len(tail) >= limit:
+            break
+        tail.insert(0, entry)
+    merged["cycles"] = tail
     merged["cycle"] = cycle
     merged["last_cycle"] = cycle
     merged["last_slug"] = slug
@@ -2569,7 +2632,7 @@ def finalize_success(cfg, wcfg, history, row, submission, receipts, next_state,
     atomic_write_json(state_path,
                       merge_creative_state(previous_state, next_state,
                                            expected_cycle, submission["slug"],
-                                           receipts))
+                                           receipts, wcfg))
     return _finish(cfg, wcfg, history, row, OUTCOME_CONTRIBUTED,
                    f"{submission['title']} ({submission['slug']}) merged as "
                    f"{receipts['merge_commit'][:12]}", receipts, submission)
@@ -2635,7 +2698,7 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
 
         state_path = HOME / str(wcfg["creative_state_file"])
         creative = strict_load(state_path, {}, expect=dict)
-        expected_cycle, expected_previous = next_creative_cycle(creative)
+        expected_cycle, expected_previous = next_creative_cycle(creative, wcfg)
 
         fcfg = SS.fanout_config(wcfg)
         if dry_run:
