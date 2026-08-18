@@ -111,16 +111,21 @@ def _queue_lines_unlocked():
             if line.strip()]
 
 
-def _rewrite_queue_unlocked(lines):
-    """Atomic rewrite so appenders never lose their writes."""
-    QUEUE.parent.mkdir(parents=True, exist_ok=True)
+def _rewrite_lines_unlocked(path, lines):
+    """Atomically rewrite one JSONL ledger while its caller holds the lock."""
+    path.parent.mkdir(parents=True, exist_ok=True)
     data = "".join(line + "\n" for line in lines)
-    tmp = QUEUE.with_name(f"{QUEUE.name}.tmp.{os.getpid()}.{time.time_ns()}")
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{time.time_ns()}")
     try:
         tmp.write_text(data, encoding="utf-8")
-        os.replace(tmp, QUEUE)
+        os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def _rewrite_queue_unlocked(lines):
+    """Atomic rewrite so appenders never lose their writes."""
+    _rewrite_lines_unlocked(QUEUE, lines)
 
 
 def enqueue(text, to, attachments=None):

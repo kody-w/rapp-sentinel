@@ -5,6 +5,7 @@ import os
 import plistlib
 import re
 import socketserver
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,7 @@ import retro
 import sentinel
 import serve
 import standup
+import verify_outbox
 import watcher_outbox
 
 
@@ -538,6 +540,131 @@ class WatcherOutboxTests(unittest.TestCase):
 
         self.assertEqual(["do not send"],
                          [row["text"] for row in outbox._pending()])
+
+
+class VerifyOutboxTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        root = Path(self.temp.name)
+        self.old = (
+            outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
+            outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
+            outbox.DEAD_LETTER, verify_outbox.CHAT_DB)
+        outbox.QUEUE = root / "outbox.jsonl"
+        outbox.SENT = root / "sent.jsonl"
+        outbox.LAST_DRAIN = root / "last.json"
+        outbox.REPORTS = root / "reports"
+        outbox.LOCK = root / "outbox.lock"
+        outbox.DRAIN_LOCK = root / "outbox-drain.lock"
+        outbox.UNVERIFIED = root / "outbox-unverified.jsonl"
+        outbox.DEAD_LETTER = root / "outbox-dead-letter.jsonl"
+        outbox.REPORTS.mkdir()
+        verify_outbox.CHAT_DB = root / "chat.db"
+        self.connection = sqlite3.connect(verify_outbox.CHAT_DB)
+        self.connection.executescript("""
+            CREATE TABLE handle (ROWID INTEGER PRIMARY KEY, id TEXT);
+            CREATE TABLE message (
+              ROWID INTEGER PRIMARY KEY,
+              handle_id INTEGER,
+              is_from_me INTEGER,
+              is_sent INTEGER,
+              is_delivered INTEGER,
+              error INTEGER,
+              date INTEGER,
+              text TEXT,
+              attributedBody BLOB
+            );
+            INSERT INTO handle (ROWID, id) VALUES (1, 'recipient');
+        """)
+        self.attempted = datetime(
+            2026, 8, 17, 22, 0, tzinfo=timezone.utc)
+
+    def tearDown(self):
+        self.connection.close()
+        (outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
+         outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
+         outbox.DEAD_LETTER, verify_outbox.CHAT_DB) = self.old
+        self.temp.cleanup()
+
+    @staticmethod
+    def _archive(text):
+        encoded = text.encode("utf-8")
+        if len(encoded) < 0x81:
+            prefix = bytes([len(encoded)])
+        else:
+            prefix = b"\x82" + len(encoded).to_bytes(2, "little")
+        return b"archive NSString fields +" + prefix + encoded + b" tail"
+
+    def _queue_uncertain(self, text="art link"):
+        outbox.UNVERIFIED.write_text(json.dumps({
+            "at": self.attempted.isoformat(),
+            "attempted_at": self.attempted.isoformat(),
+            "to": "recipient",
+            "text": text,
+            "attachments": [],
+            "reason": "chat.db unreadable",
+        }) + "\n", encoding="utf-8")
+
+    def _insert_delivery(self, text="art link", offset_seconds=1):
+        apple = int((
+            self.attempted.timestamp()
+            - verify_outbox.APPLE_EPOCH_OFFSET
+            + offset_seconds
+        ) * 1_000_000_000)
+        self.connection.execute(
+            "INSERT INTO message VALUES (1,1,1,1,1,0,?,NULL,?)",
+            (apple, self._archive(text)),
+        )
+        self.connection.commit()
+
+    def test_delivered_attributed_body_verifies_uncertain_send(self):
+        self._queue_uncertain()
+        self._insert_delivery()
+
+        verified, remaining = verify_outbox.verify()
+
+        self.assertEqual((1, 0), (verified, remaining))
+        self.assertEqual("", outbox.UNVERIFIED.read_text())
+        sent = json.loads(outbox.SENT.read_text().splitlines()[0])
+        self.assertEqual("Messages/chat.db",
+                         sent["delivery_evidence"]["source"])
+        self.assertEqual(1.0, sent["delivery_evidence"]["delta_seconds"])
+
+    def test_content_mismatch_remains_unverified(self):
+        self._queue_uncertain()
+        self._insert_delivery("different")
+
+        verified, remaining = verify_outbox.verify()
+
+        self.assertEqual((0, 1), (verified, remaining))
+        self.assertFalse(outbox.SENT.exists())
+
+    def test_duplicate_matching_rows_fail_closed(self):
+        self._queue_uncertain()
+        self._insert_delivery(offset_seconds=1)
+        apple = int((
+            self.attempted.timestamp()
+            - verify_outbox.APPLE_EPOCH_OFFSET
+            + 2
+        ) * 1_000_000_000)
+        self.connection.execute(
+            "INSERT INTO message VALUES (2,1,1,1,1,0,?,NULL,?)",
+            (apple, self._archive("art link")),
+        )
+        self.connection.commit()
+
+        verified, remaining = verify_outbox.verify()
+
+        self.assertEqual((0, 1), (verified, remaining))
+
+    def test_unreadable_database_never_mutates_ledger(self):
+        self._queue_uncertain()
+        self.connection.close()
+        verify_outbox.CHAT_DB = Path(self.temp.name) / "missing.db"
+        with self.assertRaises(RuntimeError):
+            verify_outbox.verify()
+        self.assertTrue(outbox.UNVERIFIED.read_text().strip())
+        self.connection = sqlite3.connect(":memory:")
 
 
 class SmokePolicyTests(unittest.TestCase):
