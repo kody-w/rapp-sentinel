@@ -391,6 +391,98 @@ def _spinning_openrappter_jobs():
                 f"{audited} job(s) audited, none spinning")
 
 
+def _git(*args, timeout=25):
+    """(returncode, stdout) for a git command against the CODE checkout.
+
+    Separate from _sh because classification here turns on EXIT STATUS —
+    `merge-base --is-ancestor` says everything in its return code and nothing
+    on stdout. A raise (git absent, wedged, slow remote) becomes (None, "")
+    so the caller reports blind rather than inventing a verdict (#45).
+    """
+    try:
+        r = subprocess.run(("git", "-C", str(CODE)) + args,
+                           capture_output=True, text=True, timeout=timeout)
+        return r.returncode, (r.stdout or "").strip()
+    except Exception:
+        return None, ""
+
+
+def _deployed_code_is_current():
+    """Is the code that is RUNNING the code that was merged? (R2 turned on
+    the watcher itself.)
+
+    Measured incident, 2026-08-17: rb_shards paged critical with a false red.
+    The repair was diagnosed correctly, merged to origin/main as #99, and
+    verified there — and the page kept firing for four more hours, because
+    run.sh is `cd $(dirname $0); python3 sentinel.py` and pulls nothing. The
+    live checkout sat eight commits behind origin/main, so the running process
+    executed the pre-fix file. A second repair attempt then re-derived the
+    same correct diagnosis against an instance that could never show it,
+    which is the loop this check exists to break: a fix that lands on main
+    but never reaches the process is indistinguishable, from inside, from a
+    fix that did not work.
+
+    health.py already names this deploy model out loud — "code arrives by git
+    pull between ticks" — and nothing anywhere asserted that it had. Every
+    other w_ check watches a peer; this one watches the delivery of our own
+    repairs, which is the one outage the rest of the suite structurally
+    cannot see, because a stale instance runs stale checks.
+
+    Read-only about the working tree BY CONSTRUCTION: ls-remote and rev-parse
+    touch no ref, no index and no file, so a checkout full of uncommitted work
+    is never at risk from being watched. That is also why this only reports —
+    pulling is a human's call, and a repair arm that silently upgraded the
+    code it is running would be deploying unreviewed changes to the watcher
+    mid-tick.
+
+    Warn, not critical, and only for BEHIND. Ahead or diverged is a person
+    mid-development, not a stranded repair, and paging on it every tick on
+    the maintainer's own box is how a channel gets ignored (the eco_sweep
+    reasoning). Unknowable states report warn rather than green, because
+    "I could not tell whether my repairs are arriving" is not health.
+    """
+    rc, running = _git("rev-parse", "HEAD")
+    if rc != 0 or not running:
+        return C.fail("w_sentinel_current",
+                      "cannot read running commit - is CODE a git checkout? "
+                      "unable to tell whether merged repairs have arrived",
+                      critical=False)
+    rc, out = _git("ls-remote", "origin", "refs/heads/main")
+    published = out.split()[0] if rc == 0 and out.split() else ""
+    if not published:
+        return C.fail("w_sentinel_current",
+                      f"cannot read origin/main (running {running[:7]}) - "
+                      "unable to tell whether merged repairs have arrived",
+                      critical=False)
+    if running == published:
+        return C.ok("w_sentinel_current",
+                    f"running merged origin/main {running[:7]}")
+    # Objects for a commit merged on the server are not local until something
+    # fetches them. Fetch into FETCH_HEAD only: no branch, no remote-tracking
+    # ref, no index and no working-tree byte moves, so this cannot disturb
+    # uncommitted work.
+    _git("fetch", "--quiet", "origin", "main", timeout=60)
+    rc, _ = _git("cat-file", "-e", published + "^{commit}")
+    if rc != 0:
+        return C.fail("w_sentinel_current",
+                      f"running {running[:7]}, origin/main is {published[:7]} "
+                      "- differs, and the published commit could not be "
+                      "fetched to classify it", critical=False)
+    rc, _ = _git("merge-base", "--is-ancestor", running, published)
+    if rc != 0:
+        return C.ok("w_sentinel_current",
+                    f"running {running[:7]} is not behind origin/main "
+                    f"{published[:7]} (ahead or diverged - local work, "
+                    "not a stranded repair)")
+    rc, behind = _git("rev-list", "--count", f"{running}..{published}")
+    n = behind if rc == 0 and behind else "?"
+    return C.fail("w_sentinel_current",
+                  f"running {running[:7]}, {n} commit(s) behind origin/main "
+                  f"{published[:7]} - merged repairs have not reached this "
+                  "instance; deploy with: git -C "
+                  f"{CODE} pull --ff-only origin main", critical=False)
+
+
 def probe_watchers():
     """The watchers watching the watchmen.
 
@@ -466,6 +558,10 @@ def probe_watchers():
                     else f"last tick {age_m:.0f}m ago")
                if age_m is None or age_m < 90
                else C.fail("w_sentinel_fresh", f"last tick {age_m:.0f}m ago", critical=False))
+
+    # A fresh tick of stale code still reports stale answers: last_run.json
+    # moving proves the loop is alive, never that it is the loop we merged.
+    out.append(_deployed_code_is_current())
     return out, disabled
 
 
