@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """Verify uncertain iMessage sends against Messages' delivered-message ledger."""
 
+import argparse
+import fcntl
 import json
+import os
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -13,6 +17,8 @@ import outbox
 CHAT_DB = outbox.CHAT_DB
 APPLE_EPOCH_OFFSET = 978307200
 MATCH_WINDOW_SECONDS = 15
+VERIFY_LOCK = outbox.STATE / "outbox-verify.lock"
+PID_FILE = outbox.STATE / "outbox-verify.pid"
 
 
 def decode_attributed_body(value):
@@ -169,7 +175,7 @@ def verify():
     return committed, len(kept)
 
 
-def main():
+def verify_once():
     try:
         verified, remaining = verify()
     except Exception as exc:
@@ -177,6 +183,44 @@ def main():
         return 1
     print(f"verified={verified} still_unverified={remaining}")
     return 0
+
+
+def run_loop(interval):
+    VERIFY_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    with open(VERIFY_LOCK, "a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("outbox verifier already running", file=sys.stderr)
+            return 0
+        PID_FILE.write_text(str(os.getpid()) + "\n", encoding="utf-8")
+        try:
+            while True:
+                try:
+                    verified, remaining = verify()
+                    if verified or remaining:
+                        print(
+                            f"{outbox.now()} verified={verified} "
+                            f"still_unverified={remaining}",
+                            flush=True,
+                        )
+                except Exception as exc:
+                    print(f"{outbox.now()} {exc}", file=sys.stderr, flush=True)
+                time.sleep(interval)
+        finally:
+            PID_FILE.unlink(missing_ok=True)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--loop", action="store_true",
+                        help="continuously reconcile retained sends")
+    parser.add_argument("--interval", type=int, default=60,
+                        help="loop interval in seconds (minimum 10)")
+    args = parser.parse_args(argv)
+    if args.loop:
+        return run_loop(max(10, args.interval))
+    return verify_once()
 
 
 if __name__ == "__main__":
