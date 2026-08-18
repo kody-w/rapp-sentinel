@@ -327,32 +327,50 @@ def confined_argv(prompt, model, cwd, tools=(), add_dirs=(), secret_vars=(),
     return argv
 
 
-SANDBOX_PROFILE = """(version 1)
+SANDBOX_PROFILE_HEADER = """(version 1)
 ;; Defence in depth behind the CLI's own permissions: even a tool we did not
-;; expect cannot write outside the workspace. Reads and network stay open
+;; expect cannot write outside the roots below. Reads and network stay open
 ;; because model inference needs both.
+;;
+;; TWO roots, not one. The maker's FILE TOOLS are rooted at staging alone
+;; (--add-dir), but the process itself must write its isolated HOME, XDG,
+;; TMPDIR and CLI logs, which live in a sibling runtime directory on purpose —
+;; so that the tools cannot reach even the model's own process state. A
+;; profile that allowed only staging turned every confined run into a
+;; PermissionError, which is a sandbox that protects nothing because nobody
+;; can leave it on.
+;;
+;; The controller's clone and the operator's real HOME are never roots here.
 (allow default)
 (deny file-write*)
-(allow file-write* (subpath "{workspace}"))
 (allow file-write* (literal "/dev/null") (literal "/dev/dtracehelper"))
-(allow file-write-data (regex #"^/dev/(tty|fd|std(in|out|err))"))
+(allow file-write-data (regex #"^/dev/(tty|fd|std(in|out|err)|null|zero|random|urandom)"))
 """
 
 
-def sandbox_wrap(argv, workspace, enabled):
+def sandbox_profile(write_roots):
+    body = "".join(f'(allow file-write* (subpath "{Path(root).resolve()}"))\n'
+                   for root in write_roots)
+    return SANDBOX_PROFILE_HEADER + body
+
+
+def sandbox_wrap(argv, write_roots, enabled, profile_dir=None):
     """Optionally re-exec the model under macOS sandbox-exec.
 
     Off by default: it is a second belt, and a second belt that silently
     strangles inference would be worse than none. When on, the profile denies
-    every write outside the workspace — which is where the isolated HOME, XDG
-    and temp directories already live.
+    every write outside the listed roots — the sanitized staging directory the
+    model's tools are rooted at, and the runtime directory holding its
+    isolated HOME/XDG/TMPDIR. Never the controller's clone, never a real HOME.
     """
+    roots = [Path(r) for r in (write_roots if isinstance(write_roots, (list, tuple))
+                               else [write_roots])]
     if not enabled:
         return argv
-    workspace = Path(workspace)
-    profile = workspace / "sandbox.sb"
-    profile.write_text(SANDBOX_PROFILE.format(workspace=workspace),
-                       encoding="utf-8")
+    target = Path(profile_dir) if profile_dir else roots[0]
+    target.mkdir(parents=True, exist_ok=True)
+    profile = target / "sandbox.sb"
+    profile.write_text(sandbox_profile(roots), encoding="utf-8")
     return ["/usr/bin/sandbox-exec", "-f", str(profile), *argv]
 
 
@@ -374,6 +392,16 @@ def confined_env(fcfg, workspace, depth, env=None):
     falling back to the real HOME would hand a model the operator's whole
     credential set to save one line of config.
     """
+    # sandbox_exec makes the workspace roots the only writable places. An
+    # un-isolated HOME lives outside them by definition, so the combination
+    # cannot work — and the way it failed was a bare PermissionError with an
+    # empty stderr, which is the worst possible way to learn it.
+    if fcfg.get("sandbox_exec") and not fcfg.get("isolated_home", True):
+        raise AuthUnavailable(
+            "sandbox_exec requires isolated_home: the sandbox only permits "
+            "writes inside the staging and runtime roots, and a shared HOME "
+            "is not one of them")
+
     src = dict(env if env is not None else os.environ)
     out = {k: src[k] for k in ENV_ALLOWLIST if k in src}
     out.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
@@ -731,7 +759,7 @@ def _run_child(spec, fcfg, workspace, cycle, collective, parent_role, prior,
                       or "claude-sonnet-4.6", ws, tools=CHILD_TOOLS,
                       secret_vars=secret_vars_for(fcfg),
                       log_dir=ws / "copilot-logs"),
-        ws, bool(fcfg.get("sandbox_exec")))
+        [ws], bool(fcfg.get("sandbox_exec")))
     result["argv"] = argv
     try:
         proc = subprocess.Popen(argv, cwd=str(ws), env=env,

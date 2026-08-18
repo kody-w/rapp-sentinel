@@ -190,9 +190,16 @@ The worker (`evolve_worker.py`, `com.rapp.evolve-worker`, every 30 min):
 | global cadence + rolling daily budget | shared across roles, in its own ledger, never repair's |
 | fail-closed ledgers | a corrupt or truncated history **stops the pass**; it is never read as "no spend" |
 | health at start, before the push, before the merge | any **critical** check aborts; degraded proceeds only when *every* failing id is in `degraded_allowlist` — `evolve_on_degraded` is ignored here, and `alert_delivery` / `health_runtime` refuse to be allowlisted at all |
-| temp clone | the model works only in a worker-made clone and is told, explicitly, that it may not commit, push, open a PR, or merge |
+| confined model | **no `--allow-all`**: the maker gets bounded file tools rooted at `--add-dir` and no shell, git, gh, MCP or network tool; built-in MCPs, custom instructions, `BASH_ENV`, the system temp dir, remote control and auto-update are off; HOME/XDG/TMPDIR/gh/git config live in a runtime directory the tools cannot reach, behind a strict env allowlist; inference auth is one `--secret-env-vars` variable |
+| sanitized staging | the maker never sees a repository — its root holds only its read context and an empty `out/`, with **no `.git` and no clone metadata**. The controller validates that tree and copies only the two validated files into its own private clone |
+| remote integrity | **every** network git call — fetch, push, and branch cleanup — goes through one chokepoint that first rejects any `remote.origin.pushurl`, unexpected local config (`core.hooksPath`, `url.*.insteadOf`, `credential.*`, …), `objects/info/alternates` and executable hooks, then resets and re-reads origin's fetch and push URLs |
+| honest cleanup | if the clone no longer verifies, an abandoned branch is deleted from the canonical URL through a fresh repository with global/system git config neutralised, then confirmed with `ls-remote` — an injected remote is never contacted, and a real branch is never left orphaned |
+| tracked process tree | maker and children each get their own process group; a timeout or SIGTERM kills the tree, then the workspace is deleted, and only then is the lock released |
+| verified index | the git **index** is checked before the push — exactly two `100644` blobs whose bytes are the bytes that passed the gate |
+| reconciliation | a cycle killed between `gh pr merge` and the ledger write is finished (or its PR closed) on the next pass, from the PR and `origin/main` |
+| liveness | every pass writes a heartbeat, and `w_evolve_worker` reports enabled-but-never-loaded or stale |
 | bounded sub-sentinel fan-out | optional: 3-5 read-only children in separate processes with no repo, no token and no ability to spawn children, aggregated deterministically into exactly 10 finalists — see below |
-| deterministic gate | exactly one new `submissions/<slug>/`, exactly `meta.json` + `piece.<ext>`, no existing path touched, valid slug/schema/kind/extension/license, piece ≤ 50 KB, SVG parses with no script, no `on*` handler and no external reference, and `_dada_cycle` proving 1-5 rounds of **exactly 10** scored candidates with a winner that names the piece |
+| deterministic gate | exactly **two root-level regular files** (`lstat`: no symlink, no hardlink, no fifo, not executable, nothing nested) in one new `submissions/<slug>/`, valid slug/schema/kind/extension/license, piece ≤ 50 KB, SVG parses with no script, no `on*` handler and no external reference (including CSS), and `_dada_cycle` proving 1-5 rounds of **exactly 10** scored candidates whose round one reproduces the finalist records by digest |
 | controller-owned publish | the branch, commit, PR, PR **file scope as GitHub reports it**, squash merge, and the re-read of `origin/main` and the merge commit afterwards are all done by code |
 | honest outcomes | only a re-read merge sends a 🎨; a timeout, failure, rejection or decline is recorded as what it was |
 | one text per merge | a verified merge sends exactly one iMessage: title, a tappable Pages URL for the piece itself, the GitHub source and PR URLs, and one sentence of concept — see below |
@@ -334,7 +341,14 @@ Honest limits:
   deliberate.
 - `sandbox_exec` (macOS `sandbox-exec` file-write confinement) is available
   and off by default: tool and path restriction is the mandatory layer, and a
-  second belt that silently strangled inference would be worse than none.
+  second belt that silently strangled inference would be worse than none. Its
+  profile permits writes to exactly two roots — the sanitized staging
+  directory and the sibling runtime directory holding the isolated
+  HOME/XDG/TMPDIR — and never the controller's clone or the operator's real
+  HOME. It therefore **requires `isolated_home`** (and so the inference
+  credential): a shared `~/.copilot` is outside every writable root, and that
+  combination is refused up front instead of failing later as a bare
+  PermissionError.
 
 ---
 

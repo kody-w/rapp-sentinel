@@ -177,6 +177,112 @@ class BaselineEnrolmentTests(unittest.TestCase):
                          "a test module exists that the baseline never runs")
 
 
+@unittest.skipUnless(sys.platform == "darwin" and
+                     Path("/usr/bin/sandbox-exec").exists(),
+                     "sandbox-exec is macOS only")
+class SandboxProfileProbes(unittest.TestCase):
+    """The sandbox profile, exercised by real processes under real sandbox-exec.
+
+    No model calls: this is about whether the profile the code generates
+    actually permits what a confined run needs and forbids what it must. The
+    bug it exists to prevent is the one that shipped — a profile that allowed
+    only the staging directory while HOME, XDG, TMPDIR and the CLI's logs live
+    in the sibling runtime directory, so every sandboxed run died with
+    PermissionError and the feature could never be turned on.
+    """
+
+    def setUp(self):
+        self.workspace = scratch_dir("sandbox")
+        self.staging = self.workspace / "staging"
+        self.runtime = self.workspace / "runtime"
+        self.clone = self.workspace / "clone"
+        for path in (self.staging / "out", self.runtime, self.clone / ".git"):
+            path.mkdir(parents=True, exist_ok=True)
+        (self.clone / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+        self.addCleanup(shutil.rmtree, self.workspace, True)
+
+    def run_sandboxed(self, script, roots=None):
+        argv = SS.sandbox_wrap(["/bin/sh", "-c", script],
+                               roots or [self.staging, self.runtime],
+                               True, profile_dir=self.runtime)
+        self.assertEqual("/usr/bin/sandbox-exec", argv[0])
+        return subprocess.run(argv, capture_output=True, text=True, timeout=60)
+
+    def test_the_runtime_home_is_writable(self):
+        target = self.runtime / "home" / ".copilot" / "state.json"
+        proc = self.run_sandboxed(
+            f"mkdir -p {target.parent} && echo ok > {target}")
+        self.assertEqual(0, proc.returncode, proc.stderr[:300])
+        self.assertTrue(target.is_file(),
+                        "an isolated HOME the model cannot write is not a HOME")
+
+    def test_the_staging_output_is_writable(self):
+        target = self.staging / "out" / "submissions" / "x" / "piece.svg"
+        proc = self.run_sandboxed(f"mkdir -p {target.parent} && echo ok > {target}")
+        self.assertEqual(0, proc.returncode, proc.stderr[:300])
+        self.assertTrue(target.is_file())
+
+    def test_the_controller_clone_is_not_writable(self):
+        target = self.clone / ".git" / "probe.txt"
+        proc = self.run_sandboxed(f"echo pwned > {target}")
+        self.assertNotEqual(0, proc.returncode,
+                            "a sibling clone must not be writable")
+        self.assertFalse(target.exists())
+
+    def test_the_clone_config_cannot_be_appended_to(self):
+        config = self.clone / ".git" / "config"
+        proc = self.run_sandboxed(
+            f"printf 'pushurl = https://attacker.example/x.git\\n' >> {config}")
+        self.assertNotEqual(0, proc.returncode)
+        self.assertNotIn("attacker.example",
+                         config.read_text(encoding="utf-8"))
+
+    def test_the_real_home_is_not_writable(self):
+        target = Path.home() / ".rapp-sandbox-probe-should-not-exist"
+        proc = self.run_sandboxed(f"echo pwned > {target}")
+        self.assertNotEqual(0, proc.returncode, "the operator's HOME is not a root")
+        self.assertFalse(target.exists())
+
+    def test_reads_and_the_profile_itself_still_work(self):
+        proc = self.run_sandboxed(f"cat {self.clone}/.git/config > /dev/null")
+        self.assertEqual(0, proc.returncode,
+                         "reads stay open; inference needs them")
+
+    def test_the_profile_names_both_roots_and_neither_clone_nor_home(self):
+        profile = SS.sandbox_profile([self.staging, self.runtime])
+        self.assertIn(f'(subpath "{self.staging.resolve()}")', profile)
+        self.assertIn(f'(subpath "{self.runtime.resolve()}")', profile)
+        self.assertIn("(deny file-write*)", profile)
+        self.assertNotIn(str(self.clone.resolve()), profile)
+        self.assertNotIn(f'(subpath "{Path.home()}")', profile)
+
+    def test_sandbox_with_a_shared_home_is_refused_not_broken(self):
+        cfg = SS.fanout_config({"fanout": {"sandbox_exec": True,
+                                           "isolated_home": False}})
+        with self.assertRaises(SS.AuthUnavailable) as cm:
+            SS.confined_env(cfg, self.runtime, 0, env={"HOME": "/Users/x"})
+        self.assertIn("sandbox_exec requires isolated_home", str(cm.exception))
+
+    def test_sandbox_with_an_isolated_home_builds_a_writable_environment(self):
+        cfg = SS.fanout_config({"fanout": {"sandbox_exec": True,
+                                           "isolated_home": True}})
+        env = SS.confined_env(cfg, self.runtime, 0,
+                              env={"COPILOT_GITHUB_TOKEN": "t"})
+        self.assertTrue(env["HOME"].startswith(str(self.runtime)))
+        proc = self.run_sandboxed(f"echo ok > {env['HOME']}/probe.txt")
+        self.assertEqual(0, proc.returncode, proc.stderr[:300])
+
+    def test_the_maker_argv_sandboxes_both_roots(self):
+        import evolve_worker as EW
+        wcfg = EW.worker_config({"evolve_worker": {
+            "fanout": {"sandbox_exec": True}}})
+        argv = EW.maker_argv(wcfg, self.staging)
+        self.assertEqual("/usr/bin/sandbox-exec", argv[0])
+        profile = Path(argv[2]).read_text(encoding="utf-8")
+        self.assertIn(str(self.staging.resolve()), profile)
+        self.assertIn(str(self.runtime.resolve()), profile)
+
+
 @unittest.skipUnless(PROBE, "set RAPP_CLI_PROBE=1 to spend real model calls")
 class LiveCliPermissionProbes(unittest.TestCase):
     """Does the CLI actually obey the flags? Opt-in, because it costs credits.
@@ -256,6 +362,39 @@ class LiveCliPermissionProbes(unittest.TestCase):
         self.assertNotIn("attacker.example",
                          (clone / ".git" / "config").read_text(encoding="utf-8"),
                          "the maker rewrote a git remote")
+
+    def test_the_cli_still_works_under_sandbox_exec(self):
+        """sandbox_exec is only worth shipping if inference survives it.
+
+        It requires an ISOLATED home — the sandbox permits writes only inside
+        staging and runtime, and the operator's ~/.copilot is deliberately not
+        a root — so this probe needs the inference credential in the
+        environment. Without it the combination genuinely cannot run, and
+        saying so is more useful than a green test that proved nothing.
+        """
+        if not Path("/usr/bin/sandbox-exec").exists():
+            self.skipTest("sandbox-exec is macOS only")
+        if not os.environ.get("COPILOT_GITHUB_TOKEN"):
+            self.skipTest("sandbox_exec needs isolated_home, which needs "
+                          "COPILOT_GITHUB_TOKEN")
+        runtime = self.ws.parent / "runtime"
+        runtime.mkdir(parents=True, exist_ok=True)
+        cfg = SS.fanout_config({"fanout": {"isolated_home": True,
+                                           "sandbox_exec": True}})
+        argv = SS.sandbox_wrap(
+            SS.confined_argv(
+                'Create a file sandboxed.txt containing exactly OK in your '
+                'current directory, then reply DONE.',
+                self.MODEL, self.ws, tools=SS.MAKER_TOOLS, add_dirs=[self.ws],
+                secret_vars=SS.secret_vars_for(cfg),
+                log_dir=runtime / "copilot-logs"),
+            [self.ws, runtime], True, profile_dir=runtime)
+        env = SS.confined_env(cfg, runtime, 0)
+        proc = subprocess.run(argv, cwd=str(self.ws), env=env, text=True,
+                              capture_output=True, timeout=300)
+        self.assertEqual(0, proc.returncode, proc.stderr[:500])
+        self.assertTrue((self.ws / "sandboxed.txt").is_file(),
+                        "the sandboxed maker could not write its own output")
 
     def test_a_denied_path_is_not_writable(self):
         outside = self.ws.parent / f"outside-{uuid.uuid4().hex[:6]}.txt"

@@ -714,6 +714,26 @@ def _git_bytes(cwd, *args, timeout=600):
     return r.stdout
 
 
+NETWORK_GIT_VERBS = ("fetch", "push", "pull", "ls-remote", "clone", "remote")
+
+
+def _git_remote(clone, wcfg, *args, timeout=600, check=True):
+    """Every git call that can reach the network goes through here.
+
+    Not because callers are careless, but because "remember to check first"
+    is not an invariant. `_delete_remote_branch` was the proof: it pushed a
+    branch deletion straight at `origin`, and with a pushurl injected after
+    the normal push, the cleanup hit the attacker's remote and left the real
+    branch orphaned on ours. The integrity check now lives at the chokepoint,
+    so a new call site inherits it instead of having to remember it.
+    """
+    verb = next((a for a in args if not a.startswith("-")), "")
+    if verb not in NETWORK_GIT_VERBS:
+        raise CommandError(f"_git_remote used for a local verb: {verb!r}")
+    assert_repo_integrity(clone, wcfg)
+    return _git(clone, *args, timeout=timeout, check=check)
+
+
 def _gh(*args, timeout=300):
     r = subprocess.run(["gh", *args], capture_output=True, text=True,
                        timeout=timeout)
@@ -757,7 +777,11 @@ def run_model(staging, prompt, wcfg, depth=0, runtime=None):
                          add_dirs=[staging],
                          secret_vars=SS.secret_vars_for(fcfg),
                          log_dir=runtime / "copilot-logs"),
-        staging, bool(fcfg.get("sandbox_exec")))
+        # Both roots: tools stay rooted at staging via --add-dir, but the
+        # process must be able to write its isolated HOME/XDG/TMPDIR in
+        # runtime or the sandbox turns every run into a PermissionError.
+        [staging, runtime], bool(fcfg.get("sandbox_exec")),
+        profile_dir=runtime)
     try:
         proc = subprocess.Popen(argv, cwd=str(staging), env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -796,7 +820,8 @@ def maker_argv(wcfg, staging, prompt="P"):
                          tools=SS.MAKER_TOOLS, add_dirs=[staging],
                          secret_vars=SS.secret_vars_for(fcfg),
                          log_dir=staging.parent / "runtime" / "copilot-logs"),
-        staging, bool(fcfg.get("sandbox_exec")))
+        [staging, staging.parent / "runtime"], bool(fcfg.get("sandbox_exec")),
+        profile_dir=staging.parent / "runtime")
 
 
 # ── the deterministic gate ──────────────────────────────────────────────────
@@ -1438,7 +1463,7 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None):
     probe_health(health, "pre-write", wcfg)
     assert_repo_integrity(clone, wcfg)
 
-    _git(clone, "fetch", "--no-tags", "origin", base, timeout=git_t)
+    _git_remote(clone, wcfg, "fetch", "--no-tags", "origin", base, timeout=git_t)
     _git(clone, "checkout", "-b", branch, f"origin/{base}", timeout=git_t)
     still_new = _git(clone, "ls-tree", "--name-only", f"origin/{base}",
                      f"submissions/{slug}/", timeout=git_t).strip()
@@ -1465,10 +1490,11 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None):
          "commit", "-m", message, timeout=git_t)
     head = _git(clone, "rev-parse", "HEAD", timeout=git_t).strip()
     note(phase="committed", branch=branch, commit=head, blobs=blobs, paths=paths)
-    # The last thing before bytes leave this machine: prove the remote is
-    # still the remote we configured, not one somebody wrote into .git.
-    assert_repo_integrity(clone, wcfg)
-    _git(clone, "push", "--set-upstream", "origin", branch, timeout=git_t)
+    # The last thing before bytes leave this machine: the chokepoint proves
+    # the remote is still the one we configured, not one somebody wrote into
+    # .git after the last check.
+    _git_remote(clone, wcfg, "push", "--set-upstream", "origin", branch,
+                timeout=git_t)
     note(phase="pushed", branch=branch, commit=head)
 
     pr_url, pr_number = "", ""
@@ -1510,7 +1536,7 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None):
         if pr_number:
             _close_pr(repo, pr_number, gh_t)
         else:
-            _delete_remote_branch(clone, branch, git_t)
+            _delete_remote_branch(clone, branch, wcfg, git_t)
         note(phase="cleaned-up")
         raise
 
@@ -1540,8 +1566,7 @@ def confirm_merge(clone, submission, wcfg, pr_number, paths):
     if not merge_sha:
         raise CommandError(f"PR {pr_number} reports no merge commit")
 
-    assert_repo_integrity(clone, wcfg)
-    _git(clone, "fetch", "--no-tags", "origin", base, timeout=git_t)
+    _git_remote(clone, wcfg, "fetch", "--no-tags", "origin", base, timeout=git_t)
     main_sha = _git(clone, "rev-parse", f"origin/{base}", timeout=git_t).strip()
     _git(clone, "merge-base", "--is-ancestor", merge_sha, f"origin/{base}",
          timeout=git_t)
@@ -1571,12 +1596,63 @@ def _close_pr(repo, pr_number, timeout):
         log(f"could not close PR {pr_number}: {type(e).__name__}: {e}")
 
 
-def _delete_remote_branch(clone, branch, timeout):
+def _delete_remote_branch(clone, branch, wcfg, timeout=None):
+    """Remove a branch we pushed, from the canonical repo and nowhere else.
+
+    Two paths, and neither can reach a remote we did not configure:
+
+      * the clone still verifies -> delete through it, normally.
+      * the clone does NOT verify (a pushurl appeared, a hostile config, a
+        hook) -> do not touch that repository at all. Delete from a fresh,
+        empty git directory with global and system config neutralised,
+        addressing the canonical URL explicitly, then confirm with ls-remote.
+
+    The second path exists because failing closed here would leave a real
+    branch orphaned on the real origin as the price of someone else's
+    tampering, and cleanup is exactly when the repository is least
+    trustworthy.
+    """
+    timeout = int(timeout or wcfg.get("git_timeout_s", 600))
+    canonical = _repo_url(wcfg["repo"])
     try:
-        _git(clone, "push", "origin", "--delete", branch, timeout=timeout)
+        _git_remote(clone, wcfg, "push", "origin", "--delete", branch,
+                    timeout=timeout)
         log(f"deleted the pushed branch {branch} after aborting the cycle")
+        return True
+    except GateError as e:
+        log(f"the clone no longer verifies ({e}); deleting {branch} from "
+            f"{canonical} through a sanitized repository instead")
     except Exception as e:
-        log(f"could not delete branch {branch}: {type(e).__name__}: {e}")
+        log(f"could not delete branch {branch} via origin: "
+            f"{type(e).__name__}: {e}")
+
+    scratch = Path(clone).parent / f"cleanup-{uuid.uuid4().hex[:8]}"
+    env = dict(os.environ)
+    env["GIT_CONFIG_GLOBAL"] = os.devnull
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        scratch.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "init", "-q"], cwd=str(scratch), env=env,
+                       capture_output=True, text=True, timeout=timeout,
+                       check=True)
+        subprocess.run(["git", "push", canonical, "--delete", branch],
+                       cwd=str(scratch), env=env, capture_output=True,
+                       text=True, timeout=timeout, check=True)
+        left = subprocess.run(["git", "ls-remote", "--heads", canonical, branch],
+                              cwd=str(scratch), env=env, capture_output=True,
+                              text=True, timeout=timeout)
+        if left.stdout.strip():
+            log(f"branch {branch} still exists on {canonical} after deletion")
+            return False
+        log(f"deleted {branch} from {canonical} through a sanitized repository")
+        return True
+    except Exception as e:
+        log(f"sanitized deletion of {branch} failed: {type(e).__name__}: {e} — "
+            f"failing closed, nothing was pushed anywhere else")
+        return False
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _pr_body(submission, wcfg):

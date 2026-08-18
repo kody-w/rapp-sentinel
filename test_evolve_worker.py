@@ -9,6 +9,7 @@ touches the live instance, GitHub, or a model.
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -982,7 +983,8 @@ class WorkerRunTests(WorkerEnv):
                 " time.sleep(90)']);"
                 "open('gc.pid','w').write(str(p.pid)); time.sleep(90)"]
         with mock.patch.object(EW.SS, "confined_argv", return_value=argv), \
-             mock.patch.object(EW.SS, "sandbox_wrap", lambda a, w, e: a):
+             mock.patch.object(EW.SS, "sandbox_wrap",
+                               lambda a, w, e, profile_dir=None: a):
             status, out = EW.run_model(self.home, "prompt", wcfg)
         self.assertEqual(EW.OUTCOME_TIMEOUT, status)
         self.assertIn("timed out", out)
@@ -1799,6 +1801,118 @@ class CloneScopeTests(WorkerEnv):
         with self.assertRaises(EW.GateError) as cm:
             EW.verify_staged_tree(self.clone, self.submission, self.wcfg, paths)
         self.assertIn("120000", str(cm.exception))
+
+
+class CleanupIntegrityTests(WorkerEnv):
+    """Cleanup is exactly when the repository is least trustworthy."""
+
+    def setUp(self):
+        super().setUp()
+        self.attacker = self.home / "attacker.git"
+        subprocess.run(["git", "init", "--bare", "-b", "main",
+                        str(self.attacker)], check=True, capture_output=True)
+
+    def attacker_refs(self):
+        return git_bare(self.attacker, "for-each-ref",
+                        "--format=%(refname)").split()
+
+    def origin_branches(self):
+        return [r for r in git_bare(self.origin, "for-each-ref",
+                                    "--format=%(refname)").split()
+                if r != "refs/heads/main"]
+
+    def gh_that_fails_pr_create_after_injecting_a_pushurl(self, clone_holder):
+        """The repro: the push succeeds, then a pushurl appears, then PR
+        creation fails and the cleanup path runs."""
+        def fake(*args, timeout=None):
+            self.gh.calls.append(args)
+            if args[:2] == ("pr", "create"):
+                clone = clone_holder.get("clone")
+                git(clone, "config", "remote.origin.pushurl", str(self.attacker))
+                raise EW.CommandError("gh pr create exited 1: rate limited")
+            raise AssertionError(f"unexpected gh call: {args}")
+        return fake
+
+    def test_cleanup_never_pushes_to_an_injected_remote(self):
+        holder = {}
+        real_publish = EW.publish
+
+        def capture(clone, *a, **kw):
+            holder["clone"] = clone
+            return real_publish(clone, *a, **kw)
+
+        with mock.patch.object(EW, "publish", capture), \
+             mock.patch.object(EW, "_gh",
+                               self.gh_that_fails_pr_create_after_injecting_a_pushurl(holder)), \
+             mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+        self.assertEqual(EW.OUTCOME_FAILED, summary["outcome"], summary)
+        self.assertEqual([], self.attacker_refs(),
+                         "the cleanup pushed to the attacker's remote")
+        self.assertEqual([], self.origin_branches(),
+                         "the real branch was left orphaned on origin")
+
+    def test_a_tampered_clone_still_cleans_the_real_origin(self):
+        # The unit of the same guarantee: a clone whose config was rewritten
+        # cannot be used, and the branch is still removed from the real repo.
+        clone = self.home / "clone"
+        subprocess.run(["git", "clone", str(self.origin), str(clone)],
+                       check=True, capture_output=True)
+        git(clone, "config", "user.email", "t@example.com")
+        git(clone, "config", "user.name", "t")
+        git(clone, "checkout", "-q", "-b", "art/doomed")
+        (clone / "x.txt").write_text("x", encoding="utf-8")
+        git(clone, "add", "-A")
+        git(clone, "commit", "-qm", "doomed")
+        git(clone, "push", "-q", "-u", "origin", "art/doomed")
+        self.assertEqual(["refs/heads/art/doomed"], self.origin_branches())
+
+        git(clone, "config", "remote.origin.pushurl", str(self.attacker))
+        wcfg = dict(EW.worker_config({}), repo=str(self.origin))
+        self.assertTrue(EW._delete_remote_branch(clone, "art/doomed", wcfg))
+
+        self.assertEqual([], self.origin_branches(),
+                         "the real branch should have been deleted")
+        self.assertEqual([], self.attacker_refs(),
+                         "nothing may reach the injected remote")
+
+    def test_an_unreachable_canonical_repo_fails_closed(self):
+        clone = self.home / "clone2"
+        subprocess.run(["git", "clone", str(self.origin), str(clone)],
+                       check=True, capture_output=True)
+        git(clone, "config", "remote.origin.pushurl", str(self.attacker))
+        wcfg = dict(EW.worker_config({}),
+                    repo=str(self.home / "does-not-exist.git"))
+        self.assertFalse(EW._delete_remote_branch(clone, "art/nope", wcfg))
+        self.assertEqual([], self.attacker_refs())
+
+    def test_the_network_chokepoint_refuses_a_tampered_clone(self):
+        clone = self.home / "clone3"
+        subprocess.run(["git", "clone", str(self.origin), str(clone)],
+                       check=True, capture_output=True)
+        git(clone, "config", "remote.origin.pushurl", str(self.attacker))
+        wcfg = dict(EW.worker_config({}), repo=str(self.origin))
+        with self.assertRaises(EW.GateError):
+            EW._git_remote(clone, wcfg, "fetch", "--no-tags", "origin", "main")
+
+    def test_the_chokepoint_rejects_local_verbs(self):
+        clone = self.home / "clone4"
+        subprocess.run(["git", "clone", str(self.origin), str(clone)],
+                       check=True, capture_output=True)
+        wcfg = dict(EW.worker_config({}), repo=str(self.origin))
+        with self.assertRaises(EW.CommandError):
+            EW._git_remote(clone, wcfg, "status", "--porcelain")
+
+    def test_no_raw_network_git_call_survives_in_the_source(self):
+        """The invariant, asserted against the code rather than remembered."""
+        source = (Path(__file__).resolve().parent / "evolve_worker.py").read_text(
+            encoding="utf-8")
+        offenders = re.findall(
+            r'_git\((?!_)[^)]*?"(fetch|push|pull|ls-remote)"', source)
+        self.assertEqual([], offenders,
+                         "network git must go through _git_remote(), which "
+                         "checks repo integrity first")
 
 
 class LifecycleTests(WorkerEnv):
