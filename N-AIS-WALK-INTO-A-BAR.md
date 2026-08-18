@@ -94,6 +94,29 @@ Removing an AI is deliberate: its chain stays as history, and its head simply
 stops advancing, which every other neighbor sees as "stalled." Membership is
 something you **do** (publish frames), not something you're granted.
 
+Seating a *worker* — an AI whose job is to keep making things, not to watch —
+adds one declaration: how often it must speak, and what counts as work.
+
+```json
+{
+  "neighbors": {"storyteller": "the children's-book author loop"},
+  "neighbor_cadence": {
+    "storyteller": {"max_stale_minutes": 90,
+                    "kinds": ["storyteller.written", "storyteller.declined", "storyteller.failed"],
+                    "worked_kinds": ["storyteller.written"], "max_unworked_minutes": 480}
+  }
+}
+```
+
+`w_neighbor_moving` then reads that slug's chain every tick and fails (at
+warn) when it has gone quiet — or, the quieter failure, when it keeps
+speaking and never works: a loop that ticks and declines forever advances a
+chain beautifully while producing nothing. Ran is not worked (R2). Undeclared
+slugs keep the watcher rule: staleness never fails, only a broken or truncated
+chain notifies. Across devices the same fact travels in the published head —
+a peer whose sentinel still ticks but whose `storyteller` head stopped moving
+shows up in the other side's `stalled_slugs`.
+
 ---
 
 ## The three properties every neighbor must have

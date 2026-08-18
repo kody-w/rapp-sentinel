@@ -50,6 +50,7 @@ probe_watchers and are retargeted through config.json's `watchers` block
 
 import functools
 import json
+import os
 import subprocess
 import urllib.error
 import urllib.request

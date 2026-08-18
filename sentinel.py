@@ -891,6 +891,13 @@ def main():
             gone = [k for k, v in peers.items() if not v.get("reachable")]
             if stalled or gone:
                 log(f"peers stalled={stalled} unreachable={gone}")
+            # The second opinion across devices: a peer that ticks but whose
+            # seated author (or any slug) stopped. Logged per slug so "go see
+            # what the other sentinel says" is a grep, not a guess.
+            slug_stalls = {k: v["stalled_slugs"] for k, v in peers.items()
+                           if v.get("stalled_slugs")}
+            if slug_stalls:
+                log(f"peer slugs not advancing since last look: {slug_stalls}")
         anchors = NB.check_anchors()
         save_json(STATE / "anchors.json", anchors)
         cut = [k for k, v in anchors.items() if v["truncated"]]

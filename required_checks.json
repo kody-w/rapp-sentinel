@@ -30,12 +30,13 @@
     "w_checks_complete",
     "w_evolve_worker",
     "w_freshness_paired",
+    "w_neighbor_moving",
     "w_openrappter",
     "w_openrappter_spin",
     "w_outsider_coverage",
     "w_outsider_smoke",
-    "w_sentinel_fresh",
     "w_sentinel_current",
+    "w_sentinel_fresh",
     "w_test_baseline"
   ],
   "_outsider_why": "Issue #5: a platform cannot verify its own accessibility from the inside. Every platform named here must have, each tick, at least one check that RAN with no privilege - vantage='outsider' is stamped by checks.outsider_check only after proving no gh() call flowed through the execution (a violation is replaced with a critical failure and stamped 'credentialed', which does not count). w_outsider_coverage (health.py) compares this list against what actually ran; a check that ran and FAILED still covers its platform, because the discipline is standing outside the door, and the door being stuck is that check's own report.",
@@ -173,6 +174,10 @@
     "w_test_baseline": {
       "domain": "self",
       "kind": "consistency"
+    },
+    "w_neighbor_moving": {
+      "domain": "neighborhood",
+      "kind": "output-freshness"
     }
   },
   "_unpaired_accepted_why": "An accepted pairing gap is a DECISION with a diff, not a silence. A permanently-red pairing check would hold the verdict at degraded forever, which silently disables the level-3 evolve arm (sentinel only evolves while healthy) and trains readers to scroll past the channel. Each entry names the domain and why its gap is accepted; deleting an entry re-arms the check for that domain.",
