@@ -133,6 +133,33 @@ scenario("(e) sentinel.py diagnose dispatches: prints the page, never ticks",
          "sentinel diagnose" in r.stdout and before == after,
          f"rc={r.returncode}, heartbeat mtime unchanged={before == after}")
 
+# ── (f) the chat.db probe must fail where its CONSUMER fails ────────────────
+# Regression guard for a real ten-hour blind-green: the probe answered with
+# os.access(R_OK), which reads POSIX bits and cannot see macOS TCC. chat.db is
+# rw------- and user-owned, so os.access() returns True even in the contexts
+# where the open is refused -- the page printed "readable" while every outbox
+# drain reported "delivery unverifiable: chat.db unreadable" and 10 alerts
+# went undelivered. The mutation below denies the open the way TCC does and
+# asserts os.access is STILL True, so a regression to the old predicate cannot
+# pass this scenario by accident.
+import sqlite3
+
+_real_connect = sqlite3.connect
+sqlite3.connect = lambda *a, **k: (_ for _ in ()).throw(
+    sqlite3.OperationalError("unable to open database file"))
+try:
+    denied_ident, _, denied_reach = D._chat_db_reachability()
+finally:
+    sqlite3.connect = _real_connect
+
+access_still_true = D.CHAT_DB.exists() and os.access(D.CHAT_DB, os.R_OK)
+scenario("(f) a TCC-denied chat.db reads NOT readable, though os.access lies",
+         denied_ident == "NOT readable (TCC?)"
+         and "OperationalError" in denied_reach
+         and str(D.CHAT_DB) not in denied_reach,
+         f"denied -> {denied_ident!r}; os.access still True={access_still_true}; "
+         f"path leaked={str(D.CHAT_DB) in denied_reach}")
+
 print(f"\n{len(FAILURES)} failing scenario(s)" if FAILURES
       else "\nall scenarios behaved as specified")
 sys.exit(1 if FAILURES else 0)
