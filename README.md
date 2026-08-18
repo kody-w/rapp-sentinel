@@ -282,6 +282,15 @@ The default cast is three, and one of them exists to argue:
 Roles, briefs and waves are configurable; a critic that never sees the
 candidates would be decoration, which is why waves exist.
 
+**Neither the maker nor a sub-sentinel can reach a repository.** The maker's
+tool root is a staging directory holding its read context and an empty `out/`;
+the controller's clone lives outside it, so there is no `.git` to write a
+`pushurl` into. That was a real finding — with the clone inside the tool root a
+probe wrote `clone/.git/probe.txt`, and a bounded repro set
+`remote.origin.pushurl` and got the controller to push to an attacker's remote.
+The fix is structural (no repository in reach), with the integrity check before
+every git call as the second lock.
+
 **A sub-sentinel cannot publish anything.** Not by instruction — by
 construction: it gets no git clone (the parent hands it `prior.json`, read
 from the clone), no GitHub token (`GH_TOKEN`, `GITHUB_TOKEN`, `SSH_AUTH_SOCK`

@@ -376,113 +376,99 @@ class HealthGateTests(unittest.TestCase):
 # ── the deterministic gate ──────────────────────────────────────────────────
 
 class GateTests(ScratchCase):
+    """The staging gate: a submission tree with no git anywhere near it."""
+
     def setUp(self):
         super().setUp()
-        self.clone = self.home / "clone"
-        self.clone.mkdir()
-        git(self.clone, "init", "-b", "main")
-        git(self.clone, "config", "user.email", "t@example.com")
-        git(self.clone, "config", "user.name", "t")
-        write_submission(self.clone, "already-here")
-        (self.clone / "submissions" / "index.json").write_text('{"submissions": []}',
-                                                               encoding="utf-8")
-        git(self.clone, "add", "-A")
-        git(self.clone, "commit", "-m", "seed")
+        self.staging = self.home / "staging"
+        self.out = self.staging / "out"
+        self.out.mkdir(parents=True)
+        (self.staging / "context").mkdir()
         self.wcfg = EW.worker_config({})
+        self.known = {"already-here"}
 
-    def gate(self, cycle=2, previous="already-here"):
-        return EW.validate_submission(self.clone, self.wcfg, cycle, previous)
+    def gate(self, cycle=2, previous="already-here", round1=None):
+        EW.assert_no_git(self.staging)
+        return EW.gate_directory(self.out, self.wcfg, cycle, previous, round1,
+                                 self.known)
+
+    def submit(self, slug="new-piece", meta=None, **kwargs):
+        return write_submission(
+            self.out, slug,
+            meta if meta is not None else meta_for(slug, cycle=2,
+                                                   previous="already-here"),
+            **kwargs)
 
     def test_a_clean_submission_passes(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"))
+        self.submit()
         result = self.gate()
         self.assertEqual("new-piece", result["slug"])
         self.assertEqual("submissions/new-piece/piece.svg", result["piece_path"])
+        self.assertEqual(SVG.encode(), result["piece_bytes"])
 
-    def test_an_edited_existing_file_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"))
-        (self.clone / "submissions" / "index.json").write_text('{"submissions": [1]}',
-                                                               encoding="utf-8")
+    def test_nothing_at_all_is_a_decline_shaped_rejection(self):
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
-        self.assertIn("existing path", str(cm.exception))
-
-    def test_a_deleted_existing_file_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"))
-        (self.clone / "submissions" / "already-here" / "piece.svg").unlink()
-        with self.assertRaises(EW.GateError) as cm:
-            self.gate()
-        self.assertIn("existing path", str(cm.exception))
+        self.assertIn("no new submission", str(cm.exception))
 
     def test_two_new_submissions_are_rejected(self):
-        write_submission(self.clone, "one", meta_for("one", cycle=2, previous="already-here"))
-        write_submission(self.clone, "two", meta_for("two", cycle=2, previous="already-here"))
+        self.submit("one", meta_for("one", cycle=2, previous="already-here"))
+        self.submit("two", meta_for("two", cycle=2, previous="already-here"))
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("more than one", str(cm.exception))
 
-    def test_a_file_outside_submissions_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"))
-        (self.clone / "notes.md").write_text("hi", encoding="utf-8")
+    def test_anything_beside_submissions_is_rejected(self):
+        self.submit()
+        (self.out / "notes.md").write_text("hi", encoding="utf-8")
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
-        self.assertIn("not a root-level file", str(cm.exception))
+        self.assertIn("expected only 'submissions'", str(cm.exception))
 
     def test_a_third_file_in_the_folder_is_rejected(self):
-        directory = write_submission(self.clone, "new-piece",
-                                     meta_for("new-piece", cycle=2, previous="already-here"))
+        directory = self.submit()
         (directory / "notes.txt").write_text("extra", encoding="utf-8")
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("meta.json + piece", str(cm.exception))
 
-    def test_no_changes_at_all_is_a_decline_shaped_rejection(self):
-        with self.assertRaises(EW.GateError) as cm:
-            self.gate()
-        self.assertIn("no new submission", str(cm.exception))
-
     def test_a_colliding_slug_is_rejected(self):
-        # a new file dropped into a slug that already exists on the branch
-        (self.clone / "submissions" / "already-here" / "piece2.svg").write_text(
-            SVG, encoding="utf-8")
+        self.submit("already-here", meta_for("already-here", cycle=2,
+                                             previous="already-here"))
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("already exists", str(cm.exception))
 
-    def test_a_moved_head_means_the_model_published_itself(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"))
-        base = git(self.clone, "rev-parse", "HEAD").strip()
-        git(self.clone, "add", "-A")
-        git(self.clone, "commit", "-m", "mine now")
+    def test_a_git_directory_in_staging_is_rejected(self):
+        self.submit()
+        (self.staging / ".git").mkdir()
         with self.assertRaises(EW.GateError) as cm:
-            EW.validate_submission(self.clone, self.wcfg, 2, "already-here",
-                                   "main", base)
-        self.assertIn("committed", str(cm.exception))
+            self.gate()
+        self.assertIn(".git", str(cm.exception))
+
+    def test_a_git_file_inside_the_submission_is_rejected(self):
+        directory = self.submit()
+        (directory / ".git").write_text("gitdir: /somewhere/else", encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn(".git", str(cm.exception))
 
     def test_extension_must_match_kind(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here",
+        self.submit(meta=meta_for("new-piece", cycle=2, previous="already-here",
                                   kind="md"), piece_name="piece.svg")
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("piece.md", str(cm.exception))
 
     def test_unknown_license_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here",
+        self.submit(meta=meta_for("new-piece", cycle=2, previous="already-here",
                                   license="MIT"))
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("license", str(cm.exception))
 
     def test_wrong_schema_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here",
+        self.submit(meta=meta_for("new-piece", cycle=2, previous="already-here",
                                   schema="rapp-art-submission/2.0"))
         with self.assertRaises(EW.GateError):
             self.gate()
@@ -490,83 +476,129 @@ class GateTests(ScratchCase):
     def test_unknown_top_level_meta_key_is_rejected(self):
         meta = meta_for("new-piece", cycle=2, previous="already-here")
         meta["price"] = 100
-        write_submission(self.clone, "new-piece", meta)
+        self.submit(meta=meta)
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("unknown keys", str(cm.exception))
 
+    def test_an_unknown_remix_target_is_rejected(self):
+        self.submit(meta=meta_for("new-piece", cycle=2, previous="already-here",
+                                  remix_of="never-existed"))
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("remix_of", str(cm.exception))
+
     def test_an_oversized_piece_is_rejected(self):
         big = ('<svg xmlns="http://www.w3.org/2000/svg">'
                + "<!--" + "x" * 60000 + "-->" + "</svg>")
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"),
-                         piece=big)
+        self.submit(piece=big)
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("byte cap", str(cm.exception))
 
     def test_svg_with_a_script_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"),
-                         piece='<svg xmlns="http://www.w3.org/2000/svg">'
-                               '<script>alert(1)</script></svg>')
+        self.submit(piece='<svg xmlns="http://www.w3.org/2000/svg">'
+                          '<script>alert(1)</script></svg>')
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("script", str(cm.exception))
 
     def test_svg_with_an_event_attribute_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"),
-                         piece='<svg xmlns="http://www.w3.org/2000/svg">'
-                               '<circle onclick="x()" r="1"/></svg>')
+        self.submit(piece='<svg xmlns="http://www.w3.org/2000/svg">'
+                          '<circle onclick="x()" r="1"/></svg>')
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("event attribute", str(cm.exception))
 
     def test_svg_with_an_external_reference_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"),
-                         piece='<svg xmlns="http://www.w3.org/2000/svg">'
-                               '<image href="https://example.com/a.png"/></svg>')
+        self.submit(piece='<svg xmlns="http://www.w3.org/2000/svg">'
+                          '<image href="https://example.com/a.png"/></svg>')
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("outside itself", str(cm.exception))
 
-    def test_unparseable_svg_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"),
-                         piece="<svg><circle></svg>")
-        with self.assertRaises(EW.GateError) as cm:
-            self.gate()
-        self.assertIn("parse", str(cm.exception))
-
     def test_svg_with_an_external_css_reference_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"),
-                         piece='<svg xmlns="http://www.w3.org/2000/svg">'
-                               '<style>@import url(https://evil.example/x.css);'
-                               '</style><circle r="1"/></svg>')
+        self.submit(piece='<svg xmlns="http://www.w3.org/2000/svg">'
+                          '<style>@import url(https://evil.example/x.css);'
+                          '</style><circle r="1"/></svg>')
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("@import", str(cm.exception))
 
     def test_svg_with_an_external_fill_url_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"),
-                         piece='<svg xmlns="http://www.w3.org/2000/svg">'
-                               '<circle r="1" fill="url(https://x.example/a.svg#g)"/>'
-                               '</svg>')
+        self.submit(piece='<svg xmlns="http://www.w3.org/2000/svg">'
+                          '<circle r="1" fill="url(https://x.example/a.svg#g)"/>'
+                          '</svg>')
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("outside itself", str(cm.exception))
 
     def test_a_fragment_url_reference_is_allowed(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"),
-                         piece='<svg xmlns="http://www.w3.org/2000/svg">'
-                               '<circle r="1" fill="url(#grad)"/>'
-                               '<use href="#grad"/></svg>')
+        self.submit(piece='<svg xmlns="http://www.w3.org/2000/svg">'
+                          '<circle r="1" fill="url(#grad)"/>'
+                          '<use href="#grad"/></svg>')
         self.assertEqual("new-piece", self.gate()["slug"])
+
+    def test_unparseable_svg_is_rejected(self):
+        self.submit(piece="<svg><circle></svg>")
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("parse", str(cm.exception))
+
+    def test_a_nested_file_is_rejected(self):
+        directory = self.submit()
+        (directory / "extra").mkdir()
+        (directory / "extra" / "more.svg").write_text(SVG, encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("not a regular file", str(cm.exception))
+
+    def test_a_symlinked_piece_is_rejected(self):
+        directory = self.out / "submissions" / "new-piece"
+        directory.mkdir(parents=True)
+        (directory / "meta.json").write_text(
+            json.dumps(meta_for("new-piece", cycle=2, previous="already-here")),
+            encoding="utf-8")
+        secret = self.home / "id_ed25519"
+        secret.write_text("PRIVATE KEY", encoding="utf-8")
+        (directory / "piece.svg").symlink_to(secret)
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("symlink", str(cm.exception))
+
+    def test_a_symlinked_folder_is_rejected(self):
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        (self.out / "submissions").mkdir()
+        (self.out / "submissions" / "new-piece").symlink_to(elsewhere)
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("symlink", str(cm.exception))
+
+    def test_a_hardlinked_piece_is_rejected(self):
+        directory = self.submit()
+        os.link(directory / "piece.svg", self.home / "second-name.svg")
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("hard link", str(cm.exception))
+
+    def test_an_executable_piece_is_rejected(self):
+        directory = self.submit()
+        os.chmod(directory / "piece.svg", 0o755)
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("executable", str(cm.exception))
+
+    def test_a_fifo_is_rejected(self):
+        directory = self.out / "submissions" / "new-piece"
+        directory.mkdir(parents=True)
+        (directory / "meta.json").write_text(
+            json.dumps(meta_for("new-piece", cycle=2, previous="already-here")),
+            encoding="utf-8")
+        os.mkfifo(directory / "piece.svg")
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("not a regular file", str(cm.exception))
 
 
 class DadaCycleTests(unittest.TestCase):
@@ -779,12 +811,12 @@ class WorkerEnv(ScratchCase):
 
     def model_that_submits(self, slug="new-piece", cycle=1, previous=None,
                            result="CONTRIBUTED it made a thing"):
-        def fake(workspace, prompt, wcfg, depth=0):
+        def fake(staging, prompt, wcfg, depth=0, runtime=None):
             self.prompt = prompt
-            clone = Path(workspace) / "clone"
-            write_submission(clone, slug, meta_for(slug, cycle=cycle,
-                                                   previous=previous))
-            (Path(workspace) / "state-out.json").write_text(json.dumps({
+            staging = Path(staging)
+            write_submission(staging / "out", slug,
+                             meta_for(slug, cycle=cycle, previous=previous))
+            (staging / "state-out.json").write_text(json.dumps({
                 "cycle": cycle, "last_slug": slug, "notes": "learned things",
             }), encoding="utf-8")
             return "ok", f"working...\nSENTINEL_RESULT: {result}\n"
@@ -845,10 +877,13 @@ class WorkerRunTests(WorkerEnv):
     def test_the_prompt_forbids_publishing_and_names_the_invariants(self):
         with mock.patch.object(EW, "run_model", self.model_that_submits()):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
-        for phrase in ("git commit", "git push", "gh pr create", "gh pr merge",
-                       "Do not create branches", "UNCOMMITTED",
+        for phrase in ("There is NO repository here", "no .git directory",
+                       "no shell, no git, no gh and no network tool",
+                       "clone you never see", "/out/submissions/<your-slug>/",
                        f"EXACTLY {EW.CANDIDATES_PER_ROUND}", "state-out.json"):
             self.assertIn(phrase, self.prompt)
+        self.assertNotIn("/clone ", self.prompt,
+                         "the maker is never told where the clone is")
 
     # ── the refusals ──
     def test_a_critical_check_before_the_merge_aborts_and_closes_the_pr(self):
@@ -921,7 +956,7 @@ class WorkerRunTests(WorkerEnv):
         self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
 
     def test_a_timeout_is_recorded_without_a_success_shaped_alert(self):
-        def timing_out(workspace, prompt, wcfg, depth=0):
+        def timing_out(staging, prompt, wcfg, depth=0, runtime=None):
             return EW.OUTCOME_TIMEOUT, "copilot timed out after 60s"
         with mock.patch.object(EW, "run_model", timing_out):
             summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
@@ -964,7 +999,7 @@ class WorkerRunTests(WorkerEnv):
             self.fail("the maker's grandchild outlived the timeout")
 
     def test_a_declined_cycle_is_recorded_without_a_paintbrush(self):
-        def declining(workspace, prompt, wcfg, depth=0):
+        def declining(staging, prompt, wcfg, depth=0, runtime=None):
             return "ok", "SENTINEL_RESULT: DECLINED nothing worth making today\n"
         with mock.patch.object(EW, "run_model", declining):
             summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
@@ -975,25 +1010,33 @@ class WorkerRunTests(WorkerEnv):
         self.assertEqual(EW.OUTCOME_DECLINED, history[0]["outcome"])
         self.assertFalse((self.state / "evolve-creative-state.json").exists())
 
-    def test_a_model_that_commits_its_own_work_is_rejected(self):
-        def publishing(workspace, prompt, wcfg, depth=0):
-            clone = Path(workspace) / "clone"
-            write_submission(clone, "new-piece", meta_for("new-piece"))
-            git(clone, "config", "user.email", "t@example.com")
-            git(clone, "config", "user.name", "t")
-            git(clone, "add", "-A")
-            git(clone, "commit", "-m", "I published myself")
-            return "ok", "SENTINEL_RESULT: CONTRIBUTED and I merged it\n"
-        with mock.patch.object(EW, "run_model", publishing):
+    def test_a_maker_cannot_reach_a_repository_at_all(self):
+        seen = {}
+
+        def looking_for_git(staging, prompt, wcfg, depth=0, runtime=None):
+            staging = Path(staging)
+            seen["entries"] = sorted(p.name for p in staging.iterdir())
+            seen["git"] = list(staging.rglob(".git"))
+            seen["add_dirs"] = [a for a in EW.maker_argv(wcfg, staging)]
+            write_submission(staging / "out", "new-piece", meta_for("new-piece"))
+            (staging / "state-out.json").write_text(json.dumps(
+                {"cycle": 1, "last_slug": "new-piece", "notes": "n"}),
+                encoding="utf-8")
+            return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
+
+        with mock.patch.object(EW, "run_model", looking_for_git):
             summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
-        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
-        self.assertIn("committed", summary["detail"])
-        self.assertFalse(self.gh.calls)
-        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        self.assertEqual([], seen["git"], "no .git may exist in the maker's root")
+        self.assertNotIn("clone", seen["entries"])
+        add_dirs = [seen["add_dirs"][i + 1] for i, a in enumerate(seen["add_dirs"])
+                    if a == "--add-dir"]
+        self.assertEqual(1, len(add_dirs))
+        self.assertTrue(add_dirs[0].endswith("staging"), add_dirs)
 
     def test_a_missing_next_state_file_is_rejected_before_any_remote_call(self):
-        def no_state(workspace, prompt, wcfg, depth=0):
-            write_submission(Path(workspace) / "clone", "new-piece",
+        def no_state(staging, prompt, wcfg, depth=0, runtime=None):
+            write_submission(Path(staging) / "out", "new-piece",
                              meta_for("new-piece"))
             return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
         with mock.patch.object(EW, "run_model", no_state):
@@ -1005,7 +1048,7 @@ class WorkerRunTests(WorkerEnv):
     def test_roles_rotate_across_passes(self):
         seen = []
 
-        def watcher(workspace, prompt, wcfg, depth=0):
+        def watcher(staging, prompt, wcfg, depth=0, runtime=None):
             seen.append(wcfg["role"])
             return EW.OUTCOME_FAILED, "no model here"
         with mock.patch.object(EW, "run_model", watcher):
@@ -1069,18 +1112,18 @@ class FanoutIntegrationTests(WorkerEnv):
         `honour=False` keeps its own ids; `forge` rewrites one field of one
         record while keeping every id — the attack the digests exist for.
         """
-        def fake(workspace, prompt, wcfg, depth=0):
+        def fake(staging, prompt, wcfg, depth=0, runtime=None):
             self.prompt = prompt
-            records = json.loads((Path(workspace) / "round1.json").read_text())
+            staging = Path(staging)
+            records = json.loads((staging / "round1.json").read_text())
             self.finalists = [c["id"] for c in records]
             if forge:
                 records = [dict(r) for r in records]
                 records[0].update(forge)
-            clone = Path(workspace) / "clone"
-            write_submission(clone, slug, meta_for(
+            write_submission(staging / "out", slug, meta_for(
                 slug, cycle=cycle, previous=previous,
                 round1_records=records if honour else None))
-            (Path(workspace) / "state-out.json").write_text(json.dumps({
+            (staging / "state-out.json").write_text(json.dumps({
                 "cycle": cycle, "last_slug": slug, "notes": "n"}), encoding="utf-8")
             return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
         return fake
@@ -1264,9 +1307,9 @@ class ArtNotificationTests(WorkerEnv):
             "about clocks for several more sentences nobody will read on a "
             "phone."))
 
-        def maker(workspace, prompt, wcfg, depth=0):
-            write_submission(Path(workspace) / "clone", "new-piece", meta)
-            (Path(workspace) / "state-out.json").write_text(json.dumps(
+        def maker(staging, prompt, wcfg, depth=0, runtime=None):
+            write_submission(Path(staging) / "out", "new-piece", meta)
+            (Path(staging) / "state-out.json").write_text(json.dumps(
                 {"cycle": 1, "last_slug": "new-piece", "notes": "n"}),
                 encoding="utf-8")
             return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
@@ -1311,7 +1354,7 @@ class ArtNotificationTests(WorkerEnv):
 
     def test_no_message_for_a_timeout(self):
         with mock.patch.object(EW, "run_model",
-                               lambda ws, p, w, d=0: (EW.OUTCOME_TIMEOUT, "timed out")):
+                               lambda ws, p, w, d=0, r=None: (EW.OUTCOME_TIMEOUT, "timed out")):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         self.assertEqual(1, len(self.notifications))
         self.assertNotIn("View:", self.texts()[0])
@@ -1320,7 +1363,7 @@ class ArtNotificationTests(WorkerEnv):
     def test_no_message_for_a_declined_cycle(self):
         with mock.patch.object(
                 EW, "run_model",
-                lambda ws, p, w, d=0: ("ok", "SENTINEL_RESULT: DECLINED not today\n")):
+                lambda ws, p, w, d=0, r=None: ("ok", "SENTINEL_RESULT: DECLINED not today\n")):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         self.assertEqual([], self.notifications)
 
@@ -1554,13 +1597,14 @@ class ForgedFinalistTests(WorkerEnv):
         self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
 
     def test_dropping_a_record_field_is_rejected(self):
-        def maker(workspace, prompt, wcfg, depth=0):
-            records = json.loads((Path(workspace) / "round1.json").read_text())
+        def maker(staging, prompt, wcfg, depth=0, runtime=None):
+            staging = Path(staging)
+            records = json.loads((staging / "round1.json").read_text())
             stripped = [{"id": r["id"], "premise": r["premise"],
                          "scores": r["scores"]} for r in records]
-            write_submission(Path(workspace) / "clone", "new-piece",
+            write_submission(staging / "out", "new-piece",
                              meta_for("new-piece", round1_records=stripped))
-            (Path(workspace) / "state-out.json").write_text(json.dumps(
+            (staging / "state-out.json").write_text(json.dumps(
                 {"cycle": 1, "last_slug": "new-piece", "notes": "n"}),
                 encoding="utf-8")
             return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
@@ -1576,79 +1620,160 @@ class ForgedFinalistTests(WorkerEnv):
         self.assertIn("publishes a digest", summary["detail"])
 
 
-class TreeShapeTests(GateTests):
-    """What ends up in the git INDEX, not just on disk (#3)."""
+class CloneScopeTests(WorkerEnv):
+    """The controller's own clone: what it copies in, and what it pushes."""
 
-    def test_a_nested_file_is_rejected(self):
-        directory = write_submission(
-            self.clone, "new-piece",
-            meta_for("new-piece", cycle=2, previous="already-here"))
-        (directory / "extra").mkdir()
-        (directory / "extra" / "more.svg").write_text(SVG, encoding="utf-8")
+    def setUp(self):
+        super().setUp()
+        self.clone = self.home / "clone"
+        subprocess.run(["git", "clone", str(self.origin), str(self.clone)],
+                       check=True, capture_output=True)
+        self.wcfg = EW.worker_config({"evolve_worker": {"repo": str(self.origin)}})
+        self.wcfg["repo"] = str(self.origin)
+        staging_out = self.home / "stage" / "out"
+        staging_out.mkdir(parents=True)
+        write_submission(staging_out, "new-piece", meta_for("new-piece"))
+        self.submission = EW.gate_directory(staging_out, self.wcfg, 1, None,
+                                            None, {"already-here"})
+
+    def test_the_controller_copies_only_the_validated_bytes(self):
+        EW.install_into_clone(self.clone, self.submission)
+        paths = EW.verify_clone_scope(self.clone, self.submission, self.wcfg)
+        self.assertEqual(["submissions/new-piece/meta.json",
+                          "submissions/new-piece/piece.svg"], paths)
+        mode = (self.clone / "submissions" / "new-piece" / "piece.svg").stat().st_mode
+        self.assertEqual(0o644, mode & 0o777, "copies are never executable")
+
+    def test_an_extra_file_appearing_in_the_clone_is_caught(self):
+        EW.install_into_clone(self.clone, self.submission)
+        (self.clone / "submissions" / "new-piece" / "sneaky.txt").write_text(
+            "x", encoding="utf-8")
         with self.assertRaises(EW.GateError) as cm:
-            self.gate()
-        self.assertIn("not a root-level file", str(cm.exception))
+            EW.verify_clone_scope(self.clone, self.submission, self.wcfg)
+        self.assertIn("expected", str(cm.exception))
 
-    def test_a_symlinked_piece_is_rejected(self):
-        directory = self.clone / "submissions" / "new-piece"
-        directory.mkdir(parents=True)
-        (directory / "meta.json").write_text(
-            json.dumps(meta_for("new-piece", cycle=2, previous="already-here")),
-            encoding="utf-8")
-        secret = self.home / "id_ed25519"
-        secret.write_text("PRIVATE KEY", encoding="utf-8")
-        (directory / "piece.svg").symlink_to(secret)
+    def test_an_edited_existing_file_in_the_clone_is_caught(self):
+        EW.install_into_clone(self.clone, self.submission)
+        (self.clone / "submissions" / "index.json").write_text("[]", encoding="utf-8")
         with self.assertRaises(EW.GateError) as cm:
-            self.gate()
-        self.assertIn("symlink", str(cm.exception))
+            EW.verify_clone_scope(self.clone, self.submission, self.wcfg)
+        self.assertIn("existing path", str(cm.exception))
 
-    def test_a_symlinked_folder_is_rejected(self):
-        elsewhere = self.home / "elsewhere"
-        elsewhere.mkdir()
-        (self.clone / "submissions" / "new-piece").symlink_to(elsewhere)
-        (elsewhere / "meta.json").write_text("{}", encoding="utf-8")
+    def test_a_moved_head_in_the_clone_is_caught(self):
+        base = git(self.clone, "rev-parse", "HEAD").strip()
+        EW.install_into_clone(self.clone, self.submission)
+        git(self.clone, "config", "user.email", "t@example.com")
+        git(self.clone, "config", "user.name", "t")
+        git(self.clone, "add", "-A")
+        git(self.clone, "commit", "-m", "not the controller")
+        with self.assertRaises(EW.GateError) as cm:
+            EW.verify_clone_scope(self.clone, self.submission, self.wcfg, base)
+        self.assertIn("moved its HEAD", str(cm.exception))
+
+    def test_installing_over_an_existing_slug_is_refused(self):
+        EW.install_into_clone(self.clone, self.submission)
         with self.assertRaises(EW.GateError):
-            self.gate()
+            EW.install_into_clone(self.clone, self.submission)
 
-    def test_a_hardlinked_piece_is_rejected(self):
-        directory = write_submission(
-            self.clone, "new-piece",
-            meta_for("new-piece", cycle=2, previous="already-here"))
-        os.link(directory / "piece.svg", self.home / "second-name.svg")
+    # ── the push-redirect repro ──
+    def test_a_pushurl_is_rejected_before_anything_is_pushed(self):
+        attacker = self.home / "attacker.git"
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(attacker)],
+                       check=True, capture_output=True)
+        git(self.clone, "config", "remote.origin.pushurl", str(attacker))
+
         with self.assertRaises(EW.GateError) as cm:
-            self.gate()
-        self.assertIn("hard link", str(cm.exception))
+            EW.assert_repo_integrity(self.clone, self.wcfg)
+        self.assertIn("pushurl", str(cm.exception))
+        self.assertIn(str(self.origin), str(cm.exception))
 
-    def test_an_executable_piece_is_rejected(self):
-        directory = write_submission(
-            self.clone, "new-piece",
-            meta_for("new-piece", cycle=2, previous="already-here"))
-        os.chmod(directory / "piece.svg", 0o755)
-        with self.assertRaises(EW.GateError) as cm:
-            self.gate()
-        self.assertIn("executable", str(cm.exception))
+        refs = git_bare(attacker, "for-each-ref", "--format=%(refname)")
+        self.assertEqual("", refs.strip(), "nothing reached the attacker remote")
 
-    def test_a_fifo_is_rejected(self):
-        directory = self.clone / "submissions" / "new-piece"
-        directory.mkdir(parents=True)
-        (directory / "meta.json").write_text(
-            json.dumps(meta_for("new-piece", cycle=2, previous="already-here")),
+    def test_a_wandering_fetch_url_is_reset_to_canonical(self):
+        git(self.clone, "remote", "set-url", "origin",
+            "https://example.invalid/somewhere-else.git")
+        self.assertEqual(str(self.origin),
+                         EW.assert_repo_integrity(self.clone, self.wcfg))
+        self.assertEqual(str(self.origin),
+                         git(self.clone, "remote", "get-url", "origin").strip())
+        self.assertEqual(str(self.origin),
+                         git(self.clone, "remote", "get-url", "--push",
+                             "origin").strip())
+
+    def test_a_forged_staging_file_cannot_redirect_a_push(self):
+        """The repro from the finding, end to end.
+
+        A maker that writes something shaped like git configuration into its
+        staging area cannot affect the push at all: the file is rejected by
+        the gate, and even if it somehow reached the clone, the integrity
+        check resets the remote before the push.
+        """
+        staging = self.home / "stage2"
+        out = staging / "out"
+        out.mkdir(parents=True)
+        write_submission(out, "second-piece", meta_for("second-piece"))
+        forged = out / "submissions" / "second-piece" / ".git"
+        forged.mkdir()
+        (forged / "config").write_text(
+            "[remote \"origin\"]\n\tpushurl = https://attacker.example/x.git\n",
             encoding="utf-8")
-        os.mkfifo(directory / "piece.svg")
         with self.assertRaises(EW.GateError) as cm:
-            self.gate()
-        self.assertIn("not a regular file", str(cm.exception))
+            EW.assert_no_git(staging)
+        self.assertIn(".git", str(cm.exception))
 
+        # and the second lock: a clone whose config was tampered with never
+        # gets to the push at all
+        git(self.clone, "config", "remote.origin.pushurl",
+            "https://attacker.example/x.git")
+        with self.assertRaises(EW.GateError) as cm2:
+            EW.assert_repo_integrity(self.clone, self.wcfg)
+        self.assertIn("pushurl", str(cm2.exception))
+
+    def test_unexpected_local_config_is_rejected(self):
+        for key, value in (("core.hooksPath", "/tmp/hooks"),
+                           ("core.sshCommand", "ssh -o x=y"),
+                           ("url.https://attacker.example/.insteadOf",
+                            "https://github.com/"),
+                           ("credential.helper", "!evil")):
+            with self.subTest(key=key):
+                git(self.clone, "config", key, value)
+                with self.assertRaises(EW.GateError) as cm:
+                    EW.assert_repo_integrity(self.clone, self.wcfg)
+                self.assertIn(key.split(".")[0], str(cm.exception).lower())
+                subprocess.run(["git", "config", "--unset-all", key],
+                               cwd=str(self.clone), capture_output=True)
+
+    def test_an_alternates_file_is_rejected(self):
+        alt = self.clone / ".git" / "objects" / "info"
+        alt.mkdir(parents=True, exist_ok=True)
+        (alt / "alternates").write_text("/somewhere/else/objects\n",
+                                        encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            EW.assert_repo_integrity(self.clone, self.wcfg)
+        self.assertIn("alternates", str(cm.exception))
+
+    def test_an_executable_hook_is_rejected(self):
+        hooks = self.clone / ".git" / "hooks"
+        hooks.mkdir(exist_ok=True)
+        hook = hooks / "pre-push"
+        hook.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        hook.chmod(0o755)
+        with self.assertRaises(EW.GateError) as cm:
+            EW.assert_repo_integrity(self.clone, self.wcfg)
+        self.assertIn("hooks", str(cm.exception))
+
+    def test_a_clean_clone_passes_and_returns_the_canonical_url(self):
+        self.assertEqual(str(self.origin),
+                         EW.assert_repo_integrity(self.clone, self.wcfg))
+
+    # ── the index, verified before the push ──
     def test_the_staged_index_is_verified_against_the_gated_bytes(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"))
-        submission = self.gate()
+        EW.install_into_clone(self.clone, self.submission)
         git(self.clone, "add", "--", "submissions/new-piece")
-        paths = sorted([submission["meta_path"], submission["piece_path"]])
-        # honest index passes
-        EW.verify_staged_tree(self.clone, submission, self.wcfg, paths)
+        paths = sorted([self.submission["meta_path"], self.submission["piece_path"]])
+        EW.verify_staged_tree(self.clone, self.submission, self.wcfg, paths)
 
-        # a blob swapped in the index after the gate does not
         proc = subprocess.run(["git", "hash-object", "-w", "--stdin"],
                               cwd=str(self.clone), input=b"forged bytes",
                               capture_output=True)
@@ -1657,15 +1782,13 @@ class TreeShapeTests(GateTests):
                         f"100644,{blob},submissions/new-piece/piece.svg"],
                        cwd=str(self.clone), check=True, capture_output=True)
         with self.assertRaises(EW.GateError) as cm:
-            EW.verify_staged_tree(self.clone, submission, self.wcfg, paths)
+            EW.verify_staged_tree(self.clone, self.submission, self.wcfg, paths)
         self.assertIn("not the file that passed the gate", str(cm.exception))
 
     def test_a_symlink_mode_in_the_index_is_rejected(self):
-        write_submission(self.clone, "new-piece",
-                         meta_for("new-piece", cycle=2, previous="already-here"))
-        submission = self.gate()
+        EW.install_into_clone(self.clone, self.submission)
         git(self.clone, "add", "--", "submissions/new-piece")
-        paths = sorted([submission["meta_path"], submission["piece_path"]])
+        paths = sorted([self.submission["meta_path"], self.submission["piece_path"]])
         proc = subprocess.run(["git", "hash-object", "-w", "--stdin"],
                               cwd=str(self.clone), input=b"/etc/passwd",
                               capture_output=True)
@@ -1674,7 +1797,7 @@ class TreeShapeTests(GateTests):
                         f"120000,{blob},submissions/new-piece/piece.svg"],
                        cwd=str(self.clone), check=True, capture_output=True)
         with self.assertRaises(EW.GateError) as cm:
-            EW.verify_staged_tree(self.clone, submission, self.wcfg, paths)
+            EW.verify_staged_tree(self.clone, self.submission, self.wcfg, paths)
         self.assertIn("120000", str(cm.exception))
 
 
@@ -1769,7 +1892,7 @@ class LifecycleTests(WorkerEnv):
             released.append(EW.live_processes())
             return real_release(fd)
 
-        def slow_maker(workspace, prompt, wcfg, depth=0):
+        def slow_maker(staging, prompt, wcfg, depth=0, runtime=None):
             proc = subprocess.Popen(
                 [sys.executable, "-c", "import time; time.sleep(30)"],
                 start_new_session=True)

@@ -518,36 +518,37 @@ The neighborhood is healthy enough to make things right now. That is the only
 reason you were woken.
 
 YOUR WORKSPACE — THE ONLY PLACE YOU MAY WRITE
-  {workspace}/clone          a fresh clone of {repo} that this worker made
+  {workspace}/out/           where your submission goes (see below)
+  {workspace}/context/       what already exists, read-only to you in practice
   {workspace}/state-in.json  your private creative state from last cycle
                              ({state_in_note})
   {workspace}/state-out.json the private next state you must write
 
-Do not read or write anything outside {workspace}. Do not touch any other
-checkout on this machine; the operator keeps thousands of uncommitted files.
+There is NO repository here. You have no clone of {repo}, no .git directory,
+no git and no gh — by construction, not by instruction. Your file tools are
+rooted at {workspace} and reach nothing else on this machine.
 
 YOU MAY NOT PUBLISH. THIS IS ABSOLUTE.
-Do NOT run `git commit`, `git add`, `git push`, `git merge`, `git tag`,
-`gh pr create`, `gh pr merge`, `gh api` with a write method, or any other
-command that changes a remote or the clone's history. Do not create branches.
-Leave your files UNCOMMITTED and UNSTAGED in the clone's working tree.
+You have no shell, no git, no gh and no network tool, so there is nothing to
+run — and nothing you write can become a commit, a branch, a remote, a pull
+request or a merge. Leave two files on disk; that is the whole job.
 
 A controller — code, not a model — reads what you leave behind, checks it
-against the submission protocol deterministically, and only then creates the
-branch, the commit, the pull request and the merge. If you publish anything
-yourself, the controller rejects the whole cycle and nothing you made survives.
+against the submission protocol deterministically, copies the two files into a
+clone you never see, and only then creates the branch, the commit, the pull
+request and the merge.
 
 WHAT TO LEAVE BEHIND
-Exactly one new directory: {workspace}/clone/submissions/<your-slug>/
+Exactly one new directory: {workspace}/out/submissions/<your-slug>/
 containing exactly two files:
 
   meta.json     the protocol record (schema below)
   piece.<ext>   the work itself; ext is one of .svg .md .txt .json and MUST
                 match meta.kind; at most {max_piece_kb} KB
 
-Do not edit, move, rename or delete ANY existing file in the clone —
-including submissions/index.json and any other submission's folder. The
-controller re-reads the working tree and refuses anything else.
+Put nothing else under {workspace}/out — not a README, not a draft, not a
+directory. The controller validates that tree, copies exactly those two files
+into its own private clone, and refuses everything else.
 
 meta.json:
 {{
@@ -722,7 +723,7 @@ def _gh(*args, timeout=300):
     return r.stdout
 
 
-def run_model(workspace, prompt, wcfg, depth=0):
+def run_model(staging, prompt, wcfg, depth=0, runtime=None):
     """Spend the model in the workspace. Returns (outcome, output).
 
     Confined, not trusted: bounded file tools rooted at --add-dir, no shell,
@@ -739,21 +740,26 @@ def run_model(workspace, prompt, wcfg, depth=0):
     allowed to decide (R1).
     """
     fcfg = SS.fanout_config(wcfg)
-    workspace = Path(workspace)
+    staging = Path(staging)
+    # HOME, XDG, TMPDIR and the CLI's own logs live OUTSIDE the tool root, so
+    # the maker's file tools cannot reach even its own process state — and
+    # the staging root stays exactly what the gate expects to find (#1).
+    runtime = Path(runtime) if runtime else staging.parent / "runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
     timeout_s = int(wcfg["timeout_s"])
     try:
-        env = SS.confined_env(fcfg, workspace, depth)
+        env = SS.confined_env(fcfg, runtime, depth)
     except SS.AuthUnavailable as e:
         return OUTCOME_FAILED, f"cannot confine the maker: {e}"
     argv = SS.sandbox_wrap(
-        SS.confined_argv(prompt, wcfg["model"], workspace,
+        SS.confined_argv(prompt, wcfg["model"], staging,
                          tools=SS.MAKER_TOOLS,
-                         add_dirs=[workspace],
+                         add_dirs=[staging],
                          secret_vars=SS.secret_vars_for(fcfg),
-                         log_dir=workspace / "copilot-logs"),
-        workspace, bool(fcfg.get("sandbox_exec")))
+                         log_dir=runtime / "copilot-logs"),
+        staging, bool(fcfg.get("sandbox_exec")))
     try:
-        proc = subprocess.Popen(argv, cwd=str(workspace), env=env,
+        proc = subprocess.Popen(argv, cwd=str(staging), env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, start_new_session=True)
     except FileNotFoundError:
@@ -781,15 +787,16 @@ def run_model(workspace, prompt, wcfg, depth=0):
     return "ok", output
 
 
-def maker_argv(wcfg, workspace, prompt="P"):
+def maker_argv(wcfg, staging, prompt="P"):
     """The exact command line the maker would get. Exposed for tests."""
     fcfg = SS.fanout_config(wcfg)
+    staging = Path(staging)
     return SS.sandbox_wrap(
-        SS.confined_argv(prompt, wcfg.get("model", ""), workspace,
-                         tools=SS.MAKER_TOOLS, add_dirs=[workspace],
+        SS.confined_argv(prompt, wcfg.get("model", ""), staging,
+                         tools=SS.MAKER_TOOLS, add_dirs=[staging],
                          secret_vars=SS.secret_vars_for(fcfg),
-                         log_dir=Path(workspace) / "copilot-logs"),
-        workspace, bool(fcfg.get("sandbox_exec")))
+                         log_dir=staging.parent / "runtime" / "copilot-logs"),
+        staging, bool(fcfg.get("sandbox_exec")))
 
 
 # ── the deterministic gate ──────────────────────────────────────────────────
@@ -875,12 +882,12 @@ def _reject_external_url(value, where):
         idx += 4
 
 
-def _regular_dir(path):
+def _regular_dir(path, label="the submission folder"):
     st = os.lstat(path)
     if stat.S_ISLNK(st.st_mode):
-        raise GateError("the submission folder is a symlink")
+        raise GateError(f"{label} is a symlink")
     if not stat.S_ISDIR(st.st_mode):
-        raise GateError("the submission folder is not a directory")
+        raise GateError(f"{label} is not a directory")
 
 
 def _check_svg(raw, text):
@@ -1051,55 +1058,76 @@ def validate_dada_cycle(cycle, slug, expected_cycle, expected_previous,
                         f"is {slug!r}")
 
 
-def validate_submission(clone, wcfg, expected_cycle, expected_previous,
-                        base_branch="main", base_sha=None,
-                        expected_round1=None):
-    """Everything the controller must prove before a single remote call.
+def assert_no_git(root):
+    """A staging workspace must contain no git metadata of any kind.
 
-    Returns a dict describing the submission. Raises GateError otherwise.
+    The maker's file tools are rooted here. If a `.git` directory — or a
+    `.git` FILE pointing at one — can exist inside that root, the model can
+    write `remote.origin.pushurl` and the controller will happily push the
+    submission to somebody else's server. The fix is structural: the model
+    never gets a repository, so there is nothing to rewrite (#1).
     """
-    clone = Path(clone)
-    git_timeout = int(wcfg.get("git_timeout_s", 600))
-    if base_sha:
-        head = _git(clone, "rev-parse", "HEAD", timeout=git_timeout).strip()
-        if head != base_sha:
-            raise GateError("the model moved the clone's HEAD — it committed its "
-                            "own work, and publishing is the controller's job")
-    changes = working_tree_changes(clone, timeout=git_timeout)
-    slug, files = _new_submission_dir(changes)
+    root = Path(root)
+    for path in [root, *root.rglob("*")]:
+        if path.name in (".git", ".gitmodules", ".gitattributes"):
+            raise GateError(f"the staging workspace contains {path.name} at "
+                            f"{path.relative_to(root) if path != root else '.'}")
+
+
+def gate_directory(root, wcfg, expected_cycle, expected_previous,
+                   expected_round1=None, known_slugs=()):
+    """Validate a submission tree that has no git anywhere near it.
+
+    `root` holds exactly one thing: `submissions/<slug>/`, holding exactly
+    meta.json and piece.<ext>. Returns the submission record INCLUDING the
+    validated bytes, because the bytes are what the controller copies into
+    its own clone — re-reading the path later would re-open a file the model
+    could have swapped underneath us.
+    """
+    root = Path(root)
+    if not root.is_dir():
+        raise GateError("no new submission was left in the staging workspace")
+    top = sorted(p.name for p in root.iterdir())
+    if not top:
+        raise GateError("no new submission was left in the staging workspace")
+    if top != ["submissions"]:
+        raise GateError(f"the staging output holds {top}, expected only "
+                        f"'submissions'")
+    holder = root / "submissions"
+    _regular_dir(holder, "submissions")
+    slugs = sorted(p.name for p in holder.iterdir())
+    if not slugs:
+        raise GateError("no new submission was left in the staging workspace")
+    if len(slugs) > 1:
+        raise GateError(f"more than one new submission: {', '.join(slugs)}")
+    slug = slugs[0]
 
     if not SLUG_RE.match(slug) or len(slug) > SLUG_MAX:
         raise GateError(f"slug {slug!r} is not lowercase-alphanumeric-hyphen "
                         f"within {SLUG_MAX} characters")
+    if slug in set(known_slugs):
+        raise GateError(f"slug {slug!r} already exists on the base branch")
 
-    tracked = _git(clone, "ls-tree", "--name-only", base_branch,
-                   f"submissions/{slug}/", timeout=git_timeout).strip()
-    if tracked:
-        raise GateError(f"slug {slug!r} already exists on {base_branch}")
-
-    directory = clone / "submissions" / slug
-    _regular_dir(directory)
+    directory = holder / slug
+    _regular_dir(directory, f"submissions/{slug}")
     entries = sorted(directory.iterdir(), key=lambda p: p.name)
-    on_disk = []
+    names = []
     for entry in entries:
-        rel = entry.relative_to(clone).as_posix()
+        rel = f"submissions/{slug}/{entry.name}"
         _regular_file(entry, rel)
-        on_disk.append(rel)
-    if on_disk != files:
-        raise GateError(f"the submission folder holds {on_disk}, but git reports "
-                        f"{files}")
-    names = sorted(Path(f).name for f in files)
+        names.append(entry.name)
     if len(names) != 2 or "meta.json" not in names:
         raise GateError(f"a submission is exactly meta.json + piece.<ext>, found "
                         f"{names}")
     piece_name = [n for n in names if n != "meta.json"][0]
     piece_path = directory / piece_name
-
     meta_path = directory / "meta.json"
-    if meta_path.stat().st_size > int(wcfg.get("max_meta_bytes", 262144)):
+
+    meta_bytes = meta_path.read_bytes()
+    if len(meta_bytes) > int(wcfg.get("max_meta_bytes", 262144)):
         raise GateError("meta.json is implausibly large")
     try:
-        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta = json.loads(meta_bytes.decode("utf-8"))
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise GateError(f"meta.json is not valid json: {e}")
     if not isinstance(meta, dict):
@@ -1140,12 +1168,12 @@ def validate_submission(clone, wcfg, expected_cycle, expected_previous,
     if remix is not None:
         if not isinstance(remix, str) or not SLUG_RE.match(remix):
             raise GateError(f"meta.remix_of {remix!r} is not a slug or null")
-        known = _git(clone, "ls-tree", "--name-only", base_branch,
-                     f"submissions/{remix}/", timeout=git_timeout).strip()
-        if not known:
-            raise GateError(f"meta.remix_of {remix!r} does not exist on {base_branch}")
+        if remix not in set(known_slugs):
+            raise GateError(f"meta.remix_of {remix!r} does not exist on the "
+                            f"base branch")
 
-    raw = _check_piece(piece_path, kind, int(wcfg.get("max_piece_bytes", 51200)))
+    piece_bytes = _check_piece(piece_path, kind,
+                              int(wcfg.get("max_piece_bytes", 51200)))
     validate_dada_cycle(meta.get("_dada_cycle"), slug, expected_cycle,
                         expected_previous, expected_round1)
 
@@ -1156,9 +1184,146 @@ def validate_submission(clone, wcfg, expected_cycle, expected_previous,
         "meta": meta,
         "meta_path": f"submissions/{slug}/meta.json",
         "piece_path": f"submissions/{slug}/{piece_name}",
-        "piece_sha256": hashlib.sha256(raw).hexdigest(),
-        "meta_sha256": hashlib.sha256(meta_path.read_bytes()).hexdigest(),
+        "meta_bytes": meta_bytes,
+        "piece_bytes": piece_bytes,
+        "meta_sha256": hashlib.sha256(meta_bytes).hexdigest(),
+        "piece_sha256": hashlib.sha256(piece_bytes).hexdigest(),
     }
+
+
+def base_branch_slugs(clone, base_branch, wcfg):
+    """Every slug already published, read by the controller from its clone."""
+    listing = _git(clone, "ls-tree", "--name-only", base_branch, "submissions/",
+                   timeout=int(wcfg.get("git_timeout_s", 600)))
+    return {line.strip("/").split("/")[-1]
+            for line in listing.splitlines() if line.strip()}
+
+
+def install_into_clone(clone, submission):
+    """Copy the two VALIDATED files — as bytes — into the controller's clone.
+
+    Bytes, not paths: the gate read them, the gate hashed them, and these are
+    the same objects. Copying by path would re-open files in a directory a
+    model process was writing to seconds ago.
+    """
+    clone = Path(clone)
+    directory = clone / "submissions" / submission["slug"]
+    if directory.exists():
+        raise GateError(f"{directory} already exists in the controller's clone")
+    directory.mkdir(parents=True)
+    for rel, blob in ((submission["meta_path"], submission["meta_bytes"]),
+                      (submission["piece_path"], submission["piece_bytes"])):
+        target = clone / rel
+        with open(target, "wb") as fh:
+            fh.write(blob)
+        os.chmod(target, 0o644)
+    return directory
+
+
+def verify_clone_scope(clone, submission, wcfg, base_sha=None):
+    """After the copy, the controller's clone must hold exactly two new files.
+
+    The maker never had this directory — this catches the controller's own
+    mistakes, and anything else that touched the clone while we worked.
+    """
+    clone = Path(clone)
+    git_t = int(wcfg.get("git_timeout_s", 600))
+    if base_sha:
+        head = _git(clone, "rev-parse", "HEAD", timeout=git_t).strip()
+        if head != base_sha:
+            raise GateError("the controller's clone moved its HEAD unexpectedly")
+    changes = working_tree_changes(clone, timeout=git_t)
+    slug, files = _new_submission_dir(changes)
+    if slug != submission["slug"]:
+        raise GateError(f"the clone holds {slug!r}, expected "
+                        f"{submission['slug']!r}")
+    expected = sorted([submission["meta_path"], submission["piece_path"]])
+    if files != expected:
+        raise GateError(f"the clone holds {files}, expected {expected}")
+    for rel, digest in ((submission["meta_path"], submission["meta_sha256"]),
+                        (submission["piece_path"], submission["piece_sha256"])):
+        path = clone / rel
+        _regular_file(path, rel)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise GateError(f"{rel} in the clone is not the file that passed "
+                            f"the gate")
+    return expected
+
+
+# Local git config keys that can redirect, intercept or execute. None of them
+# belong in a clone this worker made ten minutes ago.
+FORBIDDEN_CONFIG_PREFIXES = (
+    "remote.origin.pushurl", "remote.", "url.", "core.hookspath",
+    "core.sshcommand", "core.gitproxy", "core.fsmonitor", "credential.",
+    "protocol.", "alias.", "include.", "includeif.", "filter.", "diff.",
+    "uploadpack.", "receive.",
+)
+ALLOWED_CONFIG_KEYS = {
+    "core.repositoryformatversion", "core.filemode", "core.bare",
+    "core.logallrefupdates", "core.ignorecase", "core.precomposeunicode",
+    "core.symlinks", "core.worktree", "remote.origin.url",
+    "remote.origin.fetch", "branch.main.remote", "branch.main.merge",
+    "extensions.objectformat", "init.defaultbranch",
+}
+
+
+def assert_repo_integrity(clone, wcfg):
+    """Prove, immediately before touching git, that this is still OUR clone.
+
+    A bounded repro of the real finding: the maker wrote into `clone/.git`,
+    set `remote.origin.pushurl`, and the controller pushed the branch to an
+    attacker's remote before failing later for an unrelated reason. The maker
+    can no longer reach a repository at all — and this runs anyway, before
+    every git operation, because "cannot happen" is not a check (#1).
+    """
+    clone = Path(clone)
+    git_t = int(wcfg.get("git_timeout_s", 600))
+    canonical = _repo_url(wcfg["repo"])
+
+    dot_git = clone / ".git"
+    if not dot_git.is_dir():
+        raise GateError("the clone's .git is not a directory")
+    alternates = dot_git / "objects" / "info" / "alternates"
+    if alternates.exists():
+        raise GateError("the clone has an objects/info/alternates file")
+    hooks = dot_git / "hooks"
+    if hooks.is_dir():
+        live = [h.name for h in hooks.iterdir()
+                if h.is_file() and not h.name.endswith(".sample")
+                and os.access(h, os.X_OK)]
+        if live:
+            raise GateError(f"the clone has executable git hooks: {', '.join(live)}")
+
+    # A pushurl is REJECTED, not quietly repaired: a clone that grew one
+    # since we made it is a clone something else has been writing to, and
+    # continuing would be treating an intrusion as a formatting problem.
+    existing_push = _git(clone, "config", "--local", "--get-all",
+                         "remote.origin.pushurl", timeout=git_t,
+                         check=False).strip()
+    if existing_push:
+        raise GateError(f"the clone has a remote.origin.pushurl "
+                        f"({existing_push.splitlines()[0][:80]}) — refusing to "
+                        f"push anywhere but {canonical}")
+
+    raw = _git(clone, "config", "--local", "--list", timeout=git_t, check=False)
+    for line in raw.splitlines():
+        key = line.split("=", 1)[0].strip().lower()
+        if not key or key in ALLOWED_CONFIG_KEYS:
+            continue
+        if key.startswith("branch.") and key.endswith((".remote", ".merge")):
+            continue
+        if key.startswith(FORBIDDEN_CONFIG_PREFIXES):
+            raise GateError(f"the clone carries an unexpected git config key: "
+                            f"{key}")
+
+    _git(clone, "remote", "set-url", "origin", canonical, timeout=git_t)
+    fetch_url = _git(clone, "remote", "get-url", "origin", timeout=git_t).strip()
+    push_url = _git(clone, "remote", "get-url", "--push", "origin",
+                    timeout=git_t).strip()
+    if fetch_url != canonical or push_url != canonical:
+        raise GateError(f"origin points at {fetch_url!r}/{push_url!r}, expected "
+                        f"{canonical!r}")
+    return canonical
 
 
 def validate_next_state(path, wcfg, expected_cycle, slug):
@@ -1271,6 +1436,7 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None):
     # ran before the model: that reading is up to half an hour old by now, and
     # the estate is exactly what may have changed while the model thought.
     probe_health(health, "pre-write", wcfg)
+    assert_repo_integrity(clone, wcfg)
 
     _git(clone, "fetch", "--no-tags", "origin", base, timeout=git_t)
     _git(clone, "checkout", "-b", branch, f"origin/{base}", timeout=git_t)
@@ -1299,6 +1465,9 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None):
          "commit", "-m", message, timeout=git_t)
     head = _git(clone, "rev-parse", "HEAD", timeout=git_t).strip()
     note(phase="committed", branch=branch, commit=head, blobs=blobs, paths=paths)
+    # The last thing before bytes leave this machine: prove the remote is
+    # still the remote we configured, not one somebody wrote into .git.
+    assert_repo_integrity(clone, wcfg)
     _git(clone, "push", "--set-upstream", "origin", branch, timeout=git_t)
     note(phase="pushed", branch=branch, commit=head)
 
@@ -1371,6 +1540,7 @@ def confirm_merge(clone, submission, wcfg, pr_number, paths):
     if not merge_sha:
         raise CommandError(f"PR {pr_number} reports no merge commit")
 
+    assert_repo_integrity(clone, wcfg)
     _git(clone, "fetch", "--no-tags", "origin", base, timeout=git_t)
     main_sha = _git(clone, "rev-parse", f"origin/{base}", timeout=git_t).strip()
     _git(clone, "merge-base", "--is-ancestor", merge_sha, f"origin/{base}",
@@ -1764,6 +1934,7 @@ def reconcile(cfg, wcfg, history):
     try:
         clone = workspace / "clone"
         _clone_repo(wcfg, clone)
+        assert_repo_integrity(clone, wcfg)
         submission = state.get("submission") or {}
         try:
             receipts = confirm_merge(clone, submission, wcfg, pr_number,
@@ -1882,7 +2053,9 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
                        "cycle": expected_cycle, "previous_slug": expected_previous,
                        "budget": f"{used}/{cap}", "depth": depth,
                        "children": [s["name"] for s in specs], "fanout": note,
-                       "maker_argv": maker_argv(wcfg, HOME / "state")}
+                       "maker_argv": maker_argv(
+                           wcfg, HOME / "state" / "evolve-workspaces" /
+                           "example" / "staging")}
             write_status("dry-run", note, role=slug_role, cycle=expected_cycle)
             return summary
 
@@ -1896,10 +2069,17 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
 
         install_signal_handlers()
         workspace = _make_workspace(wcfg)
-        clone = workspace / "clone"
+        clone = workspace / "clone"          # controller-private, never shared
+        staging = workspace / "staging"      # the maker's whole world
+        (staging / "out").mkdir(parents=True)
+        (staging / "context").mkdir(parents=True)
+        (workspace / "runtime").mkdir(parents=True, exist_ok=True)
         base_sha = _clone_repo(wcfg, clone)
+        assert_repo_integrity(clone, wcfg)
+        known_slugs = base_branch_slugs(clone, wcfg.get("base_branch", "main"),
+                                        wcfg)
         if creative:
-            atomic_write_json(workspace / "state-in.json", creative)
+            atomic_write_json(staging / "state-in.json", creative)
 
         # One row per cycle, written BEFORE the first model process of any
         # kind, and the child debit lands with it: a future that raises, a
@@ -1940,19 +2120,23 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
                 finalists, digest = SS.aggregate(results, fcfg)
             except SS.FanoutError as e:
                 return _finish(cfg, wcfg, history, row, OUTCOME_FANOUT, str(e))
-            atomic_write_json(workspace / "finalists.json",
+            atomic_write_json(staging / "finalists.json",
                               {"finalists": finalists, "digest": digest})
-            atomic_write_json(workspace / "round1.json",
+            atomic_write_json(staging / "round1.json",
                               SS.round1_array(finalists))
             log(f"aggregated {len(finalists)} finalists from "
                 f"{digest['healthy']}/{len(results)} healthy children")
 
-        prompt = build_prompt(cfg, wcfg, slug_role, workspace, expected_cycle,
+        # The bounded read context the maker gets INSTEAD of a repository.
+        atomic_write_json(staging / "context" / "prior.json",
+                          _prior_submissions(clone))
+        prompt = build_prompt(cfg, wcfg, slug_role, staging, expected_cycle,
                               expected_previous, history, finalists, digest)
         (workspace / "prompt.txt").write_text(prompt, encoding="utf-8")
         log(f"handing {slug_role} its situation (cycle {expected_cycle}, "
             f"budget {used + 1}/{cap})")
-        status, output = run_model(workspace, prompt, wcfg, depth)
+        status, output = run_model(staging, prompt, wcfg, depth,
+                                   workspace / "runtime")
         try:
             (LOGS / f"evolve-worker-{slug_role}-{sentinel.now():%Y%m%d-%H%M%S}.log"
              ).write_text(output, encoding="utf-8")
@@ -1969,12 +2153,16 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
 
         line = sentinel.result_line(output)
         try:
-            submission = validate_submission(clone, wcfg, expected_cycle,
-                                             expected_previous,
-                                             wcfg.get("base_branch", "main"),
-                                             base_sha,
-                                             SS.expected_round1(finalists)
-                                             if finalists else None)
+            # The staging tree first — no git anywhere near it — and only then
+            # the two validated blobs into the controller's own clone.
+            assert_no_git(staging)
+            submission = gate_directory(staging / "out", wcfg, expected_cycle,
+                                        expected_previous,
+                                        SS.expected_round1(finalists)
+                                        if finalists else None,
+                                        known_slugs)
+            install_into_clone(clone, submission)
+            verify_clone_scope(clone, submission, wcfg, base_sha)
         except GateError as e:
             if str(line).upper().startswith("DECLINED") and "no new submission" in str(e):
                 return _finish(cfg, wcfg, history, row, OUTCOME_DECLINED, line)
@@ -1985,7 +2173,7 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
                            f"gate: {type(e).__name__}: {e}")
 
         try:
-            next_state = validate_next_state(workspace / "state-out.json", wcfg,
+            next_state = validate_next_state(staging / "state-out.json", wcfg,
                                              expected_cycle, submission["slug"])
         except GateError as e:
             return _finish(cfg, wcfg, history, row, OUTCOME_REJECTED, f"gate: {e}")
@@ -2000,6 +2188,8 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             "submission": {k: submission[k] for k in
                            ("slug", "title", "kind", "meta", "meta_path",
                             "piece_path", "meta_sha256", "piece_sha256")},
+            # (bytes are deliberately not persisted: the digests are the
+            # contract, and reconciliation re-reads the merged file anyway)
             "next_state": next_state,
         })
         note()
