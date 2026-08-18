@@ -720,6 +720,18 @@ def peer_roll_call(stale_minutes=90):
             else:
                 info["advancing"] = prev["heads"] != info["heads"]
                 info["advancing_basis"] = "compared"
+                # Per-slug, additive: a peer whose SENTINEL still ticks but
+                # whose seated author stopped shows as advancing=True on the
+                # whole map — the mirror image of the storyteller stall this
+                # exists to see from the other side of the tailnet. Only slugs
+                # present in both observations can be judged; a new slug is
+                # first-sight and is not listed either way.
+                info["stalled_slugs"] = sorted(
+                    k for k, h in info["heads"].items()
+                    if k in prev["heads"] and prev["heads"][k] == h)
+                info["moving_slugs"] = sorted(
+                    k for k, h in info["heads"].items()
+                    if k in prev["heads"] and prev["heads"][k] != h)
             info["alive"] = (info.get("age_minutes") is not None
                              and info["age_minutes"] < stale_minutes)
             seen[slug] = {"heads": info["heads"], "at": utc_now()}

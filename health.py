@@ -121,6 +121,123 @@ def _watcher_config():
     return merged
 
 
+def _neighbor_cadence():
+    """config.json's `neighbor_cadence` map — {slug: {max_stale_minutes,
+    kinds?, worked_kinds?, max_unworked_minutes?}} — validated per entry.
+
+    Absent or malformed → {} (nothing declared, and the check says so). A
+    seated AI that emits frames is only "moving" by declaration: the roster
+    (`neighbors`) says WHO is at the bar, this says HOW OFTEN each one is
+    expected to speak, and — R2, ran is not worked — which frame kinds count
+    as work. Per-slug and additive: undeclared slugs are untouched, so the
+    live default cast keeps its "staleness never fails" behaviour.
+    """
+    out = {}
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        raw = cfg.get("neighbor_cadence")
+        if not isinstance(raw, dict):
+            return {}
+        for slug, spec in raw.items():
+            if not (isinstance(slug, str) and isinstance(spec, dict)):
+                continue
+            try:
+                stale = float(spec.get("max_stale_minutes"))
+            except (TypeError, ValueError):
+                continue
+            if stale <= 0:
+                continue
+            entry = {"max_stale_minutes": stale}
+            for key in ("kinds", "worked_kinds"):
+                v = spec.get(key)
+                if isinstance(v, list) and all(isinstance(k, str) for k in v) and v:
+                    entry[key] = list(v)
+            try:
+                unworked = float(spec.get("max_unworked_minutes"))
+                if unworked > 0 and "worked_kinds" in entry:
+                    entry["max_unworked_minutes"] = unworked
+            except (TypeError, ValueError):
+                pass
+            out[slug] = entry
+    except Exception:
+        return {}
+    return out
+
+
+def _frame_age_minutes(frame, now):
+    try:
+        t = datetime.strptime(frame["utc"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+            tzinfo=timezone.utc)
+    except Exception:
+        return None
+    return (now - t).total_seconds() / 60
+
+
+def _neighbors_moving():
+    """w_neighbor_moving — every neighbor with a DECLARED cadence has spoken
+    within it, and (if declared) has actually WORKED within its work bar.
+
+    Two bars on purpose. `max_stale_minutes` catches a loop that died: no
+    frame of any listed kind inside the window. `max_unworked_minutes` +
+    `worked_kinds` catch the quieter failure this check exists for — a loop
+    that keeps ticking and keeps declining or failing, so its chain advances
+    beautifully while nothing gets made. Frames are read from the chain
+    itself (never a heartbeat file the loop could stamp without working), and
+    the chain is the record the sentinel re-verifies from genesis.
+
+    Nothing declared → ok, and the detail says so; a reader can see the
+    check is present and unarmed rather than mistaking silence for coverage.
+    Non-critical on purpose: an author that stopped is a state change to
+    text about, not an outage that should freeze the whole verdict.
+    """
+    cadence = _neighbor_cadence()
+    if not cadence:
+        return C.ok("w_neighbor_moving", "no neighbor cadences declared")
+    try:
+        import neighborhood as NB
+    except Exception as e:  # pragma: no cover
+        return C.fail("w_neighbor_moving",
+                      f"neighborhood unreadable: {type(e).__name__}: {e}", critical=False)
+    now = datetime.now(timezone.utc)
+    bad, fine = [], []
+    for slug, spec in sorted(cadence.items()):
+        try:
+            chain = NB.read_chain(slug)
+        except Exception as e:
+            bad.append(f"{slug}: chain unreadable ({type(e).__name__})")
+            continue
+        kinds = spec.get("kinds")
+        spoke = [f for f in chain if (not kinds or f.get("kind") in kinds)]
+        if not spoke:
+            bad.append(f"{slug}: no frames yet" + (f" of kinds {kinds}" if kinds else ""))
+            continue
+        age = _frame_age_minutes(spoke[-1], now)
+        if age is None:
+            bad.append(f"{slug}: last frame has an unreadable utc")
+            continue
+        if age > spec["max_stale_minutes"]:
+            bad.append(f"{slug}: last frame {age:.0f}m ago (bar {spec['max_stale_minutes']:.0f}m)")
+            continue
+        note = f"{slug}: spoke {age:.0f}m ago"
+        worked_kinds = spec.get("worked_kinds")
+        if worked_kinds and "max_unworked_minutes" in spec:
+            worked = [f for f in chain if f.get("kind") in worked_kinds]
+            if not worked:
+                bad.append(f"{slug}: has spoken but never worked (no {worked_kinds} frame)")
+                continue
+            wage = _frame_age_minutes(worked[-1], now)
+            if wage is None or wage > spec["max_unworked_minutes"]:
+                shown = "?" if wage is None else f"{wage:.0f}"
+                bad.append(f"{slug}: alive but last WORKED {shown}m ago "
+                           f"(bar {spec['max_unworked_minutes']:.0f}m) - ran is not worked")
+                continue
+            note += f", worked {wage:.0f}m ago"
+        fine.append(note)
+    if bad:
+        return C.fail("w_neighbor_moving", "; ".join(bad), critical=False)
+    return C.ok("w_neighbor_moving", "; ".join(fine))
+
+
 def _listening_pid(port):
     """The PID LISTENING on `port`, or None.
 
@@ -562,6 +679,10 @@ def probe_watchers():
     # A fresh tick of stale code still reports stale answers: last_run.json
     # moving proves the loop is alive, never that it is the loop we merged.
     out.append(_deployed_code_is_current())
+
+    # Seated neighbors with a declared cadence must have spoken — and worked —
+    # inside it. Read from their chains, not from anything they could stamp.
+    out.append(_neighbors_moving())
     return out, disabled
 
 
