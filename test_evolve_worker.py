@@ -1952,30 +1952,37 @@ class CleanupIntegrityTests(WorkerEnv):
                          "resolves the url")
 
     def test_every_raw_git_subprocess_lives_in_an_isolated_helper(self):
-        """Only three functions may hand a git command to the OS, and two of
-        them set the sanitized environment for everybody else."""
+        """Only these functions may hand a git/gh command to the OS, and they
+        are the ones that pin the binary and set the sanitized environment."""
         import ast
         path = Path(__file__).resolve().parent / "evolve_worker.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        allowed = {"_git", "_git_bytes", "_credential_helper"}
+        allowed = {"_git", "_git_bytes", "_credential_helper", "_gh"}
         found = {}
+
+        def argv0_is_a_binary(call):
+            if not (isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "run"
+                    and getattr(call.func.value, "id", "") == "subprocess"
+                    and call.args and isinstance(call.args[0], ast.List)
+                    and call.args[0].elts):
+                return False
+            first = call.args[0].elts[0]
+            if isinstance(first, ast.Constant) and first.value in ("git", "gh"):
+                return True
+            return (isinstance(first, ast.Call)
+                    and getattr(first.func, "id", "") in ("git_binary",
+                                                          "gh_binary"))
+
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             for inner in ast.walk(node):
-                if (isinstance(inner, ast.Call)
-                        and isinstance(inner.func, ast.Attribute)
-                        and inner.func.attr == "run"
-                        and getattr(inner.func.value, "id", "") == "subprocess"
-                        and inner.args
-                        and isinstance(inner.args[0], ast.List)
-                        and inner.args[0].elts
-                        and getattr(inner.args[0].elts[0], "value", "") == "git"):
-                    found.setdefault(node.name, 0)
-                    found[node.name] += 1
+                if isinstance(inner, ast.Call) and argv0_is_a_binary(inner):
+                    found[node.name] = found.get(node.name, 0) + 1
         self.assertEqual(allowed, set(found),
-                         f"raw git subprocess calls appeared outside the "
-                         f"isolated helpers: {sorted(set(found) - allowed)}")
+                         f"git/gh subprocess calls appeared outside the pinned "
+                         f"helpers: {sorted(set(found) - allowed)}")
 
 
 class CloneIsolationTests(WorkerEnv):
@@ -2315,6 +2322,155 @@ class HostileEnvironmentTests(WorkerEnv):
         self.assertIn("GIT_ENV_ALLOWLIST", source)
         self.assertNotIn("GIT_ENV_STRIP", source,
                          "a denylist has to be complete to be correct")
+
+
+class FakeGitOnPathTests(WorkerEnv):
+    """An absolute, existing directory on PATH holding a fake `git` (#HIGH).
+
+    The previous sanitiser kept any absolute existing directory, and every
+    controller call invoked a bare `git` — so a hostile PATH entry chose the
+    binary that everything else was busy reasoning about. The fix is to stop
+    resolving git through PATH at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.marker = self.home / "FAKE-GIT-RAN"
+        self.fakebin = self.home / "fakebin"
+        self.fakebin.mkdir()
+        fake = self.fakebin / "git"
+        fake.write_text(
+            f'#!/bin/sh\ntouch "{self.marker}"\nexec /usr/bin/git "$@"\n',
+            encoding="utf-8")
+        fake.chmod(0o755)
+        # the same trick for the helper the credential path would run
+        helper = self.fakebin / "git-credential-osxkeychain"
+        helper.write_text(f'#!/bin/sh\ntouch "{self.marker}"\nexit 0\n',
+                          encoding="utf-8")
+        helper.chmod(0o755)
+        self.hostile_path = {"PATH": f"{self.fakebin}:/usr/bin:/bin"}
+        self.wcfg = dict(EW.worker_config({}), repo=str(self.origin))
+
+    def fresh(self):
+        return mock.patch.object(EW, "_GIT_ENV", None)
+
+    # ── the vector, proved to work without the controller ──
+    def test_the_fake_git_wins_for_a_naive_caller(self):
+        proc = subprocess.run(["git", "--version"], capture_output=True,
+                              text=True, env={**os.environ, **self.hostile_path})
+        self.assertEqual(0, proc.returncode)
+        self.assertTrue(self.marker.exists(),
+                        "the repro is broken if a bare `git` does not pick up "
+                        "the fake binary")
+
+    # ── and cannot win anywhere in the controller ──
+    def test_credential_helper_discovery_uses_the_pinned_binary(self):
+        with mock.patch.dict(os.environ, self.hostile_path), self.fresh():
+            EW._credential_helper()
+        self.assertFalse(self.marker.exists(),
+                         "the credential helper read ran a fake git")
+
+    def test_initial_acquisition_uses_the_pinned_binary(self):
+        clone = self.home / "clone"
+        with mock.patch.dict(os.environ, self.hostile_path), self.fresh():
+            head = EW._clone_repo(self.wcfg, clone)
+        self.assertFalse(self.marker.exists(), "the clone ran a fake git")
+        self.assertEqual(git_bare(self.origin, "rev-parse", "main").strip(), head)
+
+    def test_a_full_cycle_uses_the_pinned_binary(self):
+        with mock.patch.dict(os.environ, self.hostile_path), self.fresh(), \
+             mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        self.assertFalse(self.marker.exists(), "the cycle ran a fake git")
+
+    def test_cleanup_uses_the_pinned_binary(self):
+        clone = self.home / "clone-cleanup"
+        with self.fresh():
+            EW._clone_repo(self.wcfg, clone)
+        git(clone, "config", "user.email", "t@example.com")
+        git(clone, "config", "user.name", "t")
+        git(clone, "checkout", "-q", "-b", "art/doomed")
+        (clone / "x.txt").write_text("x", encoding="utf-8")
+        git(clone, "add", "-A")
+        git(clone, "commit", "-qm", "doomed")
+        git(clone, "push", "-q", "-u", "origin", "art/doomed")
+        git(clone, "config", "remote.origin.pushurl", str(self.home / "x.git"))
+
+        with mock.patch.dict(os.environ, self.hostile_path), self.fresh():
+            self.assertTrue(EW._delete_remote_branch(clone, "art/doomed",
+                                                     self.wcfg))
+        self.assertFalse(self.marker.exists(), "the cleanup ran a fake git")
+        self.assertNotIn("art/doomed",
+                         git_bare(self.origin, "for-each-ref",
+                                  "--format=%(refname)"))
+
+    # ── the pin itself ──
+    def test_the_pinned_binary_is_absolute_and_trusted(self):
+        with mock.patch.dict(os.environ, self.hostile_path):
+            binary = EW.git_binary()
+        self.assertTrue(binary.startswith(("/usr/bin/", "/bin/")), binary)
+        self.assertNotIn(str(self.fakebin), binary)
+
+    def test_the_path_handed_to_git_inherits_nothing(self):
+        with mock.patch.dict(os.environ, self.hostile_path), self.fresh():
+            env = EW.controller_git_env()
+        self.assertNotIn(str(self.fakebin), env["PATH"])
+        self.assertEqual(list(EW.TRUSTED_PATH_DIRS), env["PATH"].split(os.pathsep))
+
+    def test_a_configured_binary_outside_a_trusted_root_is_refused(self):
+        with self.assertRaises(EW.GateError) as cm:
+            EW.git_binary({"git_binary": str(self.fakebin / "git")})
+        self.assertIn("trusted root", str(cm.exception))
+
+    def test_a_symlink_from_a_trusted_root_to_an_untrusted_target_is_refused(self):
+        link = self.home / "link-git"
+        link.symlink_to(self.fakebin / "git")
+        with self.assertRaises(EW.GateError):
+            EW.git_binary({"git_binary": str(link)})
+
+    def test_a_non_executable_or_writable_binary_is_refused(self):
+        plain = self.home / "plain"
+        plain.write_text("#!/bin/sh\n", encoding="utf-8")
+        with self.assertRaises(EW.GateError):
+            EW.git_binary({"git_binary": str(plain),
+                           "trusted_bin_roots": [str(self.home)]})
+        plain.chmod(0o777)
+        with self.assertRaises(EW.GateError) as cm:
+            EW.git_binary({"git_binary": str(plain),
+                           "trusted_bin_roots": [str(self.home)]})
+        self.assertIn("writable", str(cm.exception))
+
+    def test_a_configured_trusted_binary_is_accepted(self):
+        self.assertEqual("/usr/bin/git",
+                         EW.git_binary({"git_binary": "/usr/bin/git"}))
+
+    def test_gh_is_validated_too(self):
+        # gh may live in a package-manager prefix, so the rule is "absolute,
+        # regular, executable, not writable by anybody else" rather than a
+        # system root — but it is still a rule.
+        with self.assertRaises(EW.GateError) as cm:
+            EW.gh_binary({"gh_binary": "gh"})
+        self.assertIn("absolute", str(cm.exception))
+
+        loose = self.home / "loose-gh"
+        loose.write_text("#!/bin/sh\n", encoding="utf-8")
+        loose.chmod(0o777)
+        with self.assertRaises(EW.GateError) as cm:
+            EW.gh_binary({"gh_binary": str(loose)})
+        self.assertIn("writable", str(cm.exception))
+
+        loose.chmod(0o755)
+        self.assertEqual(str(loose.resolve()),
+                         EW.gh_binary({"gh_binary": str(loose)}))
+
+    def test_no_bare_git_or_gh_invocation_survives_in_the_source(self):
+        source = (Path(__file__).resolve().parent / "evolve_worker.py").read_text(
+            encoding="utf-8")
+        self.assertNotIn('subprocess.run(["git"', source,
+                         "git must be invoked through the pinned binary")
+        self.assertNotIn('subprocess.run(["gh"', source,
+                         "gh must be invoked through the resolved binary")
 
 
 class LifecycleTests(WorkerEnv):

@@ -707,47 +707,138 @@ def _repo_owner(repo):
 # same is true of LD_PRELOAD, DYLD_INSERT_LIBRARIES, GIT_TEMPLATE_DIR and
 # whatever the next release adds. So nothing is inherited unless it is named
 # here, and everything else the controller sets itself.
-GIT_ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "LC_CTYPE")
+# PATH is deliberately absent: it is SET, never inherited (see trusted_path).
+GIT_ENV_ALLOWLIST = ("LANG", "LC_ALL", "LC_CTYPE")
 
 # Optional, and only when they point at something that exists: some builds
 # need them to verify TLS, and a broken cert path is a confusing outage.
 GIT_ENV_CERT_VARS = ("SSL_CERT_FILE", "SSL_CERT_DIR")
 
-DEFAULT_PATH_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
-                     "/usr/sbin", "/sbin")
+# Directories a hostile actor should not be able to write, and the only
+# places the controller will accept a git binary from. /usr/bin/git exists on
+# macOS and on Ubuntu CI; Homebrew's prefix is deliberately NOT here, because
+# it is writable by the same user a compromised model process would run as.
+TRUSTED_BIN_ROOTS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+# PATH is not inherited at all. Git needs a PATH for its own helpers; it does
+# not need the operator's, and "an absolute directory that exists" turned out
+# to include an attacker's directory holding a fake `git`.
+TRUSTED_PATH_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
+
+GIT_BINARY_CANDIDATES = ("/usr/bin/git", "/bin/git")
 
 # Only these protocols. `ext::` in particular runs a command of the URL's
 # choosing, which is a remote that executes.
 GIT_ALLOWED_PROTOCOLS = "https:file"
 
 _GIT_ENV = None
+_GIT_BINARY = None
+_GH_BINARY = None
 
 
-def _safe_path(raw):
-    """PATH reduced to absolute, existing directories, with git findable.
+def _trusted_executable(path, roots, label):
+    """An absolute, real, executable file under a root nobody else can write.
 
-    A relative entry resolves against the current directory, which for a
-    controller that cd's into repositories is an attacker-influenced lookup
-    path for `git` itself and for every credential helper it runs.
+    resolve() first: a symlink under /usr/bin pointing at /tmp/git is a
+    trusted path that is not a trusted binary.
     """
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        raise GateError(f"{label} {path!r} is not an absolute path")
+    resolved = candidate.resolve()
+    if not any(str(resolved).startswith(root.rstrip("/") + "/")
+               for root in roots):
+        raise GateError(f"{label} {resolved} is not under a trusted root "
+                        f"({', '.join(roots)})")
+    try:
+        st = os.stat(resolved)
+    except OSError as e:
+        raise GateError(f"{label} {resolved} is unusable: {e}")
+    if not stat.S_ISREG(st.st_mode):
+        raise GateError(f"{label} {resolved} is not a regular file")
+    if not os.access(resolved, os.X_OK):
+        raise GateError(f"{label} {resolved} is not executable")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise GateError(f"{label} {resolved} is group- or world-writable")
+    return str(resolved)
+
+
+def git_binary(wcfg=None):
+    """The one git this controller will run, pinned independently of PATH.
+
+    `_git` used to invoke a bare `git`, resolved through a PATH that kept any
+    absolute existing directory — so an attacker's directory holding a fake
+    `git` was consulted before /usr/bin. Everything downstream of that — the
+    integrity check, the url validation, the environment allowlist — is
+    reasoning about a binary somebody else chose.
+    """
+    global _GIT_BINARY
+    configured = (wcfg or {}).get("git_binary")
+    roots = tuple((wcfg or {}).get("trusted_bin_roots") or TRUSTED_BIN_ROOTS)
+    if configured:
+        return _trusted_executable(configured, roots, "git_binary")
+    if _GIT_BINARY:
+        return _GIT_BINARY
+    problems = []
+    for candidate in GIT_BINARY_CANDIDATES:
+        try:
+            _GIT_BINARY = _trusted_executable(candidate, roots, "git")
+            return _GIT_BINARY
+        except GateError as e:
+            problems.append(str(e))
+    raise GateError("no trusted git binary found: " + "; ".join(problems))
+
+
+def gh_binary(wcfg=None):
+    """The GitHub CLI, resolved once and validated.
+
+    Softer than git: `gh` normally lives in a package-manager prefix that the
+    operator owns, so requiring a system root would break every real install.
+    It must still be an absolute, regular, executable file that is not
+    group- or world-writable, and the choice is logged rather than assumed.
+    """
+    global _GH_BINARY
+    configured = (wcfg or {}).get("gh_binary")
+    if configured:
+        return _trusted_executable(configured, ("/",), "gh_binary")
+    if _GH_BINARY:
+        return _GH_BINARY
+    found = shutil.which("gh", path=os.pathsep.join(TRUSTED_PATH_DIRS))
+    if not found:
+        found = shutil.which("gh", path=os.environ.get("PATH", ""))
+    if not found:
+        raise CommandError("gh is not on PATH")
+    _GH_BINARY = _trusted_executable(found, ("/",), "gh")
+    log(f"using gh at {_GH_BINARY}")
+    return _GH_BINARY
+
+
+def trusted_path(wcfg=None):
+    """The PATH git runs with: trusted system directories, nothing inherited.
+
+    Git needs a PATH for its own helpers (credential helpers, remote helpers
+    it resolves by name). It does not need the operator's, and "an absolute
+    directory that exists" included an attacker's directory holding a fake
+    `git` — which is how a PATH sanitiser became an execution vector.
+    """
+    dirs = tuple((wcfg or {}).get("trusted_path_dirs") or TRUSTED_PATH_DIRS)
     keep = []
-    for entry in str(raw or "").split(os.pathsep):
-        if entry.startswith("/") and os.path.isdir(entry):
-            keep.append(entry)
-    if not any(os.path.exists(os.path.join(d, "git")) for d in keep):
-        keep = [d for d in DEFAULT_PATH_DIRS if os.path.isdir(d)] + keep
-    ordered = list(dict.fromkeys(keep))
-    return os.pathsep.join(ordered) or "/usr/bin:/bin"
+    for entry in dirs:
+        if not str(entry).startswith("/"):
+            raise GateError(f"trusted_path_dirs entry {entry!r} is not absolute")
+        if os.path.isdir(entry):
+            keep.append(str(entry))
+    return os.pathsep.join(dict.fromkeys(keep)) or "/usr/bin:/bin"
 
 
-def _minimal_env(source=None):
+def _minimal_env(source=None, wcfg=None):
     """Exactly the inherited variables the controller has decided to keep."""
     src = dict(source if source is not None else os.environ)
     env = {}
     for key in GIT_ENV_ALLOWLIST:
         if key in src and src[key]:
             env[key] = src[key]
-    env["PATH"] = _safe_path(env.get("PATH"))
+    env["PATH"] = trusted_path(wcfg)
     for key in GIT_ENV_CERT_VARS:
         value = src.get(key)
         if value and value.startswith("/") and os.path.exists(value):
@@ -771,7 +862,7 @@ def _credential_helper():
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_TERMINAL_PROMPT"] = "0"
     try:
-        r = subprocess.run(["git", "config", "--global", "--get-all",
+        r = subprocess.run([git_binary(), "config", "--global", "--get-all",
                             "credential.helper"], capture_output=True,
                            text=True, timeout=30, env=env)
     except Exception:
@@ -840,8 +931,8 @@ def controller_git_env(home=None):
 
 
 def _git(cwd, *args, timeout=600, check=True, env=None):
-    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
-                       text=True, timeout=timeout,
+    r = subprocess.run([git_binary(), *args], cwd=str(cwd),
+                       capture_output=True, text=True, timeout=timeout,
                        env=env if env is not None else controller_git_env())
     if check and r.returncode != 0:
         raise CommandError(f"git {' '.join(args)} exited {r.returncode}: "
@@ -850,8 +941,9 @@ def _git(cwd, *args, timeout=600, check=True, env=None):
 
 
 def _git_bytes(cwd, *args, timeout=600):
-    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
-                       timeout=timeout, env=controller_git_env())
+    r = subprocess.run([git_binary(), *args], cwd=str(cwd),
+                       capture_output=True, timeout=timeout,
+                       env=controller_git_env())
     if r.returncode != 0:
         raise CommandError(f"git {' '.join(args)} exited {r.returncode}")
     return r.stdout
@@ -932,7 +1024,7 @@ def _git_remote(clone, wcfg, *args, timeout=600, check=True):
 
 
 def _gh(*args, timeout=300):
-    r = subprocess.run(["gh", *args], capture_output=True, text=True,
+    r = subprocess.run([gh_binary(), *args], capture_output=True, text=True,
                        timeout=timeout)
     if r.returncode != 0:
         raise CommandError(f"gh {' '.join(args)} exited {r.returncode}: "
