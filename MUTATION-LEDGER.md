@@ -159,6 +159,7 @@ check keeps its history.*
 | `w_brainstem` | ledger row (503 / unreachable / responds-but-blank) | proven |
 | `w_checks_complete` | ledger row; `CompletenessRegressionTests` in `test_static_delivery.py` | proven |
 | `w_openrappter` | ledger row (nothing LISTENING on :18790) | proven |
+| `w_sentinel_current` | `prove_sentinel_current.py` (ships with the check) | proven |
 | `w_sentinel_fresh` | ledger row (last_run.json moved 9h into the past) | proven |
 | `w_openrappter_spin` | `prove_spinning_job.py` | landed in #76 |
 | `w_freshness_paired` | `prove_freshness_pairing.py` | landed in #76 |
