@@ -189,7 +189,7 @@ The worker (`evolve_worker.py`, `com.rapp.evolve-worker`, every 30 min):
 | nonblocking `flock` | two passes never overlap; a killed pass leaves no stale lock |
 | global cadence + rolling daily budget | shared across roles, in its own ledger, never repair's |
 | fail-closed ledgers | a corrupt or truncated history **stops the pass**; it is never read as "no spend" |
-| health at start, before the push, before the merge | any **critical** check aborts; degraded proceeds only when *every* failing id is in `degraded_allowlist` — `evolve_on_degraded` is ignored here |
+| health at start, before the push, before the merge | any **critical** check aborts; degraded proceeds only when *every* failing id is in `degraded_allowlist` — `evolve_on_degraded` is ignored here, and `alert_delivery` / `health_runtime` refuse to be allowlisted at all |
 | temp clone | the model works only in a worker-made clone and is told, explicitly, that it may not commit, push, open a PR, or merge |
 | bounded sub-sentinel fan-out | optional: 3-5 read-only children in separate processes with no repo, no token and no ability to spawn children, aggregated deterministically into exactly 10 finalists — see below |
 | deterministic gate | exactly one new `submissions/<slug>/`, exactly `meta.json` + `piece.<ext>`, no existing path touched, valid slug/schema/kind/extension/license, piece ≤ 50 KB, SVG parses with no script, no `on*` handler and no external reference, and `_dada_cycle` proving 1-5 rounds of **exactly 10** scored candidates with a winner that names the piece |
@@ -237,6 +237,16 @@ opened does not; an abort after the PR does not. The message is built inside
 the same branch that already re-read the merge commit from `origin/main` and
 compared the merged bytes to the gated bytes — so if the text arrives, the art
 is live at the URL in it.
+
+It is queued through the ordinary outbox exactly once, like every other alert,
+and the delivery layer classifies it: sent, unverified, or dead-lettered after
+its retries. This worker never asserts delivery — it hands the message over and
+stops talking. That matters because the **art arm refuses to run at all while
+`alert_delivery` is failing**: unverified or dead-lettered alerts mean the
+estate cannot reach a human, and a system that makes paintings while its own
+alarm is broken is the exact silence this repo exists to refuse. Naming
+`alert_delivery` in `degraded_allowlist` does not help; it is one of two ids
+(with `health_runtime`) the gate refuses to silence.
 
 Set `commons_repo` to `owner/name` to get the links; without it the message
 still sends with the PR URL and says plainly that no public URL was derivable.

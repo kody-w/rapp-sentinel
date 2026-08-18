@@ -22,6 +22,9 @@ import sentinel
 import subsentinels as SS
 
 SCRATCH = Path(__file__).resolve().parent / ".tmp-evolve-worker-tests"
+# Captured before any test patches it: ArtDeliveryTests puts the REAL notify
+# back so it can watch the genuine path reach the genuine queue.
+REAL_NOTIFY = sentinel.notify
 NOW = datetime(2026, 8, 17, 22, 0, tzinfo=timezone.utc)
 
 
@@ -316,6 +319,39 @@ class HealthGateTests(unittest.TestCase):
     def test_healthy_passes(self):
         ok, _ = EW.health_gate({}, healthy())
         self.assertTrue(ok)
+
+    def test_alert_delivery_cannot_be_allowlisted(self):
+        # Since 232ce7e an unverifiable or dead-lettered send fails this check
+        # instead of passing optimistically. Art must not outrun the channel
+        # that would report it.
+        verdict = {"status": "degraded", "critical": [],
+                   "failed": ["alert_delivery"]}
+        for allowlist in ([], ["alert_delivery"],
+                          ["alert_delivery", "w_openrappter_spin"]):
+            with self.subTest(allowlist=allowlist):
+                ok, why = EW.health_gate({"degraded_allowlist": allowlist}, verdict)
+                self.assertFalse(ok, "unverified/dead-letter alerts block new art")
+                self.assertIn("alert_delivery", why)
+                self.assertIn("cannot be allowlisted", why)
+
+    def test_a_blind_health_run_cannot_be_allowlisted_either(self):
+        ok, why = EW.health_gate({"degraded_allowlist": ["health_runtime"]},
+                                 {"status": "degraded", "critical": [],
+                                  "failed": ["health_runtime"]})
+        self.assertFalse(ok)
+        self.assertIn("cannot be allowlisted", why)
+
+    def test_the_unskippable_set_is_exactly_what_it_claims(self):
+        self.assertEqual({"alert_delivery", "health_runtime"},
+                         set(EW.NEVER_ALLOWLISTABLE))
+
+    def test_alert_delivery_blocks_even_beside_allowlisted_noise(self):
+        ok, why = EW.health_gate(
+            {"degraded_allowlist": ["w_openrappter_spin", "alert_delivery"]},
+            {"status": "degraded", "critical": [],
+             "failed": ["w_openrappter_spin", "alert_delivery"]})
+        self.assertFalse(ok)
+        self.assertIn("alert_delivery", why)
 
 
 # ── the deterministic gate ──────────────────────────────────────────────────
@@ -1331,6 +1367,101 @@ class ArtUrlTests(unittest.TestCase):
             {"report_number": "+1555", "notify_handle": "+1999"}))
         self.assertEqual("+1999", EW.art_recipient({"notify_handle": "+1999"}))
         self.assertEqual("", EW.art_recipient({}))
+
+
+class ArtDeliveryTests(WorkerEnv):
+    """The art text goes through the ordinary outbox — once — and is then the
+    delivery layer's business to classify, not this worker's to assert."""
+
+    def setUp(self):
+        super().setUp()
+        import outbox
+        import standup
+        self.outbox = outbox
+        self.enqueued = []
+        # sentinel.notify is NOT patched here: the point is to watch the real
+        # notify path reach the real queue exactly once.
+        for target, name, value in (
+                (EW.sentinel, "notify", REAL_NOTIFY),
+                (outbox, "enqueue", lambda text, to, attachments=None:
+                 self.enqueued.append({"text": text, "to": to,
+                                       "attachments": attachments})),
+                (outbox, "drain", mock.Mock(return_value=(1, 0, "sent"))),
+                (standup, "portable_snapshot", mock.Mock(return_value="snap.html")),
+                (standup, "publish_snapshot",
+                 mock.Mock(return_value=["http://192.0.2.9:9797/share/x.html"])),
+        ):
+            p = mock.patch.object(target, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.drain = outbox.drain
+        self.snapshot = standup.portable_snapshot
+
+    def test_a_verified_merge_enqueues_exactly_one_message(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        self.assertEqual(1, len(self.enqueued), "one merge, one queued message")
+        message = self.enqueued[0]
+        self.assertEqual("+15550000002", message["to"])
+        self.assertIn("New Piece", message["text"])
+        self.assertIn("View: https://kody-w.github.io/public-art-collective/"
+                      "submissions/new-piece/piece.svg", message["text"])
+        self.assertIn("Static HTML report:", message["text"],
+                      "the rebuilt report rides along as evidence")
+        self.assertTrue(self.snapshot.call_args.kwargs["rebuild"])
+        self.assertEqual(1, self.drain.call_count,
+                         "the delivery layer, not this worker, decides what "
+                         "'sent' means")
+
+    def test_a_queue_only_instance_still_enqueues_and_never_sends(self):
+        cfg = dict(self.cfg, notify_queue_only=True)
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            EW.run_once(cfg=cfg, health=lambda phase: healthy())
+        self.assertEqual(1, len(self.enqueued))
+        self.drain.assert_not_called()
+
+    def test_nothing_is_enqueued_when_the_merge_is_not_verified(self):
+        phases = {"start": healthy(), "pre-write": healthy(),
+                  "pre-merge": critical("rb_workflows")}
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg,
+                                  health=lambda phase: phases[phase])
+        self.assertEqual(EW.OUTCOME_ABORTED, summary["outcome"])
+        self.assertEqual(1, len(self.enqueued), "the abort is reported…")
+        self.assertNotIn("View:", self.enqueued[0]["text"], "…but not as art")
+        self.assertNotIn(EW.SUCCESS_PREFIX, self.enqueued[0]["text"])
+
+    def test_the_worker_never_claims_delivery_it_cannot_verify(self):
+        # A queue that cannot be drained must not turn a merge into a failure,
+        # and must not turn a failed send into a success either: the merge is
+        # recorded, the message is queued, and alert_delivery is what tells a
+        # human the channel is broken.
+        self.outbox.drain.side_effect = RuntimeError("Messages is not running")
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"])
+        self.assertEqual(1, len(self.enqueued))
+        row = json.loads(EW.HISTORY_PATH.read_text())[0]
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, row["outcome"])
+        self.assertIn("merge_commit", row)
+
+    def test_unverified_delivery_blocks_the_next_cycle(self):
+        # outbox.status() reports unverified/dead-letter counts (232ce7e);
+        # checks.py turns those into a failing alert_delivery, and this worker
+        # refuses to make more art until a human has been reachable again.
+        degraded = {"status": "degraded", "critical": [],
+                    "failed": ["alert_delivery"], "checks": [], "summary": "x"}
+        cfg = worker_cfg(evolve_worker={
+            "repo": str(self.origin),
+            "degraded_allowlist": ["alert_delivery", "w_openrappter_spin"]})
+        with mock.patch.object(EW, "run_model") as maker:
+            summary = EW.run_once(cfg=cfg, health=lambda phase: degraded)
+        self.assertEqual("skipped", summary["outcome"])
+        self.assertIn("alert_delivery", summary["reason"])
+        maker.assert_not_called()
+        self.assertEqual([], self.enqueued)
 
 
 # ── the tick keeps ticking ──────────────────────────────────────────────────

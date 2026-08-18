@@ -345,6 +345,22 @@ def cadence_ready(history, wcfg):
     return True, f"creative cadence ready ({age_h:.1f}h)"
 
 
+# Checks a degraded_allowlist may never silence. Everything else about the
+# allowlist is an operator's judgement call; these two are not, because both
+# mean "this loop cannot see or cannot speak", and art made while the alarm
+# is broken is exactly the silence this repo exists to refuse:
+#
+#   alert_delivery  queued, unverified or dead-lettered alerts — the estate
+#                   cannot reach a human. Since 232ce7e an unverifiable send
+#                   is an explicit failure rather than an optimistic success,
+#                   so this check now says out loud what used to be lost. Art
+#                   published while it is red would be a system cheerfully
+#                   texting about paintings from a channel that cannot text.
+#   health_runtime  the health run did not finish. The verdict is unknown,
+#                   and "unknown" must never be allowlisted into "fine".
+NEVER_ALLOWLISTABLE = frozenset({"alert_delivery", "health_runtime"})
+
+
 def health_gate(wcfg, verdict, phase="start"):
     """Health decides whether art may proceed. Returns (ok, reason).
 
@@ -352,7 +368,8 @@ def health_gate(wcfg, verdict, phase="start"):
     named in `degraded_allowlist` — an explicit list of known-noisy checks,
     not `evolve_on_degraded`, which said "any degradation is fine" and would
     have let this worker push art through an estate that was quietly on fire
-    in a way nobody had looked at yet (#3).
+    in a way nobody had looked at yet (#3). A small set of ids refuses to be
+    allowlisted at all (NEVER_ALLOWLISTABLE).
     """
     critical = list(verdict.get("critical") or [])
     if critical:
@@ -360,6 +377,11 @@ def health_gate(wcfg, verdict, phase="start"):
     failing = list(verdict.get("failed") or [])
     if not failing:
         return True, f"healthy at {phase}"
+    unskippable = sorted(set(failing) & NEVER_ALLOWLISTABLE)
+    if unskippable:
+        return False, (f"{', '.join(unskippable)} failing at {phase} and cannot "
+                       f"be allowlisted — a loop that cannot report must not "
+                       f"publish")
     allowed = {str(x) for x in (wcfg.get("degraded_allowlist") or [])}
     unlisted = sorted(set(failing) - allowed)
     if unlisted:
