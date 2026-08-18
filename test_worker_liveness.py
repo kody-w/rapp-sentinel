@@ -15,6 +15,7 @@ Two things live here:
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -211,20 +212,24 @@ class SandboxProfileProbes(unittest.TestCase):
     def test_the_runtime_home_is_writable(self):
         target = self.runtime / "home" / ".copilot" / "state.json"
         proc = self.run_sandboxed(
-            f"mkdir -p {target.parent} && echo ok > {target}")
+            f"mkdir -p {shlex.quote(str(target.parent))} && "
+            f"echo ok > {shlex.quote(str(target))}")
         self.assertEqual(0, proc.returncode, proc.stderr[:300])
         self.assertTrue(target.is_file(),
                         "an isolated HOME the model cannot write is not a HOME")
 
     def test_the_staging_output_is_writable(self):
         target = self.staging / "out" / "submissions" / "x" / "piece.svg"
-        proc = self.run_sandboxed(f"mkdir -p {target.parent} && echo ok > {target}")
+        proc = self.run_sandboxed(
+            f"mkdir -p {shlex.quote(str(target.parent))} && "
+            f"echo ok > {shlex.quote(str(target))}")
         self.assertEqual(0, proc.returncode, proc.stderr[:300])
         self.assertTrue(target.is_file())
 
     def test_the_controller_clone_is_not_writable(self):
         target = self.clone / ".git" / "probe.txt"
-        proc = self.run_sandboxed(f"echo pwned > {target}")
+        proc = self.run_sandboxed(
+            f"echo pwned > {shlex.quote(str(target))}")
         self.assertNotEqual(0, proc.returncode,
                             "a sibling clone must not be writable")
         self.assertFalse(target.exists())
@@ -232,19 +237,23 @@ class SandboxProfileProbes(unittest.TestCase):
     def test_the_clone_config_cannot_be_appended_to(self):
         config = self.clone / ".git" / "config"
         proc = self.run_sandboxed(
-            f"printf 'pushurl = https://attacker.example/x.git\\n' >> {config}")
+            "printf 'pushurl = https://attacker.example/x.git\\n' >> "
+            f"{shlex.quote(str(config))}")
         self.assertNotEqual(0, proc.returncode)
         self.assertNotIn("attacker.example",
                          config.read_text(encoding="utf-8"))
 
     def test_the_real_home_is_not_writable(self):
         target = Path.home() / ".rapp-sandbox-probe-should-not-exist"
-        proc = self.run_sandboxed(f"echo pwned > {target}")
+        proc = self.run_sandboxed(
+            f"echo pwned > {shlex.quote(str(target))}")
         self.assertNotEqual(0, proc.returncode, "the operator's HOME is not a root")
         self.assertFalse(target.exists())
 
     def test_reads_and_the_profile_itself_still_work(self):
-        proc = self.run_sandboxed(f"cat {self.clone}/.git/config > /dev/null")
+        config = self.clone / ".git" / "config"
+        proc = self.run_sandboxed(
+            f"cat {shlex.quote(str(config))} > /dev/null")
         self.assertEqual(0, proc.returncode,
                          "reads stay open; inference needs them")
 
@@ -269,7 +278,9 @@ class SandboxProfileProbes(unittest.TestCase):
         env = SS.confined_env(cfg, self.runtime, 0,
                               env={"COPILOT_GITHUB_TOKEN": "t"})
         self.assertTrue(env["HOME"].startswith(str(self.runtime)))
-        proc = self.run_sandboxed(f"echo ok > {env['HOME']}/probe.txt")
+        target = Path(env["HOME"]) / "probe.txt"
+        proc = self.run_sandboxed(
+            f"echo ok > {shlex.quote(str(target))}")
         self.assertEqual(0, proc.returncode, proc.stderr[:300])
 
     def test_the_maker_argv_sandboxes_both_roots(self):
