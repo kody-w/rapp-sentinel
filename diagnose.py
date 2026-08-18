@@ -26,6 +26,7 @@ an endpoint is about to be made for the second time.
 
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import time
@@ -164,6 +165,44 @@ def probe_endpoints():
         row(name, url[8:46], "-", reach)
 
 
+CHAT_DB = Path.home() / "Library" / "Messages" / "chat.db"
+
+
+def _chat_db_reachability():
+    """Does Messages' database actually open — not "do the mode bits allow it".
+
+    This probe used to answer with os.access(R_OK), which reads POSIX
+    permission bits and is BLIND to macOS TCC. The bits on chat.db are
+    rw-------, owned by the user, so os.access() says True in every context —
+    including the launchd contexts where the open is refused. That is how this
+    page printed "chat.db readable" for ten hours while every single outbox
+    drain failed with the literal reason "delivery unverifiable: chat.db
+    unreadable", and 10 alerts sat undelivered behind the contradiction.
+
+    An instrument that disagrees with its consumer is worse than no
+    instrument: it costs an operator the one measurement that was supposed to
+    end the guessing (#4). So open it exactly the way outbox._delivered_count
+    does — read-only URI, real query — and report what THAT does. Only the
+    exception class is printed; a sqlite message can carry the full path.
+    """
+    try:
+        if not CHAT_DB.exists():
+            return "absent", "-", "no database at the expected path"
+        try:
+            con = sqlite3.connect(f"file:{CHAT_DB}?mode=ro", uri=True, timeout=5)
+            try:
+                con.execute("SELECT COUNT(*) FROM message").fetchone()
+            finally:
+                con.close()
+        except Exception as e:
+            return ("NOT readable (TCC?)", "-",
+                    f"open refused: {type(e).__name__} — grant this context "
+                    "Full Disk Access")
+        return "readable", "-", "opened read-only, message table queried"
+    except Exception:
+        return "unverified", "-", "-"
+
+
 def probe_delivery():
     section("delivery + escalation arms")
     try:
@@ -174,13 +213,7 @@ def probe_delivery():
             "-", f"notify={cfg.get('notify')}")
     except Exception as e:
         row("notify_handle", "unverified", "-", f"config unreadable: {type(e).__name__}")
-    chat_db = Path.home() / "Library" / "Messages" / "chat.db"
-    try:
-        readable = chat_db.exists() and os.access(chat_db, os.R_OK)
-        row("chat.db", "readable" if readable else "NOT readable (TCC?)",
-            "-", str(chat_db.exists()))
-    except Exception:
-        row("chat.db", "unverified", "-", "-")
+    row("chat.db", *_chat_db_reachability())
     try:
         import outbox
         st = outbox.status()
