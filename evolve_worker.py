@@ -697,18 +697,24 @@ def _repo_owner(repo):
 
 # ── subprocess seams (patched in tests) ─────────────────────────────────────
 
-# Environment that can redirect, rewrite, proxy or execute on git's behalf.
-# All of it is removed rather than trusted: GIT_CONFIG_PARAMETERS alone can
-# inject arbitrary config into a single invocation.
-GIT_ENV_STRIP = (
-    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_DIR", "GIT_WORK_TREE",
-    "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_SSH", "GIT_SSH_COMMAND",
-    "GIT_PROXY_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_TEMPLATE_DIR",
-    "GIT_ATTR_NOSYSTEM", "GIT_EDITOR", "GIT_PAGER",
-    "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
-    "ALL_PROXY", "all_proxy",
-)
+# The controller's git environment is an ALLOWLIST, not a denylist.
+#
+# A denylist has to be complete to be correct, and it was not: GIT_EXEC_PATH
+# survived, which decides where git finds git-remote-https and git-upload-pack
+# — so a hostile value replaces the TRANSPORT itself, before any config is
+# read and long before any integrity check runs. (Reproduced: a fake
+# git-upload-pack on GIT_EXEC_PATH executes during a plain local clone.) The
+# same is true of LD_PRELOAD, DYLD_INSERT_LIBRARIES, GIT_TEMPLATE_DIR and
+# whatever the next release adds. So nothing is inherited unless it is named
+# here, and everything else the controller sets itself.
+GIT_ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "LC_CTYPE")
+
+# Optional, and only when they point at something that exists: some builds
+# need them to verify TLS, and a broken cert path is a confusing outage.
+GIT_ENV_CERT_VARS = ("SSL_CERT_FILE", "SSL_CERT_DIR")
+
+DEFAULT_PATH_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
+                     "/usr/sbin", "/sbin")
 
 # Only these protocols. `ext::` in particular runs a command of the URL's
 # choosing, which is a remote that executes.
@@ -717,18 +723,57 @@ GIT_ALLOWED_PROTOCOLS = "https:file"
 _GIT_ENV = None
 
 
+def _safe_path(raw):
+    """PATH reduced to absolute, existing directories, with git findable.
+
+    A relative entry resolves against the current directory, which for a
+    controller that cd's into repositories is an attacker-influenced lookup
+    path for `git` itself and for every credential helper it runs.
+    """
+    keep = []
+    for entry in str(raw or "").split(os.pathsep):
+        if entry.startswith("/") and os.path.isdir(entry):
+            keep.append(entry)
+    if not any(os.path.exists(os.path.join(d, "git")) for d in keep):
+        keep = [d for d in DEFAULT_PATH_DIRS if os.path.isdir(d)] + keep
+    ordered = list(dict.fromkeys(keep))
+    return os.pathsep.join(ordered) or "/usr/bin:/bin"
+
+
+def _minimal_env(source=None):
+    """Exactly the inherited variables the controller has decided to keep."""
+    src = dict(source if source is not None else os.environ)
+    env = {}
+    for key in GIT_ENV_ALLOWLIST:
+        if key in src and src[key]:
+            env[key] = src[key]
+    env["PATH"] = _safe_path(env.get("PATH"))
+    for key in GIT_ENV_CERT_VARS:
+        value = src.get(key)
+        if value and value.startswith("/") and os.path.exists(value):
+            env[key] = value
+    return env
+
+
 def _credential_helper():
     """The operator's credential helper VALUE, read once and validated.
 
-    The sanitized config below has to keep exactly one thing from the real
-    machine — how to authenticate a push — or the controller cannot publish
-    at all. A `!command` helper is refused: that is not a credential store,
-    it is arbitrary execution wearing one's coat.
+    The sanitized config has to keep exactly one thing from the real machine —
+    how to authenticate a push — or the controller cannot publish at all. Read
+    with a minimal environment pointed at the real HOME, so the value comes
+    from the operator's own config and nothing else takes part. A `!command`
+    helper is refused: that is not a credential store, it is arbitrary
+    execution wearing one's coat.
     """
+    env = _minimal_env()
+    env["HOME"] = os.path.expanduser("~")
+    env["GIT_CONFIG_SYSTEM"] = os.devnull
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_TERMINAL_PROMPT"] = "0"
     try:
         r = subprocess.run(["git", "config", "--global", "--get-all",
                             "credential.helper"], capture_output=True,
-                           text=True, timeout=30)
+                           text=True, timeout=30, env=env)
     except Exception:
         return ""
     for line in (r.stdout or "").splitlines():
@@ -744,31 +789,30 @@ def _credential_helper():
 
 
 def controller_git_env(home=None):
-    """The environment EVERY controller git call runs in.
+    """The environment EVERY controller git call runs in, built from nothing.
 
-    The finding this closes: `_clone_repo` shelled out to `git clone` with the
-    ambient environment, so a global `url.<attacker>.insteadOf <canonical>`
-    silently cloned the attacker's repository, and the integrity check — which
-    only ever reads LOCAL config — found a perfectly consistent clone of the
-    wrong thing. Isolation has to come before the first network byte, not
-    after it.
+    Two findings live in this function. First: `_clone_repo` used to shell out
+    to `git clone` with the ambient environment, and git reads system and
+    global config BEFORE it resolves a url — so a global
+    `url.<attacker>.insteadOf <canonical>` produced a flawless clone of the
+    wrong repository, which the integrity check (local config only) then
+    confirmed. Second: the fix for that was a denylist, and a denylist that
+    misses GIT_EXEC_PATH misses the transport binaries themselves.
 
-    So: no system config, no global config except a file this code writes
-    containing at most a credential helper, an isolated HOME and XDG so
-    `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config` are not found, no proxy
-    variables, no config injection via the environment, no interactive
-    prompts, and only https/file protocols.
+    So: start empty. Carry PATH (absolute existing directories only), locale,
+    and cert paths that exist. Then set an isolated HOME, XDG and TMPDIR, a
+    generated global config holding at most a validated credential helper, no
+    system config, no prompts, and only https/file protocols. Nothing else
+    from the ambient environment reaches git.
     """
     global _GIT_ENV
     if _GIT_ENV is not None and home is None:
         return dict(_GIT_ENV)
-    base = {k: v for k, v in os.environ.items() if k not in GIT_ENV_STRIP}
-    for key in list(base):
-        if key.startswith("GIT_CONFIG_KEY_") or key.startswith("GIT_CONFIG_VALUE_"):
-            base.pop(key, None)
 
+    env = _minimal_env()
     git_home = Path(home) if home else (STATE / "git-home")
-    git_home.mkdir(parents=True, exist_ok=True)
+    for path in (git_home, git_home / "xdg", git_home / "tmp"):
+        path.mkdir(parents=True, exist_ok=True)
     config = git_home / "sanitized.gitconfig"
     helper = _credential_helper()
     config.write_text(
@@ -778,9 +822,10 @@ def controller_git_env(home=None):
         + (f"[credential]\n\thelper = {helper}\n" if helper else ""),
         encoding="utf-8")
 
-    base.update({
+    env.update({
         "HOME": str(git_home),
         "XDG_CONFIG_HOME": str(git_home / "xdg"),
+        "TMPDIR": str(git_home / "tmp"),
         "GIT_CONFIG_GLOBAL": str(config),
         "GIT_CONFIG_SYSTEM": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -789,10 +834,9 @@ def controller_git_env(home=None):
         "GIT_ALLOW_PROTOCOL": GIT_ALLOWED_PROTOCOLS,
         "GIT_PROTOCOL_FROM_USER": "0",
     })
-    (git_home / "xdg").mkdir(parents=True, exist_ok=True)
     if home is None:
-        _GIT_ENV = dict(base)
-    return base
+        _GIT_ENV = dict(env)
+    return env
 
 
 def _git(cwd, *args, timeout=600, check=True, env=None):

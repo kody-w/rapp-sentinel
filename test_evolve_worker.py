@@ -48,7 +48,14 @@ def scratch_dir(name):
 
 
 def git(cwd, *args):
-    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    """Harness git, run in the sanitized environment.
+
+    The hostile-environment tests deliberately poison os.environ; the harness
+    that builds and inspects the fixtures must not be poisoned with it, or the
+    test measures the harness instead of the controller.
+    """
+    r = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                       text=True, env=EW.controller_git_env())
     if r.returncode != 0:
         raise AssertionError(f"git {' '.join(args)} failed: {r.stderr}")
     return r.stdout
@@ -2117,6 +2124,197 @@ class CloneIsolationTests(WorkerEnv):
                                               wcfg))
         with self.assertRaises(EW.GateError):
             EW.validate_repo_url("https://github.com/a/b", wcfg)
+
+
+HOSTILE_GIT_ENV_VARS = (
+    # execution paths — the finding: GIT_EXEC_PATH decides where
+    # git-remote-https and git-upload-pack come from
+    "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_SSH", "GIT_SSH_COMMAND",
+    "GIT_PROXY_COMMAND", "GIT_EXTERNAL_DIFF", "GIT_ASKPASS", "GIT_EDITOR",
+    "GIT_PAGER", "GIT_SEQUENCE_EDITOR",
+    # dynamic linker injection
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH",
+    # config injection
+    "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0", "GIT_CONFIG", "GIT_ATTR_NOSYSTEM",
+    # repository redirection
+    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE",
+    "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CEILING_DIRECTORIES",
+    # transport and proxying
+    "GIT_ALLOW_PROTOCOL", "GIT_PROTOCOL_FROM_USER", "GIT_SMART_HTTP",
+    "http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY",
+    "all_proxy", "NO_PROXY",
+    # prompting and tracing
+    "GIT_TERMINAL_PROMPT", "GIT_TRACE", "GIT_TRACE2", "GIT_CURL_VERBOSE",
+    # identity and location
+    "XDG_CONFIG_HOME", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+)
+
+
+class HostileEnvironmentTests(WorkerEnv):
+    """Nothing ambient reaches git unless the controller put it there (#1).
+
+    The vector this closes was reproduced first: a fake `git-upload-pack` on
+    GIT_EXEC_PATH executes during a plain local clone, before any config is
+    read and long before repo integrity is checked. A denylist that misses one
+    variable misses the transport itself, so the environment is an allowlist.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.wcfg = dict(EW.worker_config({}), repo=str(self.origin))
+        self.marker = self.home / "PWNED"
+        self.exec_path = self.home / "hostile-exec"
+        self.exec_path.mkdir()
+        hijack = self.exec_path / "git-upload-pack"
+        hijack.write_text(
+            f'#!/bin/sh\ntouch "{self.marker}"\n'
+            f'exec /usr/bin/git-upload-pack "$@"\n', encoding="utf-8")
+        hijack.chmod(0o755)
+        self.hostile = {v: self.hostile_value(v) for v in HOSTILE_GIT_ENV_VARS}
+
+    def hostile_value(self, name):
+        if name == "GIT_EXEC_PATH":
+            return str(self.exec_path)
+        if name in ("GIT_CONFIG_COUNT",):
+            return "1"
+        if name == "GIT_CONFIG_KEY_0":
+            return "url.https://attacker.example/.insteadOf"
+        if name == "GIT_CONFIG_VALUE_0":
+            return "https://github.com/"
+        if name == "GIT_TERMINAL_PROMPT":
+            return "1"
+        if name == "GIT_ALLOW_PROTOCOL":
+            return "ext"
+        if name in ("LD_PRELOAD", "DYLD_INSERT_LIBRARIES"):
+            return "/tmp/evil.dylib"
+        return f"/hostile/{name.lower()}"
+
+    def fresh_env(self):
+        with mock.patch.object(EW, "_GIT_ENV", None):
+            return EW.controller_git_env()
+
+    # ── the allowlist itself ──
+    def test_no_hostile_variable_survives_unless_the_controller_set_it(self):
+        controller_set = {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+                          "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT",
+                          "GIT_ASKPASS", "GIT_ALLOW_PROTOCOL",
+                          "GIT_PROTOCOL_FROM_USER", "XDG_CONFIG_HOME"}
+        with mock.patch.dict(os.environ, self.hostile):
+            env = self.fresh_env()
+        for name in HOSTILE_GIT_ENV_VARS:
+            with self.subTest(var=name):
+                if name in controller_set:
+                    self.assertNotEqual(self.hostile[name], env.get(name),
+                                        f"{name} kept its hostile value")
+                else:
+                    self.assertNotIn(name, env, f"{name} survived the allowlist")
+
+    def test_the_environment_is_exactly_what_the_controller_decided(self):
+        with mock.patch.dict(os.environ, self.hostile):
+            env = self.fresh_env()
+        expected = {"PATH", "HOME", "XDG_CONFIG_HOME", "TMPDIR",
+                    "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+                    "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT",
+                    "GIT_ASKPASS", "GIT_ALLOW_PROTOCOL",
+                    "GIT_PROTOCOL_FROM_USER"}
+        self.assertEqual(set(), set(env) - expected - set(EW.GIT_ENV_ALLOWLIST)
+                         - set(EW.GIT_ENV_CERT_VARS))
+        self.assertEqual("0", env["GIT_TERMINAL_PROMPT"])
+        self.assertEqual("https:file", env["GIT_ALLOW_PROTOCOL"])
+        self.assertEqual("/usr/bin/false", env["GIT_ASKPASS"])
+        self.assertTrue(env["HOME"].endswith("git-home"))
+        self.assertTrue(env["TMPDIR"].startswith(env["HOME"]))
+
+    def test_a_relative_path_entry_is_dropped(self):
+        with mock.patch.dict(os.environ, {"PATH": ".:relative:/usr/bin:/bin"}):
+            env = self.fresh_env()
+        self.assertNotIn(".", env["PATH"].split(os.pathsep))
+        self.assertNotIn("relative", env["PATH"].split(os.pathsep))
+        self.assertIn("/usr/bin", env["PATH"].split(os.pathsep))
+
+    def test_an_unusable_path_still_finds_git(self):
+        with mock.patch.dict(os.environ, {"PATH": "/nonexistent-xyz"}):
+            env = self.fresh_env()
+        self.assertTrue(any(os.path.exists(os.path.join(d, "git"))
+                            for d in env["PATH"].split(os.pathsep)),
+                        "git must remain findable")
+
+    def test_cert_vars_are_carried_only_when_they_exist(self):
+        real = self.home / "certs.pem"
+        real.write_text("x", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"SSL_CERT_FILE": str(real)}):
+            self.assertEqual(str(real), self.fresh_env()["SSL_CERT_FILE"])
+        with mock.patch.dict(os.environ,
+                             {"SSL_CERT_FILE": "/nope/does-not-exist.pem"}):
+            self.assertNotIn("SSL_CERT_FILE", self.fresh_env())
+
+    # ── the vector, end to end ──
+    def test_the_hijack_vector_reproduces_without_the_controller(self):
+        """If this ever stops firing, the test below proves nothing."""
+        naive = self.home / "naive"
+        proc = subprocess.run(
+            ["git", "clone", "-q", str(self.origin), str(naive)],
+            capture_output=True, text=True,
+            env={**os.environ, "GIT_EXEC_PATH": str(self.exec_path)})
+        self.assertEqual(0, proc.returncode, proc.stderr[:300])
+        self.assertTrue(self.marker.exists(),
+                        "GIT_EXEC_PATH no longer hijacks git-upload-pack; "
+                        "the guarantee below needs a new repro")
+
+    def test_the_initial_fetch_is_immune_to_a_hijacked_exec_path(self):
+        clone = self.home / "clone"
+        with mock.patch.dict(os.environ, self.hostile), \
+             mock.patch.object(EW, "_GIT_ENV", None):
+            head = EW._clone_repo(self.wcfg, clone)
+        self.assertFalse(self.marker.exists(),
+                         "a hostile GIT_EXEC_PATH executed during the fetch")
+        self.assertEqual(git_bare(self.origin, "rev-parse", "main").strip(), head)
+        self.assertTrue((clone / "submissions" / "already-here").is_dir(),
+                        "canonical transport must still work")
+
+    def test_the_sanitized_cleanup_is_immune_too(self):
+        clone = self.home / "clone-cleanup"
+        with mock.patch.object(EW, "_GIT_ENV", None):
+            EW._clone_repo(self.wcfg, clone)
+        git(clone, "config", "user.email", "t@example.com")
+        git(clone, "config", "user.name", "t")
+        git(clone, "checkout", "-q", "-b", "art/doomed")
+        (clone / "x.txt").write_text("x", encoding="utf-8")
+        git(clone, "add", "-A")
+        git(clone, "commit", "-qm", "doomed")
+        git(clone, "push", "-q", "-u", "origin", "art/doomed")
+        # force the sanitized path: the clone no longer verifies
+        git(clone, "config", "remote.origin.pushurl", str(self.home / "x.git"))
+
+        with mock.patch.dict(os.environ, self.hostile), \
+             mock.patch.object(EW, "_GIT_ENV", None):
+            self.assertTrue(EW._delete_remote_branch(clone, "art/doomed",
+                                                     self.wcfg))
+        self.assertFalse(self.marker.exists(),
+                         "the cleanup ran a hijacked git helper")
+        self.assertNotIn("art/doomed",
+                         git_bare(self.origin, "for-each-ref",
+                                  "--format=%(refname)"))
+
+    def test_a_full_cycle_survives_a_hostile_environment(self):
+        with mock.patch.dict(os.environ, self.hostile), \
+             mock.patch.object(EW, "_GIT_ENV", None), \
+             mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        self.assertFalse(self.marker.exists())
+        self.assertIn("submissions/new-piece/piece.svg",
+                      git_bare(self.origin, "ls-tree", "--name-only", "-r", "main"))
+
+    def test_the_allowlist_is_named_in_the_source_not_a_denylist(self):
+        source = (Path(__file__).resolve().parent / "evolve_worker.py").read_text(
+            encoding="utf-8")
+        self.assertIn("GIT_ENV_ALLOWLIST", source)
+        self.assertNotIn("GIT_ENV_STRIP", source,
+                         "a denylist has to be complete to be correct")
 
 
 class LifecycleTests(WorkerEnv):
