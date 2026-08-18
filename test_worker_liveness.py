@@ -348,6 +348,57 @@ class LiveCliPermissionProbes(unittest.TestCase):
         self.assertNotIn("bash", lowered.split("tools:")[-1],
                          "the model reports a shell it should not have")
 
+    def test_the_maker_can_fill_the_precreated_directory_without_a_shell(self):
+        """The live failure, probed: art completed, directory could not be
+        created, `.probe` left behind, whole cycle rejected.
+
+        The contract is now three files in paths that already exist — so a
+        model with file tools and no shell can honour it, and the gate that
+        rejected the live attempt accepts this one.
+        """
+        import evolve_worker as EW
+        out = EW.prepare_staging(self.ws)
+        cycle = {
+            "cycle": 1, "previous_slug": None,
+            "rounds": [{"round": 1, "candidates": [
+                {"id": f"r1c{i}", "premise": f"premise {i}",
+                 "scores": {d: 5 for d in SS.SCORE_DIMENSIONS}}
+                for i in range(1, 11)], "selected": "r1c1"}],
+            "winner": {"round": 1, "candidate": "r1c1", "slug": "probe-piece"},
+        }
+        proc = self.run_cli(
+            "Write exactly two files into the EXISTING directory "
+            f"{out} — do not create any directory, you have no tool that can.\n"
+            "1) meta.json containing exactly this json:\n"
+            + json.dumps({
+                "schema": "rapp-art-submission/1.0", "title": "Probe Piece",
+                "slug": "probe-piece", "contributor": "kody-w", "kind": "svg",
+                "submitted_at": "2026-08-18T00:00:00Z", "remix_of": None,
+                "license": "CC0-1.0", "_dada_cycle": cycle})
+            + "\n2) piece.svg containing exactly:\n"
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
+            '<circle cx="5" cy="5" r="4"/></svg>\n'
+            f"Then write {self.ws}/state-out.json containing "
+            '{"cycle": 1, "last_slug": "probe-piece", "notes": "probe"}\n'
+            "Reply DONE.",
+            tools=SS.MAKER_TOOLS, add_dirs=[self.ws])
+        self.assertEqual(0, proc.returncode, proc.stderr[:400])
+
+        names = sorted(p.name for p in out.iterdir())
+        self.assertEqual(["meta.json", "piece.svg"], names,
+                         f"the maker left {names}")
+        wcfg = EW.worker_config({})
+        submission = EW.gate_directory(self.ws / "out", wcfg, 1, None, None, set())
+        self.assertEqual("probe-piece", submission["slug"])
+        self.assertEqual("submissions/probe-piece/piece.svg",
+                         submission["piece_path"])
+
+        # …and the junk that failed the live cycle still fails
+        (out / ".probe").write_text("", encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            EW.gate_directory(self.ws / "out", wcfg, 1, None, None, set())
+        self.assertIn("hidden file", str(cm.exception))
+
     def test_the_maker_cannot_touch_a_sibling_clone_or_its_git_dir(self):
         """The HIGH finding, probed for real: a clone next to the staging root
         must be unreachable — no .git write, no config read."""

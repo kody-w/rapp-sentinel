@@ -111,8 +111,16 @@ def meta_for(slug, cycle=1, previous=None, round1_records=None, **overrides):
     return meta
 
 
-def write_submission(clone, slug, meta=None, piece=SVG, piece_name="piece.svg"):
-    directory = Path(clone) / "submissions" / slug
+def write_submission(root, slug, meta=None, piece=SVG, piece_name="piece.svg"):
+    """Write into the FIXED output directory the controller precreates.
+
+    `root` is a staging `out/` (the maker's world, where the slug lives only
+    in meta.json because nothing in its toolset can create a directory), or a
+    seed repository, where a slug still names a folder.
+    """
+    root = Path(root)
+    directory = (root / EW.SUBMISSION_DIR if root.name == "out"
+                 else root / "submissions" / slug)
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "meta.json").write_text(
         json.dumps(meta if meta is not None else meta_for(slug), indent=2),
@@ -389,9 +397,9 @@ class GateTests(ScratchCase):
     def setUp(self):
         super().setUp()
         self.staging = self.home / "staging"
+        EW.prepare_staging(self.staging)
         self.out = self.staging / "out"
-        self.out.mkdir(parents=True)
-        (self.staging / "context").mkdir()
+        self.submission_dir = self.out / EW.SUBMISSION_DIR
         self.wcfg = EW.worker_config({})
         self.known = {"already-here"}
 
@@ -414,24 +422,47 @@ class GateTests(ScratchCase):
         self.assertEqual("submissions/new-piece/piece.svg", result["piece_path"])
         self.assertEqual(SVG.encode(), result["piece_bytes"])
 
-    def test_nothing_at_all_is_a_decline_shaped_rejection(self):
+    def test_an_empty_output_directory_is_a_decline_shaped_rejection(self):
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("no new submission", str(cm.exception))
 
-    def test_two_new_submissions_are_rejected(self):
-        self.submit("one", meta_for("one", cycle=2, previous="already-here"))
-        self.submit("two", meta_for("two", cycle=2, previous="already-here"))
+    def test_a_second_directory_is_rejected(self):
+        self.submit()
+        (self.out / "another").mkdir()
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
-        self.assertIn("more than one", str(cm.exception))
+        self.assertIn("may not create paths", str(cm.exception))
 
-    def test_anything_beside_submissions_is_rejected(self):
+    def test_a_hidden_probe_file_is_rejected(self):
+        # exactly what the live cycle left behind when it could not mkdir
+        self.submit()
+        (self.submission_dir / ".probe").write_text("", encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("hidden file", str(cm.exception))
+
+    def test_the_slug_comes_from_meta_not_a_directory_name(self):
+        self.submit(meta=meta_for("named-in-meta", cycle=2,
+                                  previous="already-here"))
+        result = self.gate()
+        self.assertEqual("named-in-meta", result["slug"])
+        self.assertEqual("submissions/named-in-meta/meta.json",
+                         result["meta_path"])
+
+    def test_a_bad_slug_in_meta_is_rejected(self):
+        self.submit(meta=meta_for("Not A Slug", cycle=2,
+                                  previous="already-here"))
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("meta.slug", str(cm.exception))
+
+    def test_anything_beside_the_fixed_directory_is_rejected(self):
         self.submit()
         (self.out / "notes.md").write_text("hi", encoding="utf-8")
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
-        self.assertIn("expected only 'submissions'", str(cm.exception))
+        self.assertIn("may not create paths", str(cm.exception))
 
     def test_a_third_file_in_the_folder_is_rejected(self):
         directory = self.submit()
@@ -441,8 +472,8 @@ class GateTests(ScratchCase):
         self.assertIn("meta.json + piece", str(cm.exception))
 
     def test_a_colliding_slug_is_rejected(self):
-        self.submit("already-here", meta_for("already-here", cycle=2,
-                                             previous="already-here"))
+        self.submit(meta=meta_for("already-here", cycle=2,
+                                  previous="already-here"))
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("already exists", str(cm.exception))
@@ -553,7 +584,7 @@ class GateTests(ScratchCase):
             self.gate()
         self.assertIn("parse", str(cm.exception))
 
-    def test_a_nested_file_is_rejected(self):
+    def test_a_nested_directory_in_the_output_is_rejected(self):
         directory = self.submit()
         (directory / "extra").mkdir()
         (directory / "extra" / "more.svg").write_text(SVG, encoding="utf-8")
@@ -562,8 +593,7 @@ class GateTests(ScratchCase):
         self.assertIn("not a regular file", str(cm.exception))
 
     def test_a_symlinked_piece_is_rejected(self):
-        directory = self.out / "submissions" / "new-piece"
-        directory.mkdir(parents=True)
+        directory = self.submission_dir
         (directory / "meta.json").write_text(
             json.dumps(meta_for("new-piece", cycle=2, previous="already-here")),
             encoding="utf-8")
@@ -574,11 +604,11 @@ class GateTests(ScratchCase):
             self.gate()
         self.assertIn("symlink", str(cm.exception))
 
-    def test_a_symlinked_folder_is_rejected(self):
+    def test_a_symlinked_output_folder_is_rejected(self):
         elsewhere = self.home / "elsewhere"
         elsewhere.mkdir()
-        (self.out / "submissions").mkdir()
-        (self.out / "submissions" / "new-piece").symlink_to(elsewhere)
+        shutil.rmtree(self.submission_dir)
+        self.submission_dir.symlink_to(elsewhere)
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("symlink", str(cm.exception))
@@ -598,8 +628,7 @@ class GateTests(ScratchCase):
         self.assertIn("executable", str(cm.exception))
 
     def test_a_fifo_is_rejected(self):
-        directory = self.out / "submissions" / "new-piece"
-        directory.mkdir(parents=True)
+        directory = self.submission_dir
         (directory / "meta.json").write_text(
             json.dumps(meta_for("new-piece", cycle=2, previous="already-here")),
             encoding="utf-8")
@@ -887,7 +916,9 @@ class WorkerRunTests(WorkerEnv):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         for phrase in ("There is NO repository here", "no .git directory",
                        "no shell, no git, no gh and no network tool",
-                       "clone you never see", "/out/submissions/<your-slug>/",
+                       "clone you never see", "/out/submission/meta.json",
+                       "You cannot create directories",
+                       "slug goes in meta.json",
                        f"EXACTLY {EW.CANDIDATES_PER_ROUND}", "state-out.json"):
             self.assertIn(phrase, self.prompt)
         self.assertNotIn("/clone ", self.prompt,
@@ -1719,10 +1750,10 @@ class CloneScopeTests(WorkerEnv):
         check resets the remote before the push.
         """
         staging = self.home / "stage2"
+        EW.prepare_staging(staging)
         out = staging / "out"
-        out.mkdir(parents=True)
         write_submission(out, "second-piece", meta_for("second-piece"))
-        forged = out / "submissions" / "second-piece" / ".git"
+        forged = out / EW.SUBMISSION_DIR / ".git"
         forged.mkdir()
         (forged / "config").write_text(
             "[remote \"origin\"]\n\tpushurl = https://attacker.example/x.git\n",
@@ -2471,6 +2502,214 @@ class FakeGitOnPathTests(WorkerEnv):
                          "git must be invoked through the pinned binary")
         self.assertNotIn('subprocess.run(["gh"', source,
                          "gh must be invoked through the resolved binary")
+
+
+LIVE_LEGACY_STATE = {
+    "cycles": [
+        {"cycle": 1, "slug": "first-heartbeat-ii",
+         "title": "First Heartbeat II", "at": "2026-08-17T20:11:00+00:00"},
+    ],
+    "last_cycle": 1,
+}
+
+
+class CreativeContinuityTests(unittest.TestCase):
+    """The live instance's own state, read without guessing (#2)."""
+
+    def test_the_exact_live_state_says_the_next_cycle_is_two(self):
+        self.assertEqual((2, "first-heartbeat-ii"),
+                         EW.next_creative_cycle(LIVE_LEGACY_STATE))
+
+    def test_a_fresh_instance_starts_at_one(self):
+        self.assertEqual((1, None), EW.next_creative_cycle({}))
+
+    def test_the_worker_schema_still_reads_the_same_way(self):
+        self.assertEqual((4, "third-thing"),
+                         EW.next_creative_cycle({"cycle": 3,
+                                                 "last_slug": "third-thing"}))
+
+    def test_cycles_alone_are_enough(self):
+        state = {"cycles": [{"cycle": 1, "slug": "a"}, {"cycle": 2, "slug": "b"}]}
+        self.assertEqual((3, "b"), EW.next_creative_cycle(state))
+
+    def test_last_slug_wins_over_the_history_list(self):
+        state = dict(LIVE_LEGACY_STATE, last_slug="explicit")
+        self.assertEqual((2, "explicit"), EW.next_creative_cycle(state))
+
+    # ── inconsistency fails closed ──
+    def test_cycle_and_last_cycle_disagreeing_fails_closed(self):
+        with self.assertRaises(EW.LedgerError) as cm:
+            EW.next_creative_cycle({"cycle": 1, "last_cycle": 5})
+        self.assertIn("disagrees with itself", str(cm.exception))
+
+    def test_a_history_ahead_of_the_counter_fails_closed(self):
+        with self.assertRaises(EW.LedgerError) as cm:
+            EW.next_creative_cycle({"last_cycle": 1,
+                                    "cycles": [{"cycle": 1}, {"cycle": 2}]})
+        self.assertIn("reaches 2", str(cm.exception))
+
+    def test_a_gapped_history_fails_closed(self):
+        with self.assertRaises(EW.LedgerError) as cm:
+            EW.next_creative_cycle({"cycles": [{"cycle": 1}, {"cycle": 3}]})
+        self.assertIn("not 1..N", str(cm.exception))
+
+    def test_nonsense_types_fail_closed(self):
+        for state in ({"cycle": "two"}, {"last_cycle": -1}, {"cycles": "many"},
+                      {"cycles": [{"cycle": 0}]}, {"cycles": ["nope"]},
+                      {"cycle": True}, {"last_slug": 7, "cycle": 1}):
+            with self.subTest(state=state):
+                with self.assertRaises(EW.LedgerError):
+                    EW.next_creative_cycle(state)
+
+    def test_an_empty_shell_of_a_state_fails_closed(self):
+        with self.assertRaises(EW.LedgerError) as cm:
+            EW.next_creative_cycle({"notes": "nothing else"})
+        self.assertIn("no cycle", str(cm.exception))
+
+    # ── writing preserves the legacy history ──
+    def test_merging_keeps_the_legacy_cycles_and_adds_the_new_one(self):
+        merged = EW.merge_creative_state(
+            LIVE_LEGACY_STATE, {"notes": "learned things"}, 2, "second-thing",
+            {"merge_commit": "abc123", "pr_url": "https://example/pr/2"})
+        self.assertEqual([1, 2], [c["cycle"] for c in merged["cycles"]])
+        self.assertEqual("first-heartbeat-ii", merged["cycles"][0]["slug"])
+        self.assertEqual("second-thing", merged["cycles"][1]["slug"])
+        self.assertEqual("abc123", merged["cycles"][1]["merge_commit"])
+        self.assertEqual(2, merged["cycle"])
+        self.assertEqual(2, merged["last_cycle"])
+        self.assertEqual("second-thing", merged["last_slug"])
+        self.assertEqual("learned things", merged["notes"])
+
+    def test_the_merged_state_reads_back_as_the_next_cycle(self):
+        merged = EW.merge_creative_state(LIVE_LEGACY_STATE, {}, 2, "second",
+                                         {"merge_commit": "x"})
+        self.assertEqual((3, "second"), EW.next_creative_cycle(merged))
+
+    def test_a_replayed_cycle_number_does_not_duplicate_history(self):
+        merged = EW.merge_creative_state(LIVE_LEGACY_STATE, {}, 1, "redone",
+                                         {"merge_commit": "x"})
+        self.assertEqual([1], [c["cycle"] for c in merged["cycles"]])
+        self.assertEqual("redone", merged["cycles"][0]["slug"])
+
+    def test_history_is_bounded(self):
+        state = {"cycles": [{"cycle": i, "slug": f"s{i}"} for i in range(1, 61)],
+                 "last_cycle": 60}
+        merged = EW.merge_creative_state(state, {}, 61, "new", {})
+        self.assertEqual(50, len(merged["cycles"]))
+        self.assertEqual(61, merged["cycles"][-1]["cycle"])
+
+
+class LiveRetryTests(WorkerEnv):
+    """The rejected live attempt was a failed spend, not a public cycle (#3)."""
+
+    def setUp(self):
+        super().setUp()
+        (self.state / "evolve-creative-state.json").write_text(
+            json.dumps(LIVE_LEGACY_STATE), encoding="utf-8")
+        # the commons already holds cycle 1's piece
+        seed = self.home / "seed2"
+        subprocess.run(["git", "clone", str(self.origin), str(seed)],
+                       check=True, capture_output=True)
+        git(seed, "config", "user.email", "t@example.com")
+        git(seed, "config", "user.name", "t")
+        write_submission(seed, "first-heartbeat-ii",
+                         meta_for("first-heartbeat-ii"))
+        git(seed, "add", "-A")
+        git(seed, "commit", "-qm", "cycle 1")
+        git(seed, "push", "-q", "origin", "main")
+
+    def test_the_retry_after_a_rejected_attempt_is_cycle_two(self):
+        # a rejected cycle: the maker leaves a hidden probe and nothing else
+        def fumbling(staging, prompt, wcfg, depth=0, runtime=None):
+            (Path(staging) / "out" / EW.SUBMISSION_DIR / ".probe").write_text(
+                "", encoding="utf-8")
+            return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
+        with mock.patch.object(EW, "run_model", fumbling):
+            first = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_REJECTED, first["outcome"])
+
+        state = json.loads(
+            (self.state / "evolve-creative-state.json").read_text())
+        self.assertEqual(LIVE_LEGACY_STATE, state,
+                         "a failed spend must not touch public continuity")
+
+        seen = {}
+
+        def maker(staging, prompt, wcfg, depth=0, runtime=None):
+            seen["prompt"] = prompt
+            write_submission(Path(staging) / "out", "second-piece",
+                             meta_for("second-piece", cycle=2,
+                                      previous="first-heartbeat-ii"))
+            (Path(staging) / "state-out.json").write_text(json.dumps(
+                {"cycle": 2, "last_slug": "second-piece", "notes": "n"}),
+                encoding="utf-8")
+            return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
+
+        with mock.patch.object(EW, "run_model", maker):
+            second = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, second["outcome"], second)
+        self.assertIn('"cycle" MUST be exactly 2', seen["prompt"])
+        self.assertIn("first-heartbeat-ii", seen["prompt"])
+        merged = json.loads(
+            (self.state / "evolve-creative-state.json").read_text())
+        self.assertEqual(2, merged["cycle"])
+        self.assertEqual("second-piece", merged["last_slug"])
+        self.assertEqual([1, 2], [c["cycle"] for c in merged["cycles"]],
+                         "the legacy history survived the write")
+
+    def test_a_cycle_one_retry_against_the_live_state_is_rejected(self):
+        def stale(staging, prompt, wcfg, depth=0, runtime=None):
+            write_submission(Path(staging) / "out", "another-first",
+                             meta_for("another-first", cycle=1, previous=None))
+            (Path(staging) / "state-out.json").write_text(json.dumps(
+                {"cycle": 1, "last_slug": "another-first"}), encoding="utf-8")
+            return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
+        with mock.patch.object(EW, "run_model", stale):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+        self.assertIn("continuity", summary["detail"])
+
+    def test_an_inconsistent_state_stops_the_pass_before_any_model(self):
+        (self.state / "evolve-creative-state.json").write_text(
+            json.dumps({"cycle": 1, "last_cycle": 9}), encoding="utf-8")
+        with mock.patch.object(EW, "run_model") as maker:
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("fail-closed", summary["outcome"])
+        maker.assert_not_called()
+
+    def test_reconciliation_writes_the_migrated_shape(self):
+        real_publish = EW.publish
+
+        def dying(clone, submission, wcfg, health, branch=None, transaction=None):
+            def note(**fields):
+                state = transaction(**fields) if transaction else {}
+                if fields.get("phase") == "merged":
+                    raise KeyboardInterrupt("power cut")
+                return state
+            return real_publish(clone, submission, wcfg, health, branch, note)
+
+        def maker(staging, prompt, wcfg, depth=0, runtime=None):
+            write_submission(Path(staging) / "out", "second-piece",
+                             meta_for("second-piece", cycle=2,
+                                      previous="first-heartbeat-ii"))
+            (Path(staging) / "state-out.json").write_text(json.dumps(
+                {"cycle": 2, "last_slug": "second-piece"}), encoding="utf-8")
+            return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
+
+        with mock.patch.object(EW, "run_model", maker), \
+             mock.patch.object(EW, "publish", dying):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        with mock.patch.object(EW, "run_model") as unused:
+            healed = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        unused.assert_not_called()
+        self.assertEqual("reconciled-contributed", healed["outcome"], healed)
+
+        merged = json.loads(
+            (self.state / "evolve-creative-state.json").read_text())
+        self.assertEqual(2, merged["cycle"])
+        self.assertEqual([1, 2], [c["cycle"] for c in merged["cycles"]])
+        self.assertEqual((3, "second-piece"), EW.next_creative_cycle(merged))
 
 
 class LifecycleTests(WorkerEnv):

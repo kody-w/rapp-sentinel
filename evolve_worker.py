@@ -518,7 +518,7 @@ The neighborhood is healthy enough to make things right now. That is the only
 reason you were woken.
 
 YOUR WORKSPACE — THE ONLY PLACE YOU MAY WRITE
-  {workspace}/out/           where your submission goes (see below)
+  {workspace}/out/submission/  where your two submission files go (it exists)
   {workspace}/context/       what already exists, read-only to you in practice
   {workspace}/state-in.json  your private creative state from last cycle
                              ({state_in_note})
@@ -538,17 +538,24 @@ against the submission protocol deterministically, copies the two files into a
 clone you never see, and only then creates the branch, the commit, the pull
 request and the merge.
 
-WHAT TO LEAVE BEHIND
-Exactly one new directory: {workspace}/out/submissions/<your-slug>/
-containing exactly two files:
+WHAT TO LEAVE BEHIND — THREE FILES, IN PATHS THAT ALREADY EXIST
+You cannot create directories: you have file tools and no shell, and that is
+deliberate. Every directory you need has been made for you. Write exactly:
 
-  meta.json     the protocol record (schema below)
-  piece.<ext>   the work itself; ext is one of .svg .md .txt .json and MUST
-                match meta.kind; at most {max_piece_kb} KB
+  {workspace}/out/submission/meta.json      the protocol record (schema below)
+  {workspace}/out/submission/piece.<ext>    the work itself; ext is one of
+                                            .svg .md .txt .json and MUST match
+                                            meta.kind; at most {max_piece_kb} KB
+  {workspace}/state-out.json                your private next state
 
-Put nothing else under {workspace}/out — not a README, not a draft, not a
-directory. The controller validates that tree, copies exactly those two files
-into its own private clone, and refuses everything else.
+Your slug goes in meta.json, NOT in a directory name — the controller creates
+submissions/<your-slug>/ in its own clone from that field. Do not attempt to
+create any directory, and do not leave anything else behind: a stray file, a
+draft, or a hidden file like .probe fails the whole cycle.
+
+The controller validates that directory, reads your slug from meta.json,
+copies exactly those two files into its own private clone, and refuses
+everything else.
 
 meta.json:
 {{
@@ -1388,54 +1395,176 @@ def assert_no_git(root):
                             f"{path.relative_to(root) if path != root else '.'}")
 
 
+# The maker has file tools, not a shell — `create` writes files, nothing
+# makes directories. A live cycle proved it: the model produced the art, could
+# not create out/submissions/<its-new-slug>/, left a `.probe` behind trying,
+# and the gate correctly rejected the lot. Asking a model to mkdir with no
+# mkdir is a contract that cannot be honoured, so the controller precreates
+# ONE fixed directory and the slug moves to meta.json where it belongs.
+SUBMISSION_DIR = "submission"
+META_NAME = "meta.json"
+STATE_OUT_NAME = "state-out.json"
+
+
+def _cycle_entries(state):
+    """The legacy `cycles` list, validated. Anything odd fails closed."""
+    raw = state.get("cycles")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise LedgerError("creative state 'cycles' is not a list")
+    entries = []
+    for i, row in enumerate(raw, start=1):
+        if not isinstance(row, dict):
+            raise LedgerError(f"creative state cycles[{i - 1}] is not an object")
+        number = row.get("cycle", row.get("n", i))
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            raise LedgerError(f"creative state cycles[{i - 1}].cycle is "
+                              f"{number!r}, not a positive integer")
+        entries.append({**row, "cycle": number})
+    return entries
+
+
+def creative_position(state):
+    """(completed_cycle, previous_slug) from any state this loop has written.
+
+    The live instance carried `{"cycles": [...], "last_cycle": 1}` from an
+    earlier shape, and the worker read `cycle` with a default of 0 — so it
+    proposed cycle 1 again, against a commons that already had cycle 1. A
+    default is a guess, and a guess about continuity is exactly the thing this
+    ledger exists to prevent.
+
+    Canonical order: `cycle`, else `last_cycle`, else the highest number in
+    `cycles`. Fields that disagree are not reconciled quietly — they fail
+    closed, because "which of these two numbers is the truth" is not a
+    question this code gets to answer on its own.
+    """
+    if not isinstance(state, dict):
+        raise LedgerError("creative state is not an object")
+    if not state:
+        return 0, None
+
+    entries = _cycle_entries(state)
+    from_entries = max((e["cycle"] for e in entries), default=None)
+    if entries and from_entries != len(entries):
+        # A gap or a duplicate: the list cannot vouch for its own count.
+        numbers = sorted(e["cycle"] for e in entries)
+        if numbers != list(range(1, len(numbers) + 1)):
+            raise LedgerError(f"creative state cycles are not 1..N: {numbers}")
+
+    declared = []
+    for key in ("cycle", "last_cycle"):
+        value = state.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise LedgerError(f"creative state '{key}' is {value!r}, not a "
+                              f"non-negative integer")
+        declared.append((key, value))
+    if len({v for _, v in declared}) > 1:
+        raise LedgerError(f"creative state disagrees with itself: "
+                          f"{', '.join(f'{k}={v}' for k, v in declared)}")
+    completed = declared[0][1] if declared else from_entries
+    if completed is None:
+        raise LedgerError("creative state has no cycle, last_cycle or cycles")
+    if from_entries is not None and completed < from_entries:
+        raise LedgerError(f"creative state says cycle {completed} but its "
+                          f"cycles list reaches {from_entries}")
+
+    previous = state.get("last_slug")
+    if previous is None:
+        for entry in sorted(entries, key=lambda e: e["cycle"], reverse=True):
+            candidate = entry.get("slug") or entry.get("last_slug")
+            if isinstance(candidate, str) and candidate:
+                previous = candidate
+                break
+    if previous is not None and not isinstance(previous, str):
+        raise LedgerError(f"creative state last_slug is {previous!r}, not a slug")
+    return completed, previous
+
+
+def next_creative_cycle(state):
+    """What the next cycle number and previous slug must be."""
+    completed, previous = creative_position(state)
+    return completed + 1, previous
+
+
+def merge_creative_state(previous_state, next_state, cycle, slug, receipts):
+    """The state to write after a verified merge, preserving legacy history.
+
+    An instance that has been running carries a `cycles` list nobody asked
+    this worker to understand. Dropping it would erase the collective's own
+    record of itself to make the schema tidier, so it is carried forward and
+    appended to, with the canonical fields written unambiguously.
+    """
+    merged = dict(next_state or {})
+    entries = _cycle_entries(previous_state or {})
+    entries = [e for e in entries if e.get("cycle") != cycle]
+    entries.append({
+        "cycle": cycle,
+        "slug": slug,
+        "merge_commit": receipts.get("merge_commit", ""),
+        "pr": receipts.get("pr_url", ""),
+        "at": sentinel.now().isoformat(timespec="seconds"),
+    })
+    merged["cycles"] = sorted(entries, key=lambda e: e["cycle"])[-50:]
+    merged["cycle"] = cycle
+    merged["last_cycle"] = cycle
+    merged["last_slug"] = slug
+    merged["updated_at"] = sentinel.now().isoformat(timespec="seconds")
+    merged["merge_commit"] = receipts.get("merge_commit", "")
+    return merged
+
+
+def prepare_staging(staging):
+    """Everything the maker writes into must already exist when it starts."""
+    staging = Path(staging)
+    out = staging / "out" / SUBMISSION_DIR
+    out.mkdir(parents=True, exist_ok=True)
+    (staging / "context").mkdir(parents=True, exist_ok=True)
+    return out
+
+
 def gate_directory(root, wcfg, expected_cycle, expected_previous,
                    expected_round1=None, known_slugs=()):
-    """Validate a submission tree that has no git anywhere near it.
+    """Validate the fixed output directory. No git anywhere near it.
 
-    `root` holds exactly one thing: `submissions/<slug>/`, holding exactly
-    meta.json and piece.<ext>. Returns the submission record INCLUDING the
-    validated bytes, because the bytes are what the controller copies into
-    its own clone — re-reading the path later would re-open a file the model
-    could have swapped underneath us.
+    `root` is `<staging>/out`, whose only child is the precreated
+    `submission/` holding exactly meta.json and piece.<ext>. The slug is read
+    from meta.json — the maker cannot name a directory it cannot create —
+    and the controller materialises the gated bytes under that slug in its own
+    clone. Returns the submission record INCLUDING the validated bytes.
     """
     root = Path(root)
     if not root.is_dir():
-        raise GateError("no new submission was left in the staging workspace")
+        raise GateError("no staging output directory exists")
     top = sorted(p.name for p in root.iterdir())
-    if not top:
-        raise GateError("no new submission was left in the staging workspace")
-    if top != ["submissions"]:
-        raise GateError(f"the staging output holds {top}, expected only "
-                        f"'submissions'")
-    holder = root / "submissions"
-    _regular_dir(holder, "submissions")
-    slugs = sorted(p.name for p in holder.iterdir())
-    if not slugs:
-        raise GateError("no new submission was left in the staging workspace")
-    if len(slugs) > 1:
-        raise GateError(f"more than one new submission: {', '.join(slugs)}")
-    slug = slugs[0]
+    if top != [SUBMISSION_DIR]:
+        extra = [n for n in top if n != SUBMISSION_DIR]
+        if not extra:
+            raise GateError(f"the staging output is missing {SUBMISSION_DIR}/")
+        raise GateError(f"the staging output holds {extra}, expected only "
+                        f"{SUBMISSION_DIR}/ — the maker may not create paths")
 
-    if not SLUG_RE.match(slug) or len(slug) > SLUG_MAX:
-        raise GateError(f"slug {slug!r} is not lowercase-alphanumeric-hyphen "
-                        f"within {SLUG_MAX} characters")
-    if slug in set(known_slugs):
-        raise GateError(f"slug {slug!r} already exists on the base branch")
-
-    directory = holder / slug
-    _regular_dir(directory, f"submissions/{slug}")
+    directory = root / SUBMISSION_DIR
+    _regular_dir(directory, f"out/{SUBMISSION_DIR}")
     entries = sorted(directory.iterdir(), key=lambda p: p.name)
+    if not entries:
+        raise GateError("no new submission was left in the staging workspace")
     names = []
     for entry in entries:
-        rel = f"submissions/{slug}/{entry.name}"
+        rel = f"out/{SUBMISSION_DIR}/{entry.name}"
+        if entry.name.startswith("."):
+            raise GateError(f"{rel} is a hidden file; the submission is exactly "
+                            f"{META_NAME} + piece.<ext>")
         _regular_file(entry, rel)
         names.append(entry.name)
-    if len(names) != 2 or "meta.json" not in names:
-        raise GateError(f"a submission is exactly meta.json + piece.<ext>, found "
-                        f"{names}")
-    piece_name = [n for n in names if n != "meta.json"][0]
+    if len(names) != 2 or META_NAME not in names:
+        raise GateError(f"a submission is exactly {META_NAME} + piece.<ext>, "
+                        f"found {names}")
+    piece_name = [n for n in names if n != META_NAME][0]
     piece_path = directory / piece_name
-    meta_path = directory / "meta.json"
+    meta_path = directory / META_NAME
 
     meta_bytes = meta_path.read_bytes()
     if len(meta_bytes) > int(wcfg.get("max_meta_bytes", 262144)):
@@ -1457,8 +1586,14 @@ def gate_directory(root, wcfg, expected_cycle, expected_previous,
     if meta["schema"] != SUBMISSION_SCHEMA:
         raise GateError(f"meta.schema is {meta['schema']!r}, expected "
                         f"{SUBMISSION_SCHEMA!r}")
-    if meta["slug"] != slug:
-        raise GateError(f"meta.slug is {meta['slug']!r} but the folder is {slug!r}")
+
+    slug = meta.get("slug")
+    if not isinstance(slug, str) or not SLUG_RE.match(slug) or len(slug) > SLUG_MAX:
+        raise GateError(f"meta.slug {slug!r} is not lowercase-alphanumeric-hyphen "
+                        f"within {SLUG_MAX} characters")
+    if slug in set(known_slugs):
+        raise GateError(f"slug {slug!r} already exists on the base branch")
+
     if not isinstance(meta.get("title"), str) or not meta["title"].strip():
         raise GateError("meta.title is empty")
     if not isinstance(meta.get("contributor"), str) or not meta["contributor"].strip():
@@ -1496,7 +1631,7 @@ def gate_directory(root, wcfg, expected_cycle, expected_previous,
         "title": meta["title"],
         "kind": kind,
         "meta": meta,
-        "meta_path": f"submissions/{slug}/meta.json",
+        "meta_path": f"submissions/{slug}/{META_NAME}",
         "piece_path": f"submissions/{slug}/{piece_name}",
         "meta_bytes": meta_bytes,
         "piece_bytes": piece_bytes,
@@ -2336,13 +2471,11 @@ def finalize_success(cfg, wcfg, history, row, submission, receipts, next_state,
                      expected_cycle):
     """The one place a verified merge becomes ledger, chain, and message."""
     state_path = HOME / str(wcfg["creative_state_file"])
-    atomic_write_json(state_path, {
-        **(next_state or {}),
-        "cycle": expected_cycle,
-        "last_slug": submission["slug"],
-        "updated_at": sentinel.now().isoformat(timespec="seconds"),
-        "merge_commit": receipts["merge_commit"],
-    })
+    previous_state = strict_load(state_path, {}, expect=dict)
+    atomic_write_json(state_path,
+                      merge_creative_state(previous_state, next_state,
+                                           expected_cycle, submission["slug"],
+                                           receipts))
     return _finish(cfg, wcfg, history, row, OUTCOME_CONTRIBUTED,
                    f"{submission['title']} ({submission['slug']}) merged as "
                    f"{receipts['merge_commit'][:12]}", receipts, submission)
@@ -2408,8 +2541,7 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
 
         state_path = HOME / str(wcfg["creative_state_file"])
         creative = strict_load(state_path, {}, expect=dict)
-        expected_cycle = int(creative.get("cycle", 0)) + 1
-        expected_previous = creative.get("last_slug")
+        expected_cycle, expected_previous = next_creative_cycle(creative)
 
         fcfg = SS.fanout_config(wcfg)
         if dry_run:
@@ -2436,8 +2568,9 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         workspace = _make_workspace(wcfg)
         clone = workspace / "clone"          # controller-private, never shared
         staging = workspace / "staging"      # the maker's whole world
-        (staging / "out").mkdir(parents=True)
-        (staging / "context").mkdir(parents=True)
+        # Precreated, because the maker has file tools and no shell: nothing
+        # in its toolset can make a directory (#1).
+        prepare_staging(staging)
         (workspace / "runtime").mkdir(parents=True, exist_ok=True)
         base_sha = _clone_repo(wcfg, clone)
         assert_repo_integrity(clone, wcfg)
