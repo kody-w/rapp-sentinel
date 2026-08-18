@@ -1525,6 +1525,100 @@ def prepare_staging(staging):
     return out
 
 
+def _scan_staging(staging):
+    """Every path under staging, by lstat, without following a single link."""
+    staging = Path(staging)
+    entries = {}
+    for root, dirnames, filenames in os.walk(staging, followlinks=False):
+        for name in list(dirnames) + list(filenames):
+            path = Path(root) / name
+            rel = path.relative_to(staging).as_posix()
+            st = os.lstat(path)
+            if stat.S_ISLNK(st.st_mode):
+                kind, digest = "symlink", ""
+            elif stat.S_ISDIR(st.st_mode):
+                kind, digest = "dir", ""
+            elif stat.S_ISREG(st.st_mode):
+                kind = "file"
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            else:
+                kind, digest = "other", ""
+            entries[rel] = {"kind": kind, "mode": stat.S_IMODE(st.st_mode),
+                            "sha256": digest}
+    return entries
+
+
+def staging_manifest(staging):
+    """The canonical baseline, captured before the model is allowed to run.
+
+    Everything the controller put in staging — the context it may read, the
+    finalists it must reproduce, the empty output directory — recorded by
+    path, type, mode and content digest. Anything that is not this, afterwards,
+    is something the model did.
+    """
+    baseline = _scan_staging(staging)
+    for rel, entry in sorted(baseline.items()):
+        if entry["kind"] not in ("dir", "file"):
+            raise GateError(f"prepared staging already contains a {entry['kind']} "
+                            f"at {rel}")
+    return baseline
+
+
+def verify_staging_tree(staging, baseline, wcfg=None):
+    """The WHOLE staging tree, not just the corner the submission lives in.
+
+    The gate used to read out/, state-out.json and .git and call it done — so
+    a model could leave a draft, a note, a second copy of its piece or a
+    rewritten prior.json anywhere else in staging and the cycle would sail
+    through. "Everything I did not check was fine" is the assumption this
+    whole file exists to refuse.
+
+    Returns the piece filename. Raises GateError on the first difference.
+    """
+    staging = Path(staging)
+    allowed_new = {STATE_OUT_NAME, f"out/{SUBMISSION_DIR}/{META_NAME}"}
+    piece_names = {f"out/{SUBMISSION_DIR}/piece{ext}"
+                   for ext in KIND_EXTENSIONS.values()}
+    current = _scan_staging(staging)
+
+    for rel, before in sorted(baseline.items()):
+        after = current.get(rel)
+        if after is None:
+            raise GateError(f"the model deleted {rel} from its context")
+        if after["kind"] != before["kind"]:
+            raise GateError(f"{rel} changed from {before['kind']} to "
+                            f"{after['kind']}")
+        if before["kind"] == "file" and after["sha256"] != before["sha256"]:
+            raise GateError(f"the model modified {rel}, which is read-only "
+                            f"context")
+        if after["mode"] != before["mode"]:
+            raise GateError(f"{rel} changed mode from {before['mode']:o} to "
+                            f"{after['mode']:o}")
+
+    new_paths = sorted(set(current) - set(baseline))
+    pieces = []
+    for rel in new_paths:
+        entry = current[rel]
+        if entry["kind"] == "dir":
+            raise GateError(f"the model created the directory {rel}; every "
+                            f"path it needs already exists")
+        if entry["kind"] != "file":
+            raise GateError(f"the model left a {entry['kind']} at {rel}")
+        if Path(rel).name.startswith("."):
+            raise GateError(f"the model left the hidden file {rel}")
+        if rel in allowed_new:
+            continue
+        if rel in piece_names:
+            pieces.append(rel)
+            continue
+        raise GateError(f"the model left {rel}, which is not part of a "
+                        f"submission (allowed: out/{SUBMISSION_DIR}/{META_NAME}, "
+                        f"out/{SUBMISSION_DIR}/piece.<ext>, {STATE_OUT_NAME})")
+    if len(pieces) > 1:
+        raise GateError(f"more than one piece: {', '.join(pieces)}")
+    return Path(pieces[0]).name if pieces else ""
+
+
 def gate_directory(root, wcfg, expected_cycle, expected_previous,
                    expected_round1=None, known_slugs=()):
     """Validate the fixed output directory. No git anywhere near it.
@@ -2631,6 +2725,9 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         prompt = build_prompt(cfg, wcfg, slug_role, staging, expected_cycle,
                               expected_previous, history, finalists, digest)
         (workspace / "prompt.txt").write_text(prompt, encoding="utf-8")
+        # Everything the controller put there, hashed, BEFORE the model runs.
+        # Anything that differs afterwards is something the model did (#1).
+        baseline = staging_manifest(staging)
         log(f"handing {slug_role} its situation (cycle {expected_cycle}, "
             f"budget {used + 1}/{cap})")
         status, output = run_model(staging, prompt, wcfg, depth,
@@ -2654,6 +2751,10 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             # The staging tree first — no git anywhere near it — and only then
             # the two validated blobs into the controller's own clone.
             assert_no_git(staging)
+            # Whole tree first: a draft, a note, a rewritten prior.json or a
+            # second copy of the piece anywhere in staging fails the cycle
+            # before its output is even read.
+            verify_staging_tree(staging, baseline, wcfg)
             submission = gate_directory(staging / "out", wcfg, expected_cycle,
                                         expected_previous,
                                         SS.expected_round1(finalists)

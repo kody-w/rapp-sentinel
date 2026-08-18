@@ -2712,6 +2712,195 @@ class LiveRetryTests(WorkerEnv):
         self.assertEqual((3, "second-piece"), EW.next_creative_cycle(merged))
 
 
+class StagingTreeIntegrityTests(ScratchCase):
+    """The WHOLE staging tree, not just the corner the submission lives in."""
+
+    def setUp(self):
+        super().setUp()
+        self.staging = self.home / "staging"
+        self.out = EW.prepare_staging(self.staging)
+        (self.staging / "context" / "prior.json").write_text(
+            '[{"slug": "already-here"}]', encoding="utf-8")
+        (self.staging / "state-in.json").write_text('{"cycle": 1}',
+                                                    encoding="utf-8")
+        (self.staging / "round1.json").write_text("[]", encoding="utf-8")
+        self.baseline = EW.staging_manifest(self.staging)
+
+    def leave_valid_output(self):
+        (self.out / "meta.json").write_text(
+            json.dumps(meta_for("new-piece")), encoding="utf-8")
+        (self.out / "piece.svg").write_text(SVG, encoding="utf-8")
+        (self.staging / "state-out.json").write_text(
+            '{"cycle": 1, "last_slug": "new-piece"}', encoding="utf-8")
+
+    def verify(self):
+        return EW.verify_staging_tree(self.staging, self.baseline,
+                                      EW.worker_config({}))
+
+    # ── what must pass ──
+    def test_the_valid_no_shell_output_passes(self):
+        self.leave_valid_output()
+        self.assertEqual("piece.svg", self.verify())
+
+    def test_an_empty_run_passes_the_tree_check(self):
+        self.assertEqual("", self.verify(), "a decline leaves nothing behind")
+
+    def test_each_supported_extension_is_accepted(self):
+        for ext in sorted(EW.KIND_EXTENSIONS.values()):
+            with self.subTest(ext=ext):
+                for stale in self.out.iterdir():
+                    stale.unlink()
+                (self.out / "meta.json").write_text("{}", encoding="utf-8")
+                (self.out / f"piece{ext}").write_text("x", encoding="utf-8")
+                self.assertEqual(f"piece{ext}", self.verify())
+
+    # ── the repro from the review ──
+    def test_a_draft_left_at_the_staging_root_is_rejected(self):
+        self.leave_valid_output()
+        (self.staging / "draft.txt").write_text("some notes", encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("draft.txt", str(cm.exception))
+        self.assertIn("not part of a submission", str(cm.exception))
+
+    def test_a_hidden_file_at_the_staging_root_is_rejected(self):
+        self.leave_valid_output()
+        (self.staging / ".secret").write_text("x", encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("hidden file", str(cm.exception))
+
+    def test_a_new_directory_anywhere_is_rejected(self):
+        self.leave_valid_output()
+        (self.staging / "scratch").mkdir()
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("created the directory", str(cm.exception))
+
+    def test_a_nested_file_under_a_new_directory_is_rejected(self):
+        self.leave_valid_output()
+        (self.staging / "work").mkdir()
+        (self.staging / "work" / "notes.md").write_text("x", encoding="utf-8")
+        with self.assertRaises(EW.GateError):
+            self.verify()
+
+    def test_a_second_copy_of_the_piece_elsewhere_is_rejected(self):
+        self.leave_valid_output()
+        (self.staging / "context" / "piece.svg").write_text(SVG, encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("context/piece.svg", str(cm.exception))
+
+    def test_two_pieces_in_the_output_are_rejected(self):
+        self.leave_valid_output()
+        (self.out / "piece.md").write_text("x", encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("more than one piece", str(cm.exception))
+
+    # ── context must survive untouched ──
+    def test_mutating_the_context_is_rejected(self):
+        self.leave_valid_output()
+        (self.staging / "context" / "prior.json").write_text(
+            '[{"slug": "invented"}]', encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("modified context/prior.json", str(cm.exception))
+
+    def test_deleting_the_context_is_rejected(self):
+        self.leave_valid_output()
+        (self.staging / "context" / "prior.json").unlink()
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("deleted context/prior.json", str(cm.exception))
+
+    def test_rewriting_the_finalists_is_rejected(self):
+        self.leave_valid_output()
+        (self.staging / "round1.json").write_text('[{"id": "mine"}]',
+                                                  encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("round1.json", str(cm.exception))
+
+    def test_deleting_a_prepared_directory_is_rejected(self):
+        self.leave_valid_output()
+        shutil.rmtree(self.staging / "context")
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("deleted", str(cm.exception))
+
+    def test_a_mode_change_on_context_is_rejected(self):
+        self.leave_valid_output()
+        os.chmod(self.staging / "state-in.json", 0o777)
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("changed mode", str(cm.exception))
+
+    def test_a_symlink_anywhere_is_rejected(self):
+        self.leave_valid_output()
+        (self.staging / "link").symlink_to(self.home)
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("symlink", str(cm.exception))
+
+    def test_replacing_a_context_file_with_a_directory_is_rejected(self):
+        self.leave_valid_output()
+        (self.staging / "state-in.json").unlink()
+        (self.staging / "state-in.json").mkdir()
+        with self.assertRaises(EW.GateError) as cm:
+            self.verify()
+        self.assertIn("changed from file to dir", str(cm.exception))
+
+    def test_a_prepared_tree_with_a_symlink_is_refused_at_baseline(self):
+        (self.staging / "sneaky").symlink_to(self.home)
+        with self.assertRaises(EW.GateError) as cm:
+            EW.staging_manifest(self.staging)
+        self.assertIn("already contains a symlink", str(cm.exception))
+
+
+class StagingLeakageCycleTests(WorkerEnv):
+    """The review's repro, run through a whole cycle."""
+
+    def maker_that_also_leaves(self, extra, slug="new-piece"):
+        def fake(staging, prompt, wcfg, depth=0, runtime=None):
+            staging = Path(staging)
+            write_submission(staging / "out", slug, meta_for(slug))
+            (staging / "state-out.json").write_text(json.dumps(
+                {"cycle": 1, "last_slug": slug}), encoding="utf-8")
+            extra(staging)
+            return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
+        return fake
+
+    def run_with(self, extra):
+        with mock.patch.object(EW, "run_model",
+                               self.maker_that_also_leaves(extra)):
+            return EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+    def test_a_draft_beside_the_submission_fails_the_cycle(self):
+        summary = self.run_with(
+            lambda s: (s / "draft.txt").write_text("notes", encoding="utf-8"))
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+        self.assertIn("draft.txt", summary["detail"])
+        self.assertFalse(self.gh.calls, "nothing reaches GitHub")
+        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
+
+    def test_a_rewritten_context_fails_the_cycle(self):
+        summary = self.run_with(
+            lambda s: (s / "context" / "prior.json").write_text(
+                "[]", encoding="utf-8"))
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+        self.assertIn("read-only context", summary["detail"])
+
+    def test_a_new_directory_fails_the_cycle(self):
+        summary = self.run_with(lambda s: (s / "scratch").mkdir())
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+        self.assertIn("created the directory", summary["detail"])
+
+    def test_the_clean_cycle_still_contributes(self):
+        summary = self.run_with(lambda s: None)
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+
+
 class LifecycleTests(WorkerEnv):
     """A stopped worker leaves nothing running (#4)."""
 
