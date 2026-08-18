@@ -558,15 +558,14 @@ def _write_coverage_receipt(declared, swept, unreachable):
     that looked.
     """
     try:
-        (HOME / "state").mkdir(exist_ok=True)
-        (HOME / "state" / "coverage.json").write_text(json.dumps({
+        write_receipt("coverage.json", {
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "declared": sorted(declared),
             "deep": sorted(DEEPLY_CHECKED),
             "swept": sorted(swept),
             "unreachable": sorted(unreachable),
             "examined": sorted(set(swept) | (set(declared) & DEEPLY_CHECKED)),
-        }, indent=2) + "\n", encoding="utf-8")
+        })
     except Exception:
         pass          # a receipt is evidence, never a reason to fail a check
 
@@ -1970,6 +1969,97 @@ def channel_serving():
 
 
 @check
+def evolve_worker_is_alive():
+    """The art arm is a SEPARATE launchd job, so its silence is invisible here.
+
+    Three states this can be in, and only one of them is fine:
+      * not enabled — declared, not silently absent
+      * enabled but no heartbeat, or one older than its own interval — either
+        launchd never loaded com.rapp.evolve-worker, or the job is wedged.
+        Both look exactly like "the collective decided not to make anything",
+        which is the failure this check exists to break (#6).
+      * enabled, loaded, ticking — ok, with its last outcome named.
+
+    Warn, not critical: a stalled art arm is not an outage of anything the
+    estate promises anyone. But it is never silence.
+    """
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+    except Exception:
+        cfg = {}
+    block = cfg.get("evolve_worker")
+    if not (isinstance(block, dict) and block.get("enabled")):
+        return ok("w_evolve_worker", "disabled by config — the tick owns art")
+
+    status_file = HOME / "state" / "evolve-worker-status.json"
+    try:
+        status = json.loads(status_file.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return fail("w_evolve_worker",
+                    "enabled in config but has never written a heartbeat — "
+                    "is com.rapp.evolve-worker loaded? "
+                    "(./install-launchd.sh --with-evolve-worker)",
+                    critical=False)
+    except Exception as e:
+        return fail("w_evolve_worker",
+                    f"heartbeat unreadable: {type(e).__name__}: {e}",
+                    critical=False)
+
+    interval_m = float(block.get("interval_minutes", 30))
+    stale_after = interval_m * 3
+    try:
+        age_m = (datetime.now(timezone.utc)
+                 - datetime.fromisoformat(status["at"])).total_seconds() / 60
+    except Exception:
+        return fail("w_evolve_worker", "heartbeat has no readable timestamp",
+                    critical=False)
+    outcome = str(status.get("outcome", "unknown"))
+    if age_m > stale_after:
+        return fail("w_evolve_worker",
+                    f"last pass {age_m:.0f}m ago (over {stale_after:.0f}m); "
+                    f"last outcome '{outcome}' — the job may be unloaded or wedged",
+                    critical=False)
+    if outcome in ("fail-closed", "crashed"):
+        return fail("w_evolve_worker",
+                    f"last pass {age_m:.0f}m ago ended {outcome}: "
+                    f"{str(status.get('reason'))[:120]}",
+                    critical=False)
+    return ok("w_evolve_worker",
+              f"{outcome} {age_m:.0f}m ago"
+              + (f" (cycle {status['cycle']})" if status.get("cycle") else ""))
+
+
+def receipt_path(name):
+    """Where a check's receipt file goes.
+
+    Normally state/. But the evolve worker runs its own health probes
+    CONCURRENTLY with the 15-minute tick, and two processes writing
+    coverage.json or pagescan.json with plain write_text() interleave into a
+    file that is neither run's answer. SENTINEL_HEALTH_RECEIPTS lets a
+    secondary runner keep its receipts to itself; the write is atomic either
+    way, so the primary's file is never half a document.
+    """
+    raw = os.environ.get("SENTINEL_HEALTH_RECEIPTS", "").strip()
+    base = Path(raw) if raw else (HOME / "state")
+    base.mkdir(parents=True, exist_ok=True)
+    return base / name
+
+
+def write_receipt(name, payload):
+    """Atomic receipt write: temp file in the same directory, then rename."""
+    target = receipt_path(name)
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, target)
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+@check
 def alerts_can_actually_reach_you():
     """A watchdog that cannot reach you is not watching anything.
 
@@ -2073,8 +2163,7 @@ def _write_pagescan_receipt(pages, targets, failures):
     and every consumer — cadence_honest reads the targets — carries on.
     """
     try:
-        (HOME / "state").mkdir(exist_ok=True)
-        (HOME / "state" / "pagescan.json").write_text(json.dumps({
+        write_receipt("pagescan.json", {
             "at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "observed_by": "regex",
             "pages": [{"url": p["url"], "status": p["status"],
@@ -2086,7 +2175,7 @@ def _write_pagescan_receipt(pages, targets, failures):
                          "first_party": True,
                          "status": t.get("probe_status")} for t in targets],
             "failures": [t["url"] for t in failures],
-        }, indent=2) + "\n", encoding="utf-8")
+        })
     except Exception:
         pass          # a receipt is evidence, never a reason to fail a check
 

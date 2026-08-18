@@ -30,7 +30,9 @@
     "repo": "kody-w/public-art-collective",
     "base_branch": "main",
     "roles": [],
-    "degraded_allowlist": ["w_openrappter_spin"],
+    "degraded_allowlist": [
+      "w_openrappter_spin"
+    ],
     "workspace_root": "state/evolve-workspaces",
     "branch_prefix": "art",
     "git_author_name": "RAPP Sentinel evolve worker",
@@ -50,14 +52,35 @@
       "daily_child_budget": 24,
       "min_healthy_children": 2,
       "roles": [
-        {"name": "novelty-archaeologist", "wave": 1,
-         "brief": "Dig through every prior submission before proposing anything; veto repeats."},
-        {"name": "execution-designer", "wave": 1,
-         "brief": "Think in the medium: a premise that cannot be built under 50 KB is a wish."},
-        {"name": "adversarial-verifier", "wave": 2,
-         "brief": "Attack wave one's candidates; a high-severity critique vetoes deterministically."}
-      ]
-    }
+        {
+          "name": "novelty-archaeologist",
+          "wave": 1,
+          "brief": "Dig through every prior submission before proposing anything; veto repeats."
+        },
+        {
+          "name": "execution-designer",
+          "wave": 1,
+          "brief": "Think in the medium: a premise that cannot be built under 50 KB is a wish."
+        },
+        {
+          "name": "adversarial-verifier",
+          "wave": 2,
+          "brief": "Attack wave one's candidates; a high-severity critique vetoes deterministically."
+        }
+      ],
+      "require_verifier": true,
+      "isolated_home": true,
+      "auth_env_var": "COPILOT_GITHUB_TOKEN",
+      "sandbox_exec": false
+    },
+    "interval_minutes": 30,
+    "view_probe_attempts": 5,
+    "view_probe_backoff": [
+      5,
+      10,
+      20,
+      30
+    ]
   },
   "smoke_enabled": true,
   "daily_smoke_budget": 1,
@@ -99,5 +122,6 @@
         "com.openrappter.daemon"
       ]
     }
-  }
+  },
+  "_evolve_worker_confinement_why": "Model processes get NO --allow-all. The maker gets bounded file tools (view/glob/grep/create/edit/write/apply_patch) rooted at --add-dir on its own workspace; sub-sentinels get --available-tools= (nothing at all) and answer in JSON on stdout. bash, powershell, fetch, web_search, task, ask_user and lsp are named in both --excluded-tools and --deny-tool; built-in MCPs, custom instructions, BASH_ENV, the system temp dir, remote control and auto-update are all switched off. HOME/XDG/TMPDIR/GH_CONFIG_DIR/git config point inside the workspace and the environment is an allowlist, so no operator credential is visible to a model. Inference auth is ONE variable (auth_env_var, default COPILOT_GITHUB_TOKEN) passed via --secret-env-vars so the CLI strips it from tool/MCP environments; with isolated_home true and that variable unset the cycle fails explicitly rather than falling back to your real ~/.copilot. sandbox_exec adds macOS sandbox-exec file-write confinement as defence in depth (off by default; tool and path limits are the mandatory layer). Only the controller has a shell, git and GitHub credentials."
 }

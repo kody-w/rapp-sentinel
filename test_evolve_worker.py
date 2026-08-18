@@ -10,7 +10,10 @@ touches the live instance, GitHub, or a model.
 import json
 import os
 import shutil
+import signal
 import subprocess
+import sys
+import time
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -62,14 +65,15 @@ SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
 
 def dada_cycle(slug, cycle=1, previous=None, rounds=1,
                candidates=EW.CANDIDATES_PER_ROUND,
-               dimensions=EW.SCORE_DIMENSIONS, round1_ids=None):
+               dimensions=EW.SCORE_DIMENSIONS, round1_records=None):
     body = []
     for r in range(1, rounds + 1):
-        ids = ([str(i) for i in round1_ids] if (r == 1 and round1_ids)
-               else [f"r{r}c{i}" for i in range(1, candidates + 1)])
-        cands = [{"id": cid, "premise": f"premise {r}.{n}",
-                  "scores": {d: 5 for d in dimensions}}
-                 for n, cid in enumerate(ids, start=1)]
+        if r == 1 and round1_records:
+            cands = [dict(rec) for rec in round1_records]
+        else:
+            cands = [{"id": f"r{r}c{i}", "premise": f"premise {r}.{i}",
+                      "scores": {d: 5 for d in dimensions}}
+                     for i in range(1, candidates + 1)]
         body.append({"round": r, "candidates": cands,
                      "selected": cands[0]["id"] if cands else None})
     return {
@@ -82,7 +86,7 @@ def dada_cycle(slug, cycle=1, previous=None, rounds=1,
     }
 
 
-def meta_for(slug, cycle=1, previous=None, round1_ids=None, **overrides):
+def meta_for(slug, cycle=1, previous=None, round1_records=None, **overrides):
     meta = {
         "schema": EW.SUBMISSION_SCHEMA,
         "title": slug.replace("-", " ").title(),
@@ -93,7 +97,7 @@ def meta_for(slug, cycle=1, previous=None, round1_ids=None, **overrides):
         "remix_of": None,
         "license": "CC0-1.0",
         "_dada_cycle": dada_cycle(slug, cycle=cycle, previous=previous,
-                                  round1_ids=round1_ids),
+                                  round1_records=round1_records),
     }
     meta.update(overrides)
     return meta
@@ -132,6 +136,21 @@ class ScratchCase(unittest.TestCase):
             p = mock.patch.object(EW, name, value)
             p.start()
             self.addCleanup(p.stop)
+        # No test may reach the network: every view-url probe answers 200
+        # unless a test says otherwise.
+        self.probes = []
+
+        def fake_probe(url, timeout=10):
+            self.probes.append(url)
+            return (self.probe_answer(url), "HTTP 200")
+        self.probe_answer = lambda url: True
+        p = mock.patch.object(EW, "probe_url", fake_probe)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(EW.time, "sleep", lambda *_: None)
+        p.start()
+        self.addCleanup(p.stop)
+
         self.notifications = []
         p = mock.patch.object(
             EW.sentinel, "notify",
@@ -411,7 +430,7 @@ class GateTests(ScratchCase):
         (self.clone / "notes.md").write_text("hi", encoding="utf-8")
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
-        self.assertIn("outside submissions", str(cm.exception))
+        self.assertIn("not a root-level file", str(cm.exception))
 
     def test_a_third_file_in_the_folder_is_rejected(self):
         directory = write_submission(self.clone, "new-piece",
@@ -760,7 +779,7 @@ class WorkerEnv(ScratchCase):
 
     def model_that_submits(self, slug="new-piece", cycle=1, previous=None,
                            result="CONTRIBUTED it made a thing"):
-        def fake(workspace, prompt, wcfg):
+        def fake(workspace, prompt, wcfg, depth=0):
             self.prompt = prompt
             clone = Path(workspace) / "clone"
             write_submission(clone, slug, meta_for(slug, cycle=cycle,
@@ -902,7 +921,7 @@ class WorkerRunTests(WorkerEnv):
         self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
 
     def test_a_timeout_is_recorded_without_a_success_shaped_alert(self):
-        def timing_out(workspace, prompt, wcfg):
+        def timing_out(workspace, prompt, wcfg, depth=0):
             return EW.OUTCOME_TIMEOUT, "copilot timed out after 60s"
         with mock.patch.object(EW, "run_model", timing_out):
             summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
@@ -918,15 +937,34 @@ class WorkerRunTests(WorkerEnv):
         self.assertFalse((self.state / "evolve-creative-state.json").exists())
         self.assertEqual([], self.workspaces(), "a timeout still cleans up")
 
-    def test_the_real_timeout_path_maps_to_the_timeout_outcome(self):
-        with mock.patch.object(EW.subprocess, "run",
-                               side_effect=subprocess.TimeoutExpired("copilot", 60)):
-            status, out = EW.run_model(self.home, "prompt", EW.worker_config({}))
+    def test_the_real_timeout_path_kills_the_tree_and_reports_timeout(self):
+        # A real process that ignores the clock, killed by the real code path.
+        wcfg = dict(EW.worker_config({}), timeout_s=2)
+        wcfg["fanout"] = {"isolated_home": False, "kill_grace_s": 1}
+        argv = [sys.executable, "-c",
+                "import subprocess, sys, time;"
+                "p = subprocess.Popen([sys.executable, '-c', 'import time;"
+                " time.sleep(90)']);"
+                "open('gc.pid','w').write(str(p.pid)); time.sleep(90)"]
+        with mock.patch.object(EW.SS, "confined_argv", return_value=argv), \
+             mock.patch.object(EW.SS, "sandbox_wrap", lambda a, w, e: a):
+            status, out = EW.run_model(self.home, "prompt", wcfg)
         self.assertEqual(EW.OUTCOME_TIMEOUT, status)
         self.assertIn("timed out", out)
+        self.assertEqual([], EW.live_processes(), "the registry is drained")
+        grandchild = int((self.home / "gc.pid").read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.kill(grandchild, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            self.fail("the maker's grandchild outlived the timeout")
 
     def test_a_declined_cycle_is_recorded_without_a_paintbrush(self):
-        def declining(workspace, prompt, wcfg):
+        def declining(workspace, prompt, wcfg, depth=0):
             return "ok", "SENTINEL_RESULT: DECLINED nothing worth making today\n"
         with mock.patch.object(EW, "run_model", declining):
             summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
@@ -938,7 +976,7 @@ class WorkerRunTests(WorkerEnv):
         self.assertFalse((self.state / "evolve-creative-state.json").exists())
 
     def test_a_model_that_commits_its_own_work_is_rejected(self):
-        def publishing(workspace, prompt, wcfg):
+        def publishing(workspace, prompt, wcfg, depth=0):
             clone = Path(workspace) / "clone"
             write_submission(clone, "new-piece", meta_for("new-piece"))
             git(clone, "config", "user.email", "t@example.com")
@@ -954,7 +992,7 @@ class WorkerRunTests(WorkerEnv):
         self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
 
     def test_a_missing_next_state_file_is_rejected_before_any_remote_call(self):
-        def no_state(workspace, prompt, wcfg):
+        def no_state(workspace, prompt, wcfg, depth=0):
             write_submission(Path(workspace) / "clone", "new-piece",
                              meta_for("new-piece"))
             return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
@@ -967,7 +1005,7 @@ class WorkerRunTests(WorkerEnv):
     def test_roles_rotate_across_passes(self):
         seen = []
 
-        def watcher(workspace, prompt, wcfg):
+        def watcher(workspace, prompt, wcfg, depth=0):
             seen.append(wcfg["role"])
             return EW.OUTCOME_FAILED, "no model here"
         with mock.patch.object(EW, "run_model", watcher):
@@ -991,7 +1029,8 @@ class WorkerRunTests(WorkerEnv):
         model.assert_not_called()
 
 
-def child_result(role, n=6, ok=True, wave=1, error="", critique=()):
+def child_result(role, n=6, ok=True, wave=1, error="", critique=(),
+                 verifier=None):
     """A sub-sentinel report in the shape subsentinels.run_children returns."""
     report = None
     if ok:
@@ -1006,6 +1045,7 @@ def child_result(role, n=6, ok=True, wave=1, error="", critique=()):
             "critique": list(critique),
         }
     return {"role": role, "wave": wave, "ok": ok, "error": error,
+            "verifier": bool(wave >= 2 if verifier is None else verifier),
             "timed_out": False, "exit_code": 0 if ok else 1, "elapsed_s": 2.0,
             "report": report}
 
@@ -1023,16 +1063,23 @@ class FanoutIntegrationTests(WorkerEnv):
         })
 
     def maker_using_finalists(self, slug="new-piece", cycle=1, previous=None,
-                              honour=True):
-        """A maker that reads the finalists the controller wrote for it."""
-        def fake(workspace, prompt, wcfg):
+                              honour=True, forge=None):
+        """A maker that copies round1.json, the way the prompt tells it to.
+
+        `honour=False` keeps its own ids; `forge` rewrites one field of one
+        record while keeping every id — the attack the digests exist for.
+        """
+        def fake(workspace, prompt, wcfg, depth=0):
             self.prompt = prompt
-            data = json.loads((Path(workspace) / "finalists.json").read_text())
-            self.finalists = [c["id"] for c in data["finalists"]]
+            records = json.loads((Path(workspace) / "round1.json").read_text())
+            self.finalists = [c["id"] for c in records]
+            if forge:
+                records = [dict(r) for r in records]
+                records[0].update(forge)
             clone = Path(workspace) / "clone"
             write_submission(clone, slug, meta_for(
                 slug, cycle=cycle, previous=previous,
-                round1_ids=self.finalists if honour else None))
+                round1_records=records if honour else None))
             (Path(workspace) / "state-out.json").write_text(json.dumps({
                 "cycle": cycle, "last_slug": slug, "notes": "n"}), encoding="utf-8")
             return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
@@ -1052,7 +1099,8 @@ class FanoutIntegrationTests(WorkerEnv):
         self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
         self.assertEqual(10, len(self.finalists))
         self.assertIn("THE TEN FINALISTS", self.prompt)
-        self.assertIn("MUST be exactly these ten ids", self.prompt)
+        self.assertIn("MUST be exactly these ten records", self.prompt)
+        self.assertIn("round1.json", self.prompt)
         for cid in self.finalists:
             self.assertIn(cid, self.prompt)
         row = json.loads(EW.HISTORY_PATH.read_text())[0]
@@ -1062,7 +1110,7 @@ class FanoutIntegrationTests(WorkerEnv):
 
     def test_a_maker_that_ignores_its_sub_sentinels_is_rejected(self):
         results = [child_result("a"), child_result("b"),
-                   child_result("c", wave=2)]
+                   child_result("adversarial-verifier", wave=2)]
         with self.patched_children(results), \
              mock.patch.object(EW, "run_model",
                                self.maker_using_finalists(honour=False)):
@@ -1075,21 +1123,23 @@ class FanoutIntegrationTests(WorkerEnv):
 
     def test_a_partial_failure_that_still_yields_ten_continues(self):
         results = [child_result("a"), child_result("b"),
-                   child_result("c", wave=2, ok=False, error="timed out after 600s")]
+                   child_result("d", ok=False, error="timed out after 600s"),
+                   child_result("adversarial-verifier", wave=2)]
         with self.patched_children(results), \
              mock.patch.object(EW, "run_model", self.maker_using_finalists()):
             summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
 
         self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
         row = json.loads(EW.HISTORY_PATH.read_text())[0]
-        self.assertEqual(["c: timed out after 600s"], row["child_failures"])
+        self.assertEqual(["d: timed out after 600s"], row["child_failures"])
         self.assertIn("CHILDREN THAT FAILED", self.prompt,
                       "the maker is told what it did not get")
 
     def test_a_failed_fanout_never_reaches_the_maker(self):
-        results = [child_result("a", ok=False, error="wrote no report.json"),
+        results = [child_result("a", ok=False, error="wrote no report"),
                    child_result("b", ok=False, error="exited 1"),
-                   child_result("c", wave=2, ok=False, error="timed out")]
+                   child_result("adversarial-verifier", wave=2, ok=False,
+                                error="timed out")]
         with self.patched_children(results), \
              mock.patch.object(EW, "run_model") as maker:
             summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
@@ -1108,7 +1158,8 @@ class FanoutIntegrationTests(WorkerEnv):
         self.assertEqual([], self.workspaces())
 
     def test_too_few_survivors_is_a_named_failure_not_nine_finalists(self):
-        results = [child_result("a", n=5), child_result("b", n=4)]
+        results = [child_result("a", n=5),
+                   child_result("adversarial-verifier", wave=2, n=4)]
         with self.patched_children(results), \
              mock.patch.object(EW, "run_model") as maker:
             summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
@@ -1129,10 +1180,10 @@ class FanoutIntegrationTests(WorkerEnv):
         self.assertIn("child budget spent", summary["reason"])
         maker.assert_not_called()
         children.assert_not_called()
-        row = json.loads(EW.HISTORY_PATH.read_text())[0]
-        self.assertTrue(row["skipped"], "a skipped cycle must not spend budget")
-        self.assertEqual(0, len(EW.spend_rows(json.loads(
-            EW.HISTORY_PATH.read_text()))))
+        self.assertFalse(EW.HISTORY_PATH.exists(),
+                         "deciding not to start spends nothing and writes no row")
+        status = json.loads(EW.STATUS_PATH.read_text())
+        self.assertEqual("skipped", status["outcome"])
 
     def test_a_nested_worker_run_refuses_itself(self):
         with mock.patch.dict(os.environ, {SS.DEPTH_ENV: "1"}), \
@@ -1151,7 +1202,7 @@ class FanoutIntegrationTests(WorkerEnv):
 
     def test_children_receive_every_prior_submission_but_no_repository(self):
         results = [child_result("a"), child_result("b"),
-                   child_result("c", wave=2)]
+                   child_result("adversarial-verifier", wave=2)]
         with self.patched_children(results) as children, \
              mock.patch.object(EW, "run_model", self.maker_using_finalists()):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
@@ -1213,7 +1264,7 @@ class ArtNotificationTests(WorkerEnv):
             "about clocks for several more sentences nobody will read on a "
             "phone."))
 
-        def maker(workspace, prompt, wcfg):
+        def maker(workspace, prompt, wcfg, depth=0):
             write_submission(Path(workspace) / "clone", "new-piece", meta)
             (Path(workspace) / "state-out.json").write_text(json.dumps(
                 {"cycle": 1, "last_slug": "new-piece", "notes": "n"}),
@@ -1260,7 +1311,7 @@ class ArtNotificationTests(WorkerEnv):
 
     def test_no_message_for_a_timeout(self):
         with mock.patch.object(EW, "run_model",
-                               lambda ws, p, w: (EW.OUTCOME_TIMEOUT, "timed out")):
+                               lambda ws, p, w, d=0: (EW.OUTCOME_TIMEOUT, "timed out")):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         self.assertEqual(1, len(self.notifications))
         self.assertNotIn("View:", self.texts()[0])
@@ -1269,7 +1320,7 @@ class ArtNotificationTests(WorkerEnv):
     def test_no_message_for_a_declined_cycle(self):
         with mock.patch.object(
                 EW, "run_model",
-                lambda ws, p, w: ("ok", "SENTINEL_RESULT: DECLINED not today\n")):
+                lambda ws, p, w, d=0: ("ok", "SENTINEL_RESULT: DECLINED not today\n")):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         self.assertEqual([], self.notifications)
 
@@ -1462,6 +1513,559 @@ class ArtDeliveryTests(WorkerEnv):
         self.assertIn("alert_delivery", summary["reason"])
         maker.assert_not_called()
         self.assertEqual([], self.enqueued)
+
+
+class ForgedFinalistTests(WorkerEnv):
+    """Same id, different content, must not pass (#2)."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = worker_cfg(evolve_worker={
+            "repo": str(self.origin), "git_author_name": "test",
+            "git_author_email": "t@example.com",
+            "fanout": {"enabled": True, "children": 3}})
+        self.results = [child_result("a"), child_result("b"),
+                        child_result("adversarial-verifier", wave=2)]
+
+    def run_with(self, forge):
+        with mock.patch.object(EW.SS, "run_children", return_value=self.results), \
+             mock.patch.object(EW, "run_model",
+                               FanoutIntegrationTests.maker_using_finalists(
+                                   self, forge=forge)):
+            return EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+    def test_a_rewritten_premise_under_the_same_id_is_rejected(self):
+        summary = self.run_with({"premise": "something else entirely"})
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+        self.assertIn("content was rewritten", summary["detail"])
+        self.assertFalse(self.gh.calls, "nothing reaches GitHub")
+
+    def test_a_rewritten_score_is_rejected(self):
+        summary = self.run_with({"scores": {d: 10 for d in EW.SCORE_DIMENSIONS}})
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+        self.assertIn("content was rewritten", summary["detail"])
+
+    def test_rewritten_role_provenance_is_rejected(self):
+        summary = self.run_with({"from": "someone-more-impressive"})
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+
+    def test_a_rewritten_evidence_digest_is_rejected(self):
+        summary = self.run_with({"evidence_digest": "0" * 64})
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+
+    def test_dropping_a_record_field_is_rejected(self):
+        def maker(workspace, prompt, wcfg, depth=0):
+            records = json.loads((Path(workspace) / "round1.json").read_text())
+            stripped = [{"id": r["id"], "premise": r["premise"],
+                         "scores": r["scores"]} for r in records]
+            write_submission(Path(workspace) / "clone", "new-piece",
+                             meta_for("new-piece", round1_records=stripped))
+            (Path(workspace) / "state-out.json").write_text(json.dumps(
+                {"cycle": 1, "last_slug": "new-piece", "notes": "n"}),
+                encoding="utf-8")
+            return "ok", "SENTINEL_RESULT: CONTRIBUTED\n"
+        with mock.patch.object(EW.SS, "run_children", return_value=self.results), \
+             mock.patch.object(EW, "run_model", maker):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+        self.assertIn("must carry the finalist record", summary["detail"])
+
+    def test_a_published_digest_that_lies_about_its_own_fields_is_rejected(self):
+        summary = self.run_with({"digest": "f" * 64})
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
+        self.assertIn("publishes a digest", summary["detail"])
+
+
+class TreeShapeTests(GateTests):
+    """What ends up in the git INDEX, not just on disk (#3)."""
+
+    def test_a_nested_file_is_rejected(self):
+        directory = write_submission(
+            self.clone, "new-piece",
+            meta_for("new-piece", cycle=2, previous="already-here"))
+        (directory / "extra").mkdir()
+        (directory / "extra" / "more.svg").write_text(SVG, encoding="utf-8")
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("not a root-level file", str(cm.exception))
+
+    def test_a_symlinked_piece_is_rejected(self):
+        directory = self.clone / "submissions" / "new-piece"
+        directory.mkdir(parents=True)
+        (directory / "meta.json").write_text(
+            json.dumps(meta_for("new-piece", cycle=2, previous="already-here")),
+            encoding="utf-8")
+        secret = self.home / "id_ed25519"
+        secret.write_text("PRIVATE KEY", encoding="utf-8")
+        (directory / "piece.svg").symlink_to(secret)
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("symlink", str(cm.exception))
+
+    def test_a_symlinked_folder_is_rejected(self):
+        elsewhere = self.home / "elsewhere"
+        elsewhere.mkdir()
+        (self.clone / "submissions" / "new-piece").symlink_to(elsewhere)
+        (elsewhere / "meta.json").write_text("{}", encoding="utf-8")
+        with self.assertRaises(EW.GateError):
+            self.gate()
+
+    def test_a_hardlinked_piece_is_rejected(self):
+        directory = write_submission(
+            self.clone, "new-piece",
+            meta_for("new-piece", cycle=2, previous="already-here"))
+        os.link(directory / "piece.svg", self.home / "second-name.svg")
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("hard link", str(cm.exception))
+
+    def test_an_executable_piece_is_rejected(self):
+        directory = write_submission(
+            self.clone, "new-piece",
+            meta_for("new-piece", cycle=2, previous="already-here"))
+        os.chmod(directory / "piece.svg", 0o755)
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("executable", str(cm.exception))
+
+    def test_a_fifo_is_rejected(self):
+        directory = self.clone / "submissions" / "new-piece"
+        directory.mkdir(parents=True)
+        (directory / "meta.json").write_text(
+            json.dumps(meta_for("new-piece", cycle=2, previous="already-here")),
+            encoding="utf-8")
+        os.mkfifo(directory / "piece.svg")
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("not a regular file", str(cm.exception))
+
+    def test_the_staged_index_is_verified_against_the_gated_bytes(self):
+        write_submission(self.clone, "new-piece",
+                         meta_for("new-piece", cycle=2, previous="already-here"))
+        submission = self.gate()
+        git(self.clone, "add", "--", "submissions/new-piece")
+        paths = sorted([submission["meta_path"], submission["piece_path"]])
+        # honest index passes
+        EW.verify_staged_tree(self.clone, submission, self.wcfg, paths)
+
+        # a blob swapped in the index after the gate does not
+        proc = subprocess.run(["git", "hash-object", "-w", "--stdin"],
+                              cwd=str(self.clone), input=b"forged bytes",
+                              capture_output=True)
+        blob = proc.stdout.decode().strip()
+        subprocess.run(["git", "update-index", "--cacheinfo",
+                        f"100644,{blob},submissions/new-piece/piece.svg"],
+                       cwd=str(self.clone), check=True, capture_output=True)
+        with self.assertRaises(EW.GateError) as cm:
+            EW.verify_staged_tree(self.clone, submission, self.wcfg, paths)
+        self.assertIn("not the file that passed the gate", str(cm.exception))
+
+    def test_a_symlink_mode_in_the_index_is_rejected(self):
+        write_submission(self.clone, "new-piece",
+                         meta_for("new-piece", cycle=2, previous="already-here"))
+        submission = self.gate()
+        git(self.clone, "add", "--", "submissions/new-piece")
+        paths = sorted([submission["meta_path"], submission["piece_path"]])
+        proc = subprocess.run(["git", "hash-object", "-w", "--stdin"],
+                              cwd=str(self.clone), input=b"/etc/passwd",
+                              capture_output=True)
+        blob = proc.stdout.decode().strip()
+        subprocess.run(["git", "update-index", "--cacheinfo",
+                        f"120000,{blob},submissions/new-piece/piece.svg"],
+                       cwd=str(self.clone), check=True, capture_output=True)
+        with self.assertRaises(EW.GateError) as cm:
+            EW.verify_staged_tree(self.clone, submission, self.wcfg, paths)
+        self.assertIn("120000", str(cm.exception))
+
+
+class LifecycleTests(WorkerEnv):
+    """A stopped worker leaves nothing running (#4)."""
+
+    def test_sigterm_kills_the_whole_tree_and_frees_the_lock(self):
+        repo_root = Path(__file__).resolve().parent
+        marker = self.home / "grandchild.pid"
+        shim_dir = self.home / "bin"
+        shim_dir.mkdir()
+        shim = shim_dir / "copilot"
+        # The marker is written atomically: a half-created file is exactly
+        # the empty-string read that made this test flake under load.
+        shim.write_text(
+            "#!/usr/bin/env bash\n"
+            f"{sys.executable} -c \"import os,subprocess,sys,time;"
+            "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(120)']);"
+            f"tmp={str(marker) + '.tmp'!r};"
+            "open(tmp,'w').write(str(p.pid));"
+            f"os.replace(tmp,{str(marker)!r});time.sleep(120)\"\n",
+            encoding="utf-8")
+        shim.chmod(0o755)
+
+        cfg = dict(self.cfg, notify=False)
+        cfg["evolve_worker"] = {**cfg["evolve_worker"],
+                                "fanout": {"enabled": False,
+                                           "isolated_home": False}}
+        (self.home / "cfg.json").write_text(json.dumps(cfg), encoding="utf-8")
+        driver = self.home / "driver.py"
+        driver.write_text(
+            "import json, sys\n"
+            f"sys.path.insert(0, {str(repo_root)!r})\n"
+            "import evolve_worker as EW\n"
+            "EW.install_signal_handlers()\n"
+            f"cfg = json.load(open({str(self.home / 'cfg.json')!r}))\n"
+            "healthy = {'status': 'healthy', 'failed': [], 'critical': [],\n"
+            "           'checks': [], 'summary': 'ok'}\n"
+            "print(json.dumps(EW.run_once(cfg=cfg, health=lambda p: healthy)))\n",
+            encoding="utf-8")
+
+        env = dict(os.environ)
+        env["SENTINEL_HOME"] = str(self.home)
+        env["PATH"] = f"{shim_dir}:{env['PATH']}"
+        proc = subprocess.Popen([sys.executable, str(driver)], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+        self.addCleanup(_reap_tree, proc)
+
+        # Generous waits: this test is about what SURVIVES a SIGTERM, not
+        # about how fast a loaded machine gets there. A tight deadline here
+        # only ever measures the test runner.
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline and not marker.exists():
+            time.sleep(0.1)
+        self.assertTrue(marker.exists(), "the fake maker never started")
+        grandchild = int(marker.read_text())
+
+        proc.send_signal(signal.SIGTERM)
+        try:
+            out, err = proc.communicate(timeout=180)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, err = proc.communicate()
+            self.fail("the worker did not exit after SIGTERM")
+
+        self.assertTrue(_dead(grandchild),
+                        "a model's grandchild outlived the worker's SIGTERM")
+        self.assertTrue(_dead(proc.pid))
+
+        workspaces = self.home / "state" / "evolve-workspaces"
+        self.assertEqual([], list(workspaces.iterdir()) if workspaces.exists() else [],
+                         "the workspace must be removed on the way out")
+
+        status_file = self.home / "state" / "evolve-worker-status.json"
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not status_file.exists():
+            time.sleep(0.1)
+        status = json.loads(status_file.read_text())
+        self.assertEqual("interrupted", status["outcome"], status)
+
+        # The lock is only free once the tree is gone — which it now is.
+        lock = EW.acquire_lock(self.home / "state" / "evolve-worker.lock")
+        self.addCleanup(EW.release_lock, lock)
+        self.assertIsNotNone(lock, "the lock outlived the pass")
+
+    def test_the_lock_is_still_held_while_a_model_is_alive(self):
+        released = []
+        real_release = EW.release_lock
+
+        def watched(fd):
+            released.append(EW.live_processes())
+            return real_release(fd)
+
+        def slow_maker(workspace, prompt, wcfg, depth=0):
+            proc = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                start_new_session=True)
+            EW.track(proc)
+            return EW.OUTCOME_FAILED, "left something running"
+
+        with mock.patch.object(EW, "run_model", slow_maker), \
+             mock.patch.object(EW, "release_lock", watched):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+        self.assertEqual([[]], released,
+                         "nothing may still be running when the lock is dropped")
+
+    def test_kill_tracked_reports_what_it_had_to_kill(self):
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                start_new_session=True)
+        EW.track(proc)
+        self.assertEqual(1, EW.kill_tracked())
+        self.assertTrue(_dead(proc.pid))
+        self.assertEqual([], EW.live_processes())
+
+
+class ReconciliationTests(WorkerEnv):
+    """The crash window between `gh pr merge` and the ledger write (#5)."""
+
+    def crash_after(self, phase):
+        """A publish that dies right after `phase` was recorded."""
+        real_publish = EW.publish
+
+        def dying(clone, submission, wcfg, health, branch=None, transaction=None):
+            def note(**fields):
+                state = transaction(**fields) if transaction else {}
+                if fields.get("phase") == phase:
+                    raise KeyboardInterrupt("power cut")
+                return state
+            return real_publish(clone, submission, wcfg, health, branch, note)
+        return dying
+
+    def test_a_merge_that_was_never_recorded_is_finished_on_the_next_pass(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()), \
+             mock.patch.object(EW, "publish", self.crash_after("merged")):
+            first = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("interrupted", first["outcome"], first)
+
+        # The art IS public: the merge happened before the interruption.
+        self.assertIn("submissions/new-piece/piece.svg",
+                      git_bare(self.origin, "ls-tree", "--name-only", "-r", "main"))
+        history = json.loads(EW.HISTORY_PATH.read_text())
+        self.assertEqual("pending", history[0]["outcome"])
+        self.assertTrue(EW.TRANSACTION_PATH.exists())
+        self.assertEqual([], self.texts(), "nothing was announced yet")
+
+        with mock.patch.object(EW, "run_model") as maker:
+            second = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+
+        self.assertEqual("reconciled-contributed", second["outcome"], second)
+        maker.assert_not_called()
+        history = json.loads(EW.HISTORY_PATH.read_text())
+        self.assertEqual(1, len(history), "reconciling is not a second cycle")
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, history[0]["outcome"])
+        state = json.loads((self.state / "evolve-creative-state.json").read_text())
+        self.assertEqual("new-piece", state["last_slug"])
+        self.assertEqual(1, len(self.notifications), "exactly one message")
+        self.assertIn(EW.SUCCESS_PREFIX, self.texts()[0])
+        self.assertFalse(EW.TRANSACTION_PATH.exists())
+
+    def test_an_abandoned_pr_is_closed_and_the_row_marked_aborted(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()), \
+             mock.patch.object(EW, "publish", self.crash_after("pr-open")):
+            first = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("interrupted", first["outcome"])
+        self.assertTrue(EW.TRANSACTION_PATH.exists())
+
+        with mock.patch.object(EW, "run_model") as maker:
+            second = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("reconciled-aborted", second["outcome"], second)
+        maker.assert_not_called()
+        self.assertTrue(self.gh.called("pr", "close"))
+        history = json.loads(EW.HISTORY_PATH.read_text())
+        self.assertEqual(EW.OUTCOME_ABORTED, history[0]["outcome"])
+        self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
+        self.assertFalse((self.state / "evolve-creative-state.json").exists())
+        self.assertFalse(EW.TRANSACTION_PATH.exists())
+
+    def test_a_death_before_any_pr_is_recorded_as_aborted(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()), \
+             mock.patch.object(EW, "publish", self.crash_after("committed")):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        with mock.patch.object(EW, "run_model") as maker:
+            second = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("reconciled-aborted", second["outcome"])
+        maker.assert_not_called()
+        history = json.loads(EW.HISTORY_PATH.read_text())
+        self.assertEqual(EW.OUTCOME_ABORTED, history[0]["outcome"])
+
+    def test_the_next_cycle_number_follows_the_reconciled_ledger(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()), \
+             mock.patch.object(EW, "publish", self.crash_after("merged")):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        with mock.patch.object(EW, "run_model",
+                               self.model_that_submits(slug="second-piece",
+                                                       cycle=2,
+                                                       previous="new-piece")):
+            third = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, third["outcome"], third)
+
+
+class HealthProbeTests(WorkerEnv):
+    """A probe that cannot answer is not an answer (#5, #8)."""
+
+    def test_a_raising_probe_before_the_merge_blocks_and_cleans_up(self):
+        def health(phase):
+            if phase == "pre-merge":
+                raise RuntimeError("health.py exploded")
+            return healthy()
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=health)
+        self.assertEqual(EW.OUTCOME_ABORTED, summary["outcome"])
+        self.assertIn("RuntimeError", summary["detail"])
+        self.assertFalse(self.gh.called("pr", "merge"))
+        self.assertTrue(self.gh.called("pr", "close"))
+
+    def test_a_malformed_verdict_before_the_merge_blocks(self):
+        def health(phase):
+            return healthy() if phase != "pre-merge" else {"status": "healthy"}
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=health)
+        self.assertEqual(EW.OUTCOME_ABORTED, summary["outcome"])
+        self.assertIn("missing", summary["detail"])
+        self.assertFalse(self.gh.called("pr", "merge"))
+
+    def test_a_raising_probe_at_the_start_never_spends_a_model(self):
+        def health(phase):
+            raise TimeoutError("no answer")
+        with mock.patch.object(EW, "run_model") as maker:
+            summary = EW.run_once(cfg=self.cfg, health=health)
+        self.assertEqual("skipped", summary["outcome"])
+        self.assertIn("TimeoutError", summary["reason"])
+        maker.assert_not_called()
+
+
+class ViewProbeTests(WorkerEnv):
+    """Never text a triumphant 404 (#10)."""
+
+    def test_a_live_pages_url_is_used(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        text = self.texts()[0]
+        self.assertIn("View: https://kody-w.github.io/", text)
+        self.assertTrue(self.probes, "the url was probed before it was sent")
+
+    def test_pages_lagging_falls_back_to_the_verified_raw_url(self):
+        self.probe_answer = lambda url: "raw.githubusercontent.com" in url
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        text = self.texts()[0]
+        self.assertIn("View: https://raw.githubusercontent.com/", text)
+        self.assertIn("Pages has not published it yet", text)
+        self.assertNotIn("View: https://kody-w.github.io/", text)
+
+    def test_nothing_answering_says_so_instead_of_linking_a_404(self):
+        self.probe_answer = lambda url: False
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"])
+        text = self.texts()[0]
+        self.assertNotIn("View:", text)
+        self.assertIn("no public URL answered yet", text)
+        self.assertIn("Source:", text, "the evidence links still go out")
+
+    def test_the_probe_retries_before_giving_up(self):
+        answers = iter([False, False, True])
+        self.probe_answer = lambda url: ("github.io" in url
+                                         and next(answers, True))
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertGreater(len(self.probes), 2, "it retried")
+        self.assertIn("View: https://kody-w.github.io/", self.texts()[0])
+
+    def test_the_probed_url_is_recorded_in_the_ledger(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        row = json.loads(EW.HISTORY_PATH.read_text())[0]
+        self.assertEqual("pages", row["view_kind"])
+        self.assertTrue(row["view_url"].startswith("https://kody-w.github.io/"))
+
+
+class HeartbeatTests(WorkerEnv):
+    """Enabled-but-not-running must not look like 'nothing to make' (#6)."""
+
+    def test_every_pass_writes_a_heartbeat(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        status = json.loads(EW.STATUS_PATH.read_text())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, status["outcome"])
+        self.assertEqual("openrappter", status["role"])
+        self.assertEqual(os.getpid(), status["pid"])
+
+    def test_a_skip_writes_a_heartbeat_too(self):
+        EW.run_once(cfg=self.cfg, health=lambda phase: critical("rb_workflows"))
+        status = json.loads(EW.STATUS_PATH.read_text())
+        self.assertEqual("skipped", status["outcome"])
+        self.assertIn("rb_workflows", status["reason"])
+
+    def test_a_failure_writes_a_heartbeat_too(self):
+        with mock.patch.object(EW, "run_model",
+                               lambda *a, **k: (EW.OUTCOME_TIMEOUT, "timed out")):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        status = json.loads(EW.STATUS_PATH.read_text())
+        self.assertEqual(EW.OUTCOME_TIMEOUT, status["outcome"])
+
+
+def _dead(pid, timeout=10):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        time.sleep(0.05)
+    return False
+
+
+def _reap_tree(proc):
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
+class ChildDebitTests(WorkerEnv):
+    """Spend recorded before it happens, so a crash cannot refund it (#9)."""
+
+    def setUp(self):
+        super().setUp()
+        self.cfg = worker_cfg(evolve_worker={
+            "repo": str(self.origin),
+            "fanout": {"enabled": True, "children": 3}})
+
+    def test_the_debit_lands_before_the_children_are_spawned(self):
+        seen = {}
+
+        def spy(*args, **kwargs):
+            rows = json.loads(EW.HISTORY_PATH.read_text())
+            seen["children_at_spawn"] = rows[0]["children"]
+            return [child_result("a"), child_result("b"),
+                    child_result("adversarial-verifier", wave=2)]
+
+        with mock.patch.object(EW.SS, "run_children", spy), \
+             mock.patch.object(EW, "run_model",
+                               FanoutIntegrationTests.maker_using_finalists(self)):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(3, seen["children_at_spawn"],
+                         "the ledger is debited before the processes start")
+
+    def test_a_raised_future_cannot_erase_the_debit(self):
+        def exploding(*args, **kwargs):
+            raise RuntimeError("a wave died badly")
+        with mock.patch.object(EW.SS, "run_children", exploding), \
+             mock.patch.object(EW, "run_model") as maker:
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("crashed", summary["outcome"])
+        maker.assert_not_called()
+        row = json.loads(EW.HISTORY_PATH.read_text())[0]
+        self.assertEqual(3, row["children"], "spent credit stays spent")
+        self.assertEqual(3, SS.children_spent([row]))
+
+    def test_an_interrupted_fanout_keeps_its_debit(self):
+        def interrupted(*args, **kwargs):
+            raise KeyboardInterrupt("SIGTERM")
+        with mock.patch.object(EW.SS, "run_children", interrupted):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("interrupted", summary["outcome"])
+        row = json.loads(EW.HISTORY_PATH.read_text())[0]
+        self.assertEqual(3, row["children"])
+
+    def test_the_next_pass_sees_yesterdays_children(self):
+        with mock.patch.object(EW.SS, "run_children",
+                               return_value=[child_result("a"), child_result("b"),
+                                             child_result("adversarial-verifier",
+                                                          wave=2)]), \
+             mock.patch.object(EW, "run_model",
+                               FanoutIntegrationTests.maker_using_finalists(self)):
+            EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        history = json.loads(EW.HISTORY_PATH.read_text())
+        cfg = SS.fanout_config(EW.worker_config(self.cfg))
+        specs, why = SS.plan_children(dict(cfg, daily_child_budget=3), history, 0)
+        self.assertEqual([], specs)
+        self.assertIn("child budget spent", why)
 
 
 # ── the tick keeps ticking ──────────────────────────────────────────────────

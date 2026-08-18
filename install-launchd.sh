@@ -115,7 +115,18 @@ if [ "$WITH_EVOLVE_WORKER" -eq 1 ] || config_enables_evolve_worker; then
     echo "        config.example.json."
   fi
 else
-  echo "skipped com.rapp.evolve-worker — proactive art still runs inside the tick"
+  # Not enabled — so make sure it is not still RUNNING from a previous
+  # install. A job left loaded after its config was turned off is a model
+  # spending money on behalf of a decision that was reversed.
+  ELABEL="com.rapp.evolve-worker"
+  EPLIST="$HOME/Library/LaunchAgents/$ELABEL.plist"
+  if [ -f "$EPLIST" ]; then
+    launchctl unload "$EPLIST" 2>/dev/null || true
+    rm -f "$EPLIST"
+    echo "unloaded and removed $ELABEL — art is disabled for this instance"
+  else
+    echo "skipped com.rapp.evolve-worker — proactive art still runs inside the tick"
+  fi
   echo "  enable: set evolve_worker.enabled=true in $INSTANCE_HOME/config.json,"
   echo "          then rerun with --with-evolve-worker"
 fi

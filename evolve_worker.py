@@ -41,8 +41,14 @@ import json
 import os
 import re
 import shutil
+import signal
+import stat
 import subprocess
 import sys
+import threading
+import time
+import urllib.error
+import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -62,6 +68,14 @@ LOCK_PATH = STATE / "evolve-worker.lock"
 HISTORY_PATH = STATE / "evolve-worker-history.json"
 TURN_PATH = STATE / "evolve-worker-turn.json"
 ALERT_PATH = STATE / "evolve-worker-alerts.json"
+STATUS_PATH = STATE / "evolve-worker-status.json"
+TRANSACTION_PATH = STATE / "evolve-worker-transaction.json"
+
+# Every model process this pass started, so a timeout, a SIGTERM or a crash
+# can take the whole tree down instead of orphaning a 30-minute model run and
+# whatever it spawned. The lock is released only after this list is empty.
+_LIVE = []
+_LIVE_LOCK = threading.Lock()
 
 HISTORY_KEEP = 400
 
@@ -141,6 +155,69 @@ class AbortError(RuntimeError):
 
 class CommandError(RuntimeError):
     """A git/gh command failed or timed out."""
+
+
+# ── the process tree ────────────────────────────────────────────────────────
+
+def track(proc):
+    with _LIVE_LOCK:
+        _LIVE.append(proc)
+    return proc
+
+
+def untrack(proc):
+    with _LIVE_LOCK:
+        try:
+            _LIVE.remove(proc)
+        except ValueError:
+            pass
+
+
+def live_processes():
+    with _LIVE_LOCK:
+        return [p for p in _LIVE if p.poll() is None]
+
+
+def kill_tracked(grace=5.0):
+    """Terminate every model process this pass started, and their children.
+
+    Each is spawned with start_new_session, so one signal per process GROUP
+    reaches the grandchildren a model shelled into. Returns how many were
+    still alive when we started, for the caller to report honestly.
+    """
+    with _LIVE_LOCK:
+        procs = list(_LIVE)
+    alive = [p for p in procs if p.poll() is None]
+    for proc in alive:
+        SS._kill_group(proc, grace)
+    for proc in procs:
+        untrack(proc)
+    return len(alive)
+
+
+_STOPPING = threading.Event()
+
+
+def _handle_signal(signum, frame):
+    """A stopped worker must not leave a model running.
+
+    launchd's ceiling, a reboot, or an operator's kill all arrive here. Kill
+    the tree first, then let the normal unwind delete the workspace and
+    release the lock — in that order, so nothing that is still running can
+    outlive the lock that says a cycle is in flight (#4).
+    """
+    _STOPPING.set()
+    killed = kill_tracked()
+    log(f"signal {signum} — terminated {killed} live model process tree(s)")
+    raise KeyboardInterrupt(f"signal {signum}")
+
+
+def install_signal_handlers():
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _handle_signal)
+        except (ValueError, OSError):
+            pass          # not the main thread (tests) — nothing to install
 
 
 # ── logging ─────────────────────────────────────────────────────────────────
@@ -360,6 +437,10 @@ def cadence_ready(history, wcfg):
 #                   and "unknown" must never be allowlisted into "fine".
 NEVER_ALLOWLISTABLE = frozenset({"alert_delivery", "health_runtime"})
 
+# health.py emits exactly these three. Anything else is a verdict this worker
+# cannot reason about, and an unreadable verdict is never a green light.
+KNOWN_STATUSES = frozenset({"healthy", "degraded", "critical"})
+
 
 def health_gate(wcfg, verdict, phase="start"):
     """Health decides whether art may proceed. Returns (ok, reason).
@@ -371,10 +452,31 @@ def health_gate(wcfg, verdict, phase="start"):
     in a way nobody had looked at yet (#3). A small set of ids refuses to be
     allowlisted at all (NEVER_ALLOWLISTABLE).
     """
+    # A verdict is only evidence if it has the shape of a verdict. Reading
+    # missing keys as empty defaults meant "{}" — a crashed health run, a
+    # truncated json read, a mock nobody finished — scored as "healthy, no
+    # criticals, nothing failing" and unlocked the model (#8).
+    if not isinstance(verdict, dict):
+        return False, f"health at {phase} returned {type(verdict).__name__}, not a verdict"
+    missing = [k for k in ("status", "failed", "critical") if k not in verdict]
+    if missing:
+        return False, (f"health verdict at {phase} is missing "
+                       f"{', '.join(missing)} — shape unknown, not healthy")
+    status = verdict.get("status")
+    if status not in KNOWN_STATUSES:
+        return False, (f"health verdict at {phase} reports status "
+                       f"{status!r}, which this worker does not understand")
+    if not isinstance(verdict.get("failed"), list) or not isinstance(
+            verdict.get("critical"), list):
+        return False, (f"health verdict at {phase} has non-list failed/critical "
+                       f"fields — shape unknown, not healthy")
     critical = list(verdict.get("critical") or [])
     if critical:
         return False, f"critical checks failing at {phase}: {', '.join(sorted(critical))}"
     failing = list(verdict.get("failed") or [])
+    if status != "healthy" and not failing:
+        return False, (f"health verdict at {phase} says {status!r} but names no "
+                       f"failing check — the two disagree, so neither is trusted")
     if not failing:
         return True, f"healthy at {phase}"
     unskippable = sorted(set(failing) & NEVER_ALLOWLISTABLE)
@@ -545,8 +647,10 @@ def build_prompt(cfg, wcfg, slug, workspace, expected_cycle,
             SS.finalists_block(finalists, digest or {})
             + "\n\nYour sub-sentinels are finished and cannot be consulted "
               "again. Do not start any further agents; you are the maker.\n")
-        round_one = ('Round 1 MUST contain exactly the ten finalist ids above, '
-                     'verbatim. Later rounds (up to 5) may use ids of your own.')
+        round_one = ('Round 1 MUST be exactly the ten finalist RECORDS in '
+                     'round1.json — every field, copied verbatim, including '
+                     '"from", "rationale", "evidence_digest" and all six '
+                     'scores. Later rounds (up to 5) are yours.')
     else:
         fanout_block = ""
         round_one = ("Round 1 is yours to populate; every round needs exactly "
@@ -618,32 +722,74 @@ def _gh(*args, timeout=300):
     return r.stdout
 
 
-def run_model(workspace, prompt, wcfg):
+def run_model(workspace, prompt, wcfg, depth=0):
     """Spend the model in the workspace. Returns (outcome, output).
+
+    Confined, not trusted: bounded file tools rooted at --add-dir, no shell,
+    no git, no gh, no MCP, no network tool, an isolated HOME/XDG/temp inside
+    the workspace, a strict environment allowlist, and inference auth handed
+    over as one --secret-env-vars variable rather than the operator's real
+    credential store (#1).
+
+    Tracked, not fire-and-forget: its own process group, registered in _LIVE
+    so a timeout or a SIGTERM takes the whole tree down (#4).
 
     Outcome is only ever "ok", "timeout" or "failed" here — whether the model
     actually CONTRIBUTED is not something its exit code or its last line is
     allowed to decide (R1).
-
-    The maker inherits a depth marker too: if it shells back into
-    evolve_worker.py, that run refuses itself rather than starting a second
-    cycle inside this one.
     """
-    cmd = ["copilot", "-p", prompt, "--allow-all", "--model", wcfg["model"]]
+    fcfg = SS.fanout_config(wcfg)
+    workspace = Path(workspace)
     timeout_s = int(wcfg["timeout_s"])
-    env = dict(os.environ)
-    env[SS.DEPTH_ENV] = str(SS.current_depth() + 1)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=timeout_s, cwd=str(workspace), env=env)
-    except subprocess.TimeoutExpired:
-        return OUTCOME_TIMEOUT, f"copilot timed out after {timeout_s}s"
+        env = SS.confined_env(fcfg, workspace, depth)
+    except SS.AuthUnavailable as e:
+        return OUTCOME_FAILED, f"cannot confine the maker: {e}"
+    argv = SS.sandbox_wrap(
+        SS.confined_argv(prompt, wcfg["model"], workspace,
+                         tools=SS.MAKER_TOOLS,
+                         add_dirs=[workspace],
+                         secret_vars=SS.secret_vars_for(fcfg),
+                         log_dir=workspace / "copilot-logs"),
+        workspace, bool(fcfg.get("sandbox_exec")))
+    try:
+        proc = subprocess.Popen(argv, cwd=str(workspace), env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
     except FileNotFoundError:
         return OUTCOME_FAILED, "copilot CLI not found on PATH"
-    out = (r.stdout or "") + (r.stderr or "")
-    if r.returncode != 0:
-        return OUTCOME_FAILED, out or f"copilot exited {r.returncode}"
-    return "ok", out
+    except OSError as e:
+        return OUTCOME_FAILED, f"could not start the maker: {type(e).__name__}: {e}"
+    track(proc)
+    try:
+        out, err = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        SS._kill_group(proc, float(fcfg.get("kill_grace_s", 5)))
+        try:
+            proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        return OUTCOME_TIMEOUT, f"copilot timed out after {timeout_s}s"
+    except BaseException:
+        SS._kill_group(proc, float(fcfg.get("kill_grace_s", 5)))
+        raise
+    finally:
+        untrack(proc)
+    output = (out or "") + (err or "")
+    if proc.returncode != 0:
+        return OUTCOME_FAILED, output or f"copilot exited {proc.returncode}"
+    return "ok", output
+
+
+def maker_argv(wcfg, workspace, prompt="P"):
+    """The exact command line the maker would get. Exposed for tests."""
+    fcfg = SS.fanout_config(wcfg)
+    return SS.sandbox_wrap(
+        SS.confined_argv(prompt, wcfg.get("model", ""), workspace,
+                         tools=SS.MAKER_TOOLS, add_dirs=[workspace],
+                         secret_vars=SS.secret_vars_for(fcfg),
+                         log_dir=Path(workspace) / "copilot-logs"),
+        workspace, bool(fcfg.get("sandbox_exec")))
 
 
 # ── the deterministic gate ──────────────────────────────────────────────────
@@ -668,15 +814,21 @@ def working_tree_changes(clone, timeout=600):
 
 
 def _new_submission_dir(changes):
-    """Exactly one new submissions/<slug>/ and nothing else touched."""
+    """Exactly one new submissions/<slug>/ and nothing else touched.
+
+    Paths must have exactly three components: a submission is two files at the
+    ROOT of its folder. `submissions/<slug>/a/b.svg` used to pass the prefix
+    test and then vanish from the two-file count, which is a directory tree
+    smuggled through a check that thought it was counting files (#3).
+    """
     slugs, files = set(), []
     for code, path, origin in changes:
         if code != "??":
             raise GateError(f"the model changed an existing path: {code} {path}"
                             + (f" (from {origin})" if origin else ""))
         parts = Path(path).parts
-        if len(parts) < 3 or parts[0] != "submissions":
-            raise GateError(f"file outside submissions/<slug>/: {path}")
+        if len(parts) != 3 or parts[0] != "submissions":
+            raise GateError(f"not a root-level file in submissions/<slug>/: {path}")
         slugs.add(parts[1])
         files.append(path)
     if not slugs:
@@ -685,6 +837,24 @@ def _new_submission_dir(changes):
         raise GateError(f"more than one new submission: {', '.join(sorted(slugs))}")
     slug = slugs.pop()
     return slug, sorted(files)
+
+
+def _regular_file(path, where):
+    """lstat, never stat: the question is what this path IS, not what it
+    points at. A symlink to ~/.ssh/id_ed25519 reads fine through stat() and
+    commits as a symlink; git stores mode 120000 and the link target becomes
+    the blob (#3)."""
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise GateError(f"{where} is a symlink")
+    if not stat.S_ISREG(st.st_mode):
+        raise GateError(f"{where} is not a regular file "
+                        f"(mode {stat.S_IFMT(st.st_mode):#o})")
+    if st.st_nlink > 1:
+        raise GateError(f"{where} has {st.st_nlink} hard links")
+    if st.st_mode & 0o111:
+        raise GateError(f"{where} is executable")
+    return st
 
 
 def _reject_external_url(value, where):
@@ -703,6 +873,14 @@ def _reject_external_url(value, where):
             raise GateError(f"{where} references something outside itself: "
                             f"{ref[:60]}")
         idx += 4
+
+
+def _regular_dir(path):
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        raise GateError("the submission folder is a symlink")
+    if not stat.S_ISDIR(st.st_mode):
+        raise GateError("the submission folder is not a directory")
 
 
 def _check_svg(raw, text):
@@ -769,7 +947,7 @@ def _check_number(value, where):
 
 
 def validate_dada_cycle(cycle, slug, expected_cycle, expected_previous,
-                        expected_round1_ids=None):
+                        expected_round1=None):
     """The cycle block is the search, checked. Reject on the first doubt."""
     if not isinstance(cycle, dict):
         raise GateError("meta._dada_cycle is missing or not an object")
@@ -823,20 +1001,41 @@ def validate_dada_cycle(cycle, slug, expected_cycle, expected_previous,
         if selected not in seen:
             raise GateError(f"round {index} selected {selected!r}, which is not "
                             f"one of its candidates")
-        if index == 1 and expected_round1_ids is not None:
-            # The fan-out's ten finalists ARE round one. Without this the
-            # sub-sentinels would be theatre: a maker could run three child
-            # processes, ignore every one of them, and publish whatever it
-            # already had in mind with a deliberation section attached.
-            wanted = set(expected_round1_ids)
-            if seen != wanted:
-                missing = sorted(wanted - seen)
-                added = sorted(seen - wanted)
+        if index == 1 and expected_round1 is not None:
+            # The fan-out's ten finalists ARE round one — and a finalist is
+            # its content, not its label. Checking ids alone let a maker keep
+            # the names and replace every premise and score underneath them,
+            # which is the deliberation erased and its receipt kept (#2). The
+            # digest covers premise, rationale, all six scores, which
+            # sub-sentinel produced it, and that child's evidence.
+            wanted = dict(expected_round1)
+            if seen != set(wanted):
+                missing = sorted(set(wanted) - seen)
+                added = sorted(seen - set(wanted))
                 raise GateError(
                     "round 1 must be exactly the ten finalists the "
                     "sub-sentinels produced"
                     + (f"; missing {missing}" if missing else "")
                     + (f"; unexpected {added}" if added else ""))
+            for cand in candidates:
+                cid = cand["id"]
+                for field in SS.RECORD_FIELDS:
+                    if field not in cand:
+                        raise GateError(f"round 1 candidate {cid} is missing "
+                                        f"{field}; round one must carry the "
+                                        f"finalist record, not just its id")
+                try:
+                    actual = SS.record_digest(cand)
+                except SS.FanoutError as e:
+                    raise GateError(f"round 1 candidate {cid}: {e}")
+                if actual != wanted[cid]:
+                    raise GateError(
+                        f"round 1 candidate {cid} does not match the finalist "
+                        f"the sub-sentinels produced (digest {actual[:12]}… != "
+                        f"{wanted[cid][:12]}…) — its content was rewritten")
+                if "digest" in cand and cand["digest"] != actual:
+                    raise GateError(f"round 1 candidate {cid} publishes a digest "
+                                    f"that does not match its own fields")
     winner = cycle.get("winner")
     if not isinstance(winner, dict):
         raise GateError("_dada_cycle.winner is missing or not an object")
@@ -854,7 +1053,7 @@ def validate_dada_cycle(cycle, slug, expected_cycle, expected_previous,
 
 def validate_submission(clone, wcfg, expected_cycle, expected_previous,
                         base_branch="main", base_sha=None,
-                        expected_round1_ids=None):
+                        expected_round1=None):
     """Everything the controller must prove before a single remote call.
 
     Returns a dict describing the submission. Raises GateError otherwise.
@@ -879,8 +1078,13 @@ def validate_submission(clone, wcfg, expected_cycle, expected_previous,
         raise GateError(f"slug {slug!r} already exists on {base_branch}")
 
     directory = clone / "submissions" / slug
-    on_disk = sorted(p.relative_to(clone).as_posix()
-                     for p in directory.rglob("*") if p.is_file())
+    _regular_dir(directory)
+    entries = sorted(directory.iterdir(), key=lambda p: p.name)
+    on_disk = []
+    for entry in entries:
+        rel = entry.relative_to(clone).as_posix()
+        _regular_file(entry, rel)
+        on_disk.append(rel)
     if on_disk != files:
         raise GateError(f"the submission folder holds {on_disk}, but git reports "
                         f"{files}")
@@ -943,7 +1147,7 @@ def validate_submission(clone, wcfg, expected_cycle, expected_previous,
 
     raw = _check_piece(piece_path, kind, int(wcfg.get("max_piece_bytes", 51200)))
     validate_dada_cycle(meta.get("_dada_cycle"), slug, expected_cycle,
-                        expected_previous, expected_round1_ids)
+                        expected_previous, expected_round1)
 
     return {
         "slug": slug,
@@ -981,13 +1185,77 @@ def validate_next_state(path, wcfg, expected_cycle, slug):
 
 # ── the controller: git and GitHub are ours, not the model's ────────────────
 
-def publish(clone, submission, wcfg, health, branch=None):
+def probe_health(health, phase, wcfg):
+    """Run a health probe and treat any failure to produce one as a stop.
+
+    A probe that raises used to escape publish() entirely and unwind through
+    whatever caught RuntimeError next — which is not "the estate is fine", it
+    is "we never asked". An unanswered question is not a yes (#5).
+    """
+    try:
+        verdict = health(phase)
+    except BaseException as e:                # including KeyboardInterrupt
+        raise AbortError(f"health probe at {phase} raised "
+                         f"{type(e).__name__}: {str(e)[:160]}")
+    ok, why = health_gate(wcfg, verdict, phase=phase)
+    if not ok:
+        raise AbortError(why)
+    return verdict
+
+
+def verify_staged_tree(clone, submission, wcfg, paths):
+    """What git will actually push, checked before anything leaves the machine.
+
+    The working tree was gated; the INDEX is what gets pushed, and they are
+    not the same object. A symlink or a mode-100755 blob or a different set of
+    bytes can sit in the index while the files on disk look right, and
+    post-merge verification would then be confirming something a human already
+    merged (#3).
+    """
+    git_t = int(wcfg.get("git_timeout_s", 600))
+    staged = []
+    for line in _git(clone, "ls-files", "--stage", "--",
+                     f"submissions/{submission['slug']}",
+                     timeout=git_t).splitlines():
+        if not line.strip():
+            continue
+        info, _, path = line.partition("\t")
+        mode, blob, stage = (info.split() + ["", "", ""])[:3]
+        staged.append((mode, blob, stage, path))
+    if sorted(p for _, _, _, p in staged) != paths:
+        raise GateError(f"the index holds {[p for _, _, _, p in staged]}, "
+                        f"expected exactly {paths}")
+    digests = {submission["meta_path"]: submission["meta_sha256"],
+               submission["piece_path"]: submission["piece_sha256"]}
+    for mode, blob, stage, path in staged:
+        if mode != "100644":
+            raise GateError(f"{path} is staged with mode {mode}, expected "
+                            f"100644 (a symlink stages as 120000)")
+        if stage != "0":
+            raise GateError(f"{path} is staged unmerged (stage {stage})")
+        kind = _git(clone, "cat-file", "-t", blob, timeout=git_t).strip()
+        if kind != "blob":
+            raise GateError(f"{path} points at a {kind}, not a blob")
+        body = _git_bytes(clone, "cat-file", "blob", blob, timeout=git_t)
+        if hashlib.sha256(body).hexdigest() != digests[path]:
+            raise GateError(f"{path} in the index is not the file that passed "
+                            f"the gate")
+    return {path: blob for _, blob, _, path in staged}
+
+
+def publish(clone, submission, wcfg, health, branch=None, transaction=None):
     """Branch, commit, PR, verify, re-check health, merge, re-read main.
 
     Every remote step is preceded by a health run and followed by evidence
-    read back from GitHub. Returns a dict of receipts; raises AbortError or
-    CommandError. A PR opened before an abort is closed on the way out, so a
-    stopped cycle does not leave a half-open contribution behind.
+    read back from GitHub. Returns a dict of receipts; raises AbortError,
+    GateError or CommandError. A PR opened before an abort is closed on the
+    way out — for ANY exception, including a timeout, a malformed gh reply, or
+    the operator's Ctrl-C — so a stopped cycle does not leave a half-open
+    contribution behind (#5).
+
+    `transaction` is a callable the caller supplies to persist each step, so
+    a process killed between the merge call and the ledger write can be
+    reconciled on the next pass instead of losing a merged submission.
     """
     clone = Path(clone)
     repo = wcfg["repo"]
@@ -997,13 +1265,12 @@ def publish(clone, submission, wcfg, health, branch=None):
     slug = submission["slug"]
     branch = branch or f"{wcfg.get('branch_prefix', 'art')}/{slug}-{uuid.uuid4().hex[:8]}"
     paths = sorted([submission["meta_path"], submission["piece_path"]])
+    note = transaction or (lambda **_: None)
 
     # Health immediately before the FIRST remote write (#3). Not the health we
     # ran before the model: that reading is up to half an hour old by now, and
     # the estate is exactly what may have changed while the model thought.
-    ok, why = health_gate(wcfg, health("pre-write"), phase="pre-write")
-    if not ok:
-        raise AbortError(why)
+    probe_health(health, "pre-write", wcfg)
 
     _git(clone, "fetch", "--no-tags", "origin", base, timeout=git_t)
     _git(clone, "checkout", "-b", branch, f"origin/{base}", timeout=git_t)
@@ -1019,6 +1286,7 @@ def publish(clone, submission, wcfg, health, branch=None):
     if sorted(p for _, p in staged) != paths or any(s != "A" for s, _ in staged):
         raise GateError(f"staged set is {staged}, expected exactly two additions "
                         f"{paths}")
+    blobs = verify_staged_tree(clone, submission, wcfg, paths)
 
     message = (f"art: {submission['title']} ({slug})\n\n"
                f"Autonomous submission by the {wcfg.get('role', 'evolve')} "
@@ -1030,7 +1298,9 @@ def publish(clone, submission, wcfg, health, branch=None):
          "-c", f"user.email={wcfg['git_author_email']}",
          "commit", "-m", message, timeout=git_t)
     head = _git(clone, "rev-parse", "HEAD", timeout=git_t).strip()
+    note(phase="committed", branch=branch, commit=head, blobs=blobs, paths=paths)
     _git(clone, "push", "--set-upstream", "origin", branch, timeout=git_t)
+    note(phase="pushed", branch=branch, commit=head)
 
     pr_url, pr_number = "", ""
     try:
@@ -1040,6 +1310,7 @@ def publish(clone, submission, wcfg, health, branch=None):
                      f"art: {submission['title']} ({slug})",
                      "--body", body, timeout=gh_t).strip().splitlines()[-1].strip()
         pr_number = pr_url.rstrip("/").split("/")[-1]
+        note(phase="pr-open", pr_url=pr_url, pr_number=pr_number)
 
         # What GitHub says the PR contains, not what we think we pushed.
         view = json.loads(_gh("pr", "view", pr_number, "--repo", repo, "--json",
@@ -1056,27 +1327,45 @@ def publish(clone, submission, wcfg, health, branch=None):
                             f"{branch!r}")
 
         # Health again, immediately before the merge (#3/#6).
-        ok, why = health_gate(wcfg, health("pre-merge"), phase="pre-merge")
-        if not ok:
-            raise AbortError(why)
+        probe_health(health, "pre-merge", wcfg)
 
+        note(phase="merging", pr_url=pr_url, pr_number=pr_number)
         _gh("pr", "merge", pr_number, "--repo", repo, "--squash",
             "--delete-branch", timeout=gh_t)
-    except (AbortError, GateError, CommandError):
-        # Leave nothing half-published behind: close the PR if we opened one,
-        # and delete the branch we pushed if we never got that far.
+        note(phase="merge-called", pr_url=pr_url, pr_number=pr_number)
+    except BaseException:
+        # EVERY exception, not three named ones: a gh timeout, a malformed
+        # json reply, a KeyboardInterrupt from launchd's ceiling, a bug in
+        # this function. Whatever it was, an open PR nobody is going to
+        # finish is worse than no PR.
         if pr_number:
             _close_pr(repo, pr_number, gh_t)
         else:
             _delete_remote_branch(clone, branch, git_t)
+        note(phase="cleaned-up")
         raise
 
-    # Evidence, freshly re-read: merged state, merge commit, its file scope,
-    # and the bytes now living on the base branch (R1).
-    merged = json.loads(_gh("pr", "view", pr_number, "--repo", repo, "--json",
-                            "state,merged,mergeCommit", timeout=gh_t))
+    receipts = confirm_merge(clone, submission, wcfg, pr_number, paths)
+    receipts.update({"branch": branch, "commit": head, "pr_url": pr_url,
+                     "pr_number": pr_number})
+    note(phase="merged", **receipts)
+    return receipts
+
+
+def confirm_merge(clone, submission, wcfg, pr_number, paths):
+    """Evidence, freshly re-read: merged state, merge commit, its file scope,
+    and the bytes now living on the base branch (R1). Used both by publish()
+    and by reconciliation of a cycle that died mid-flight."""
+    clone = Path(clone)
+    repo = wcfg["repo"]
+    base = wcfg.get("base_branch", "main")
+    git_t = int(wcfg.get("git_timeout_s", 600))
+    gh_t = int(wcfg.get("gh_timeout_s", 300))
+
+    merged = json.loads(_gh("pr", "view", str(pr_number), "--repo", repo,
+                            "--json", "state,merged,mergeCommit", timeout=gh_t))
     if not merged.get("merged") or str(merged.get("state")).upper() != "MERGED":
-        raise CommandError(f"PR {pr_number} is not merged after the merge call: "
+        raise CommandError(f"PR {pr_number} is not merged: "
                            f"{merged.get('state')!r}")
     merge_sha = ((merged.get("mergeCommit") or {}).get("oid") or "").strip()
     if not merge_sha:
@@ -1098,10 +1387,7 @@ def publish(clone, submission, wcfg, health, branch=None):
                           timeout=git_t)
         if hashlib.sha256(blob).hexdigest() != digest:
             raise CommandError(f"{path} on origin/{base} is not the file we gated")
-
-    return {"branch": branch, "commit": head, "pr_url": pr_url,
-            "pr_number": pr_number, "merge_commit": merge_sha,
-            "base_sha": main_sha, "paths": paths}
+    return {"merge_commit": merge_sha, "base_sha": main_sha, "paths": paths}
 
 
 def _close_pr(repo, pr_number, timeout):
@@ -1204,6 +1490,81 @@ def art_urls(cfg, wcfg, submission):
             f"https://github.com/{owner}/{name}/blob/{branch}/{path}")
 
 
+def raw_url(cfg, wcfg, submission):
+    """The bytes on GitHub, served as a file rather than as a page."""
+    owner, name = art_repo(cfg, wcfg)
+    if not owner or not name:
+        return ""
+    path = "/".join(quote(seg, safe="")
+                    for seg in str(submission["piece_path"]).split("/"))
+    branch = quote(str(wcfg.get("base_branch", "main")), safe="")
+    return f"https://raw.githubusercontent.com/{owner}/{name}/{branch}/{path}"
+
+
+def probe_url(url, timeout=10):
+    """(ok, detail) for one HTTP probe. Never raises."""
+    if not url:
+        return False, "no url"
+    request = urllib.request.Request(url, method="GET",
+                                     headers={"User-Agent": "rapp-sentinel"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            code = getattr(response, "status", None) or response.getcode()
+            response.read(1024)
+            return (200 <= int(code) < 300), f"HTTP {code}"
+    except urllib.error.HTTPError as e:
+        return False, f"HTTP {e.code}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {str(e)[:80]}"
+
+
+def verified_view(cfg, wcfg, submission, probe=None, sleep=None):
+    """The URL a human can actually tap, proved before it is sent.
+
+    GitHub Pages publishes on its own schedule, so a merge verified against
+    origin/main can still 404 for a minute or two. Texting that URL is worse
+    than texting nothing: it reads as "your art is live" and lands on a 404,
+    which teaches the reader to distrust every future message. So the Pages
+    copy is probed with a bounded backoff, the raw file is the fallback, and
+    if neither answers the message says so rather than pretending (#10).
+
+    Returns (url, kind, note) where kind is "pages", "raw" or "".
+    """
+    probe = probe or probe_url
+    sleep = sleep or time.sleep
+    view, _ = art_urls(cfg, wcfg, submission)
+    raw = raw_url(cfg, wcfg, submission)
+    timeout = int(wcfg.get("view_probe_timeout_s", 10))
+    backoff = list(wcfg.get("view_probe_backoff") or (5, 10, 20, 30))
+    attempts = max(1, int(wcfg.get("view_probe_attempts", len(backoff) + 1)))
+
+    detail = "no url"
+    for attempt in range(attempts):
+        if view:
+            ok, detail = probe(view, timeout)
+            if ok:
+                return view, "pages", ""
+        if raw:
+            ok_raw, detail_raw = probe(raw, timeout)
+            if ok_raw:
+                # Merged and readable, just not published as a page yet. Say
+                # which one this is; a link that works is not a link that lies.
+                if attempt + 1 >= attempts:
+                    return raw, "raw", ("GitHub Pages has not published it yet — "
+                                        "this link is the file itself.")
+            else:
+                detail = f"{detail}; raw {detail_raw}"
+        if attempt + 1 < attempts:
+            sleep(backoff[min(attempt, len(backoff) - 1)])
+    if raw:
+        ok_raw, _ = probe(raw, timeout)
+        if ok_raw:
+            return raw, "raw", ("GitHub Pages has not published it yet — this "
+                                "link is the file itself.")
+    return "", "", (f"the merge is verified on main, but no public URL answered "
+                    f"yet ({detail}).")
+
+
 def _first_sentence(text, limit=220):
     collapsed = " ".join(str(text).split())
     if not collapsed:
@@ -1245,9 +1606,13 @@ def art_recipient(cfg):
     return ""
 
 
-def art_notification(cfg, wcfg, submission, receipts):
-    """The message a verified merge earns. One message, one tap to the art."""
-    view, source = art_urls(cfg, wcfg, submission)
+def art_notification(cfg, wcfg, submission, receipts, view="", note=""):
+    """The message a verified merge earns. One message, one tap to the art.
+
+    `view` is a URL that was PROBED after the merge, not one that was derived
+    and hoped for.
+    """
+    _, source = art_urls(cfg, wcfg, submission)
     lines = [f"{SUCCESS_PREFIX} {sentinel.instance_name(cfg)}: "
              f"\u201c{submission['title']}\u201d is merged.",
              "",
@@ -1259,6 +1624,8 @@ def art_notification(cfg, wcfg, submission, receipts):
     pr_url = (receipts or {}).get("pr_url", "")
     if pr_url:
         lines.append(f"PR: {pr_url}")
+    if note:
+        lines += ["", note]
     if not view and not source:
         # Say so rather than send a triumphant message with nowhere to go.
         lines += ["", "(no public URL derivable — set commons_repo to owner/name)"]
@@ -1302,16 +1669,154 @@ def _notify_once(cfg, key, text, hours=24):
 
 # ── the run ─────────────────────────────────────────────────────────────────
 
+def write_status(outcome, reason="", **extra):
+    """The worker's heartbeat. Written on EVERY pass, including the ones that
+    decide to do nothing.
+
+    A job that runs and skips and a job launchd never loaded look identical
+    from outside — both produce no art and no log line anybody reads. This
+    file is what lets w_evolve_worker tell those two apart (#6).
+    """
+    payload = {
+        "at": sentinel.now().isoformat(timespec="seconds"),
+        "outcome": outcome,
+        "reason": str(reason)[:400],
+        "pid": os.getpid(),
+        "depth": SS.current_depth(),
+        **extra,
+    }
+    try:
+        atomic_write_json(STATUS_PATH, payload)
+    except OSError as e:
+        log(f"could not write the heartbeat: {type(e).__name__}: {e}")
+    return payload
+
+
 def _skip(reason):
     log(f"skipped — {reason}")
+    write_status("skipped", reason)
     return {"outcome": "skipped", "reason": reason}
+
+
+# ── crash-window reconciliation ─────────────────────────────────────────────
+
+def transaction_writer(row_id, base):
+    """Persist what this cycle has done so far, atomically, at every step."""
+    state = dict(base)
+    state["row_id"] = row_id
+
+    def note(**fields):
+        state.update({k: v for k, v in fields.items() if v is not None})
+        state["at"] = sentinel.now().isoformat(timespec="seconds")
+        atomic_write_json(TRANSACTION_PATH, state)
+        return state
+    return note
+
+
+def clear_transaction():
+    try:
+        Path(TRANSACTION_PATH).unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log(f"could not clear the transaction file: {e}")
+
+
+def reconcile(cfg, wcfg, history):
+    """Finish, or clean up after, a cycle that died mid-publish.
+
+    The dangerous window is between `gh pr merge` and the ledger write: the
+    art is public, the ledger says "pending", and the next cycle would compute
+    the wrong cycle number and never tell anyone the piece exists. So before
+    planning anything, a leftover transaction is resolved against PUBLIC
+    state — the PR and origin/main, not our own hopes (#5).
+
+    Returns a summary dict when it did something, else None.
+    """
+    state = strict_load(TRANSACTION_PATH, {}, expect=dict)
+    if not state:
+        return None
+    row_id = state.get("row_id")
+    row = next((r for r in history if r.get("id") == row_id), None)
+    if row is None:
+        log("transaction references a row this ledger does not have — clearing")
+        clear_transaction()
+        return None
+    if row.get("outcome") != "pending":
+        clear_transaction()
+        return None
+
+    pr_number = str(state.get("pr_number") or "")
+    slug = state.get("slug") or row.get("slug") or ""
+    log(f"reconciling an interrupted cycle (phase={state.get('phase')}, "
+        f"pr={pr_number or 'none'})")
+
+    if not pr_number:
+        # Nothing public was created, or we died before we learned its number.
+        row["outcome"] = OUTCOME_ABORTED
+        row["detail"] = (f"interrupted at {state.get('phase')} before a PR "
+                         f"existed; nothing was published")
+        save_history(history)
+        clear_transaction()
+        return {"outcome": "reconciled-aborted", "detail": row["detail"]}
+
+    workspace = _make_workspace(wcfg)
+    try:
+        clone = workspace / "clone"
+        _clone_repo(wcfg, clone)
+        submission = state.get("submission") or {}
+        try:
+            receipts = confirm_merge(clone, submission, wcfg, pr_number,
+                                     sorted(state.get("paths") or []))
+        except (CommandError, subprocess.TimeoutExpired, json.JSONDecodeError,
+                KeyError, OSError) as e:
+            # Not merged (or not verifiably merged): close it and say so.
+            log(f"interrupted cycle did not land: {type(e).__name__}: {e}")
+            _close_pr(wcfg["repo"], pr_number, int(wcfg.get("gh_timeout_s", 300)))
+            row["outcome"] = OUTCOME_ABORTED
+            row["detail"] = (f"interrupted at {state.get('phase')}; PR "
+                             f"{pr_number} was not verifiably merged and has "
+                             f"been closed ({type(e).__name__})")
+            save_history(history)
+            clear_transaction()
+            return {"outcome": "reconciled-aborted", "detail": row["detail"]}
+
+        receipts.update({"pr_url": state.get("pr_url", ""),
+                         "pr_number": pr_number,
+                         "branch": state.get("branch", "")})
+        finalize_success(cfg, wcfg, history, row, submission, receipts,
+                         state.get("next_state") or {},
+                         int(state.get("cycle") or row.get("cycle") or 1))
+        clear_transaction()
+        log(f"reconciled: {slug} was merged before the interruption and is now "
+            f"recorded")
+        return {"outcome": "reconciled-contributed", "slug": slug,
+                "receipts": receipts}
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def finalize_success(cfg, wcfg, history, row, submission, receipts, next_state,
+                     expected_cycle):
+    """The one place a verified merge becomes ledger, chain, and message."""
+    state_path = HOME / str(wcfg["creative_state_file"])
+    atomic_write_json(state_path, {
+        **(next_state or {}),
+        "cycle": expected_cycle,
+        "last_slug": submission["slug"],
+        "updated_at": sentinel.now().isoformat(timespec="seconds"),
+        "merge_commit": receipts["merge_commit"],
+    })
+    return _finish(cfg, wcfg, history, row, OUTCOME_CONTRIBUTED,
+                   f"{submission['title']} ({submission['slug']}) merged as "
+                   f"{receipts['merge_commit'][:12]}", receipts, submission)
 
 
 def run_once(cfg=None, health=None, role=None, dry_run=False):
     """One worker pass. Returns a summary dict; never raises for policy."""
     cfg = cfg if cfg is not None else sentinel.config()
     wcfg = worker_config(cfg)
-    health = health or (lambda phase: sentinel.run_health())
+    health = health or (lambda phase: sentinel.run_health(receipts=True))
 
     if STOP.exists():
         return _skip("STOP file present")
@@ -1334,6 +1839,15 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
     workspace = None
     try:
         history = load_history()
+
+        # Before anything else: finish or clean up an interrupted cycle. A
+        # merged submission nobody recorded would otherwise make every future
+        # cycle compute the wrong number and stay silent about live art (#5).
+        healed = reconcile(cfg, wcfg, history)
+        if healed:
+            write_status(healed["outcome"], healed.get("detail", ""))
+            return healed
+
         okb, used, cap = within_budget(history, wcfg)
         if not okb:
             return _skip(f"evolve budget spent ({used}/{cap}); "
@@ -1350,23 +1864,37 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
 
         # Health at the start: never spend a model on art while the estate is
         # broken, and never let a degraded-but-unlisted estate through (#3).
-        ok, why = health_gate(wcfg, health("start"), phase="start")
-        if not ok:
-            return _skip(why)
+        # A probe that raises is a stop, not a shrug (#5).
+        try:
+            probe_health(health, "start", wcfg)
+        except AbortError as e:
+            return _skip(str(e))
 
         state_path = HOME / str(wcfg["creative_state_file"])
         creative = strict_load(state_path, {}, expect=dict)
         expected_cycle = int(creative.get("cycle", 0)) + 1
         expected_previous = creative.get("last_slug")
 
+        fcfg = SS.fanout_config(wcfg)
         if dry_run:
-            depth = SS.current_depth()
-            specs, note = SS.plan_children(SS.fanout_config(wcfg), history, depth)
-            return {"outcome": "dry-run", "role": slug_role,
-                    "cycle": expected_cycle, "previous_slug": expected_previous,
-                    "budget": f"{used}/{cap}", "health": why, "depth": depth,
-                    "children": [s["name"] for s in specs], "fanout": note}
+            specs, note = SS.plan_children(fcfg, history, depth)
+            summary = {"outcome": "dry-run", "role": slug_role,
+                       "cycle": expected_cycle, "previous_slug": expected_previous,
+                       "budget": f"{used}/{cap}", "depth": depth,
+                       "children": [s["name"] for s in specs], "fanout": note,
+                       "maker_argv": maker_argv(wcfg, HOME / "state")}
+            write_status("dry-run", note, role=slug_role, cycle=expected_cycle)
+            return summary
 
+        # The fan-out cast is decided BEFORE the workspace exists, so an
+        # unavailable critic costs nothing (#7).
+        specs, fanout_note = ([], "fan-out disabled")
+        if SS.enabled(fcfg):
+            specs, fanout_note = SS.plan_children(fcfg, history, depth)
+            if not specs:
+                return _skip(f"fan-out unavailable: {fanout_note}")
+
+        install_signal_handlers()
         workspace = _make_workspace(wcfg)
         clone = workspace / "clone"
         base_sha = _clone_repo(wcfg, clone)
@@ -1374,9 +1902,9 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             atomic_write_json(workspace / "state-in.json", creative)
 
         # One row per cycle, written BEFORE the first model process of any
-        # kind. A crash between here and the end must never look like free
-        # budget, and children cost real credits even when the maker never
-        # runs (fan-out accounting rides on this row's "children" count).
+        # kind, and the child debit lands with it: a future that raises, a
+        # SIGTERM mid-wave or a crash must never hand back credit that was
+        # already spent (#9).
         stamp = sentinel.now()
         row = {
             "id": uuid.uuid4().hex,
@@ -1385,32 +1913,26 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             "role": slug_role,
             "cycle": expected_cycle,
             "outcome": "pending",
-            "children": 0,
+            "children": len(specs),
+            "child_failures": [],
             "result": "",
         }
         record(history, row)
         turn["i"] = int(turn.get("i", 0)) + 1
         atomic_write_json(TURN_PATH, turn)
+        write_status("running", "cycle started", role=slug_role,
+                     cycle=expected_cycle, children=len(specs))
 
         finalists, digest = None, None
-        fcfg = SS.fanout_config(wcfg)
-        if SS.enabled(fcfg):
-            depth = SS.current_depth()
-            specs, note = SS.plan_children(fcfg, history, depth)
-            if not specs:
-                # Fan-out enabled but unable to run is NOT a licence to make
-                # art alone: "the collective deliberated" and "one model had a
-                # think" are different claims, and only one would be true.
-                row["outcome"] = "skipped"
-                row["skipped"] = True
-                row["detail"] = f"fan-out unavailable: {note}"
-                save_history(history)
-                return _skip(f"fan-out unavailable: {note}")
-            log(f"fanning out to {len(specs)} sub-sentinels ({note})")
+        if specs:
+            log(f"fanning out to {len(specs)} sub-sentinels ({fanout_note})")
+            situation = fanout_situation(cfg, wcfg, slug_role, expected_cycle,
+                                         expected_previous)
             results = SS.run_children(specs, fcfg, workspace, expected_cycle,
                                       sentinel.instance_name(cfg), slug_role,
-                                      _prior_submissions(clone), depth, log)
-            row["children"] = len(results)
+                                      _prior_submissions(clone), depth, log,
+                                      situation)
+            row["children"] = max(len(specs), len(results))
             row["child_failures"] = [f"{r['role']}: {r['error']}"
                                      for r in results if not r["ok"]]
             save_history(history)
@@ -1420,6 +1942,8 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
                 return _finish(cfg, wcfg, history, row, OUTCOME_FANOUT, str(e))
             atomic_write_json(workspace / "finalists.json",
                               {"finalists": finalists, "digest": digest})
+            atomic_write_json(workspace / "round1.json",
+                              SS.round1_array(finalists))
             log(f"aggregated {len(finalists)} finalists from "
                 f"{digest['healthy']}/{len(results)} healthy children")
 
@@ -1428,7 +1952,7 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         (workspace / "prompt.txt").write_text(prompt, encoding="utf-8")
         log(f"handing {slug_role} its situation (cycle {expected_cycle}, "
             f"budget {used + 1}/{cap})")
-        status, output = run_model(workspace, prompt, wcfg)
+        status, output = run_model(workspace, prompt, wcfg, depth)
         try:
             (LOGS / f"evolve-worker-{slug_role}-{sentinel.now():%Y%m%d-%H%M%S}.log"
              ).write_text(output, encoding="utf-8")
@@ -1449,15 +1973,16 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
                                              expected_previous,
                                              wcfg.get("base_branch", "main"),
                                              base_sha,
-                                             [c["id"] for c in finalists]
+                                             SS.expected_round1(finalists)
                                              if finalists else None)
         except GateError as e:
             if str(line).upper().startswith("DECLINED") and "no new submission" in str(e):
                 return _finish(cfg, wcfg, history, row, OUTCOME_DECLINED, line)
             return _finish(cfg, wcfg, history, row, OUTCOME_REJECTED,
                            f"gate: {e}")
-        except CommandError as e:
-            return _finish(cfg, wcfg, history, row, OUTCOME_FAILED, f"gate: {e}")
+        except (CommandError, subprocess.TimeoutExpired, OSError) as e:
+            return _finish(cfg, wcfg, history, row, OUTCOME_FAILED,
+                           f"gate: {type(e).__name__}: {e}")
 
         try:
             next_state = validate_next_state(workspace / "state-out.json", wcfg,
@@ -1465,42 +1990,83 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         except GateError as e:
             return _finish(cfg, wcfg, history, row, OUTCOME_REJECTED, f"gate: {e}")
 
+        note = transaction_writer(row["id"], {
+            "phase": "gated", "slug": submission["slug"], "cycle": expected_cycle,
+            "role": slug_role, "repo": wcfg["repo"],
+            "base_branch": wcfg.get("base_branch", "main"),
+            # The whole gated submission record, including meta: a
+            # reconciled cycle must be able to write the same ledger entry
+            # and send the same message the interrupted one would have.
+            "submission": {k: submission[k] for k in
+                           ("slug", "title", "kind", "meta", "meta_path",
+                            "piece_path", "meta_sha256", "piece_sha256")},
+            "next_state": next_state,
+        })
+        note()
         try:
-            receipts = publish(clone, submission, wcfg, health)
+            receipts = publish(clone, submission, wcfg, health, transaction=note)
         except AbortError as e:
+            clear_transaction()
             return _finish(cfg, wcfg, history, row, OUTCOME_ABORTED, str(e))
         except GateError as e:
+            clear_transaction()
             return _finish(cfg, wcfg, history, row, OUTCOME_REJECTED, f"gate: {e}")
-        except (CommandError, subprocess.TimeoutExpired) as e:
+        except (CommandError, subprocess.TimeoutExpired, json.JSONDecodeError,
+                OSError, ValueError, KeyError) as e:
+            clear_transaction()
             return _finish(cfg, wcfg, history, row, OUTCOME_FAILED,
                            f"publish: {type(e).__name__}: {e}")
 
         # Only here — merged, re-read, byte-checked — does the ledger move.
-        atomic_write_json(state_path, {
-            **next_state,
-            "cycle": expected_cycle,
-            "last_slug": submission["slug"],
-            "updated_at": sentinel.now().isoformat(timespec="seconds"),
-            "merge_commit": receipts["merge_commit"],
-        })
-        return _finish(cfg, wcfg, history, row, OUTCOME_CONTRIBUTED,
-                       f"{submission['title']} ({submission['slug']}) merged as "
-                       f"{receipts['merge_commit'][:12]}", receipts, submission)
+        summary = finalize_success(cfg, wcfg, history, row, submission, receipts,
+                                   next_state, expected_cycle)
+        clear_transaction()
+        return summary
     except LedgerError as e:
         log(f"FAIL-CLOSED: {e}")
+        write_status("fail-closed", str(e))
         _notify_once(cfg, "ledger", f"\u26A0\uFE0F {sentinel.instance_name(cfg)}: "
                                     f"the evolve worker stopped — {e}")
         return {"outcome": "fail-closed", "reason": str(e)}
+    except KeyboardInterrupt as e:
+        # A signal arrived. The handler already killed the tree; record the
+        # interruption honestly and let the finally block clean up.
+        log(f"interrupted: {e}")
+        write_status("interrupted", str(e))
+        return {"outcome": "interrupted", "reason": str(e)}
     except Exception as e:
         log(f"worker crashed: {type(e).__name__}: {e}")
+        write_status("crashed", f"{type(e).__name__}: {e}")
         _notify_once(cfg, "crash", f"\u26A0\uFE0F {sentinel.instance_name(cfg)}: "
                                    f"the evolve worker crashed — "
                                    f"{type(e).__name__}: {e}")
         return {"outcome": "crashed", "reason": f"{type(e).__name__}: {e}"}
     finally:
+        # Order matters: kill everything this pass started, THEN delete the
+        # workspace those processes were writing into, THEN release the lock.
+        # Releasing first would let the next pass start while a 30-minute
+        # model is still running against a directory we are deleting (#4).
+        still_running = kill_tracked()
+        if still_running:
+            log(f"terminated {still_running} live model process tree(s) on the "
+                f"way out")
         if workspace is not None:
             shutil.rmtree(workspace, ignore_errors=True)
         release_lock(lock)
+
+
+def fanout_situation(cfg, wcfg, role, cycle, previous_slug):
+    """The bounded description of the moment, handed to tool-less children."""
+    return (f"collective: {sentinel.instance_name(cfg)}\n"
+            f"neighbor acting: {role}\n"
+            f"cycle: {cycle} (the previous submission was "
+            f"{previous_slug or 'none — this is the first'})\n"
+            f"commons: {wcfg.get('repo')}\n"
+            f"standing directive: "
+            f"{sentinel.evolve_brief(cfg) or 'none'}\n"
+            f"the piece must be one self-contained file (svg, md, txt or json) "
+            f"under {int(wcfg.get('max_piece_bytes', 51200)) // 1024} KB, "
+            f"CC0-1.0, in submissions/<slug>/")
 
 
 def _finish(cfg, wcfg, history, row, outcome, detail, receipts=None,
@@ -1532,14 +2098,25 @@ def _finish(cfg, wcfg, history, row, outcome, detail, receipts=None,
         # merge commit was fetched back and the merged bytes were compared —
         # a message that says "merged" for anything less is a lie with a link.
         #
+        # The View URL is PROBED first (#10): Pages publishes on its own
+        # schedule, and a triumphant 404 teaches the reader to ignore the
+        # next one.
+        #
         # rebuild=True: the static report attached to this alert renders the
         # chains this cycle just wrote. Rebuilding first is the difference
         # between linked evidence and linked yesterday.
-        sentinel.notify(cfg, art_notification(cfg, wcfg, submission, receipts),
+        view, kind, view_note = verified_view(cfg, wcfg, submission)
+        row["view_url"], row["view_kind"] = view, kind
+        save_history(history)
+        sentinel.notify(cfg, art_notification(cfg, wcfg, submission, receipts,
+                                              view, view_note),
                         to=art_recipient(cfg), rebuild=True)
     elif text and (outcome != OUTCOME_DECLINED or wcfg.get("notify_declines")):
         sentinel.notify(cfg, text)
     log(f"{row['role']}: {outcome} — {row['detail'][:200]}")
+    write_status(outcome, row["detail"], role=row["role"],
+                 cycle=row.get("cycle"), children=row.get("children", 0),
+                 slug=row.get("slug", ""), pr=(receipts or {}).get("pr_url", ""))
     return {"outcome": outcome, "role": row["role"], "detail": row["detail"],
             "receipts": receipts or {}}
 

@@ -28,6 +28,7 @@
     "w_anchor_ledger",
     "w_brainstem",
     "w_checks_complete",
+    "w_evolve_worker",
     "w_freshness_paired",
     "w_openrappter",
     "w_openrappter_spin",
@@ -45,35 +46,35 @@
   ],
   "_kinds_why": "R2 (ran is not worked) enforced mechanically: w_freshness_paired reads this map and fails, at warn, any domain that has run-status coverage but no output-freshness coverage. Classifying a new check here is one line; the five-day rappterbook silence is what it costs not to.",
   "kinds": {
+    "alert_delivery": {
+      "domain": "delivery",
+      "kind": "watcher"
+    },
+    "cadence_honest": {
+      "domain": "sites",
+      "kind": "consistency"
+    },
+    "channel": {
+      "domain": "channel",
+      "kind": "reachability"
+    },
     "eco_sweep": {
       "domain": "ecosystem",
       "kind": "run-status"
     },
-    "rv_world_merging": {
-      "domain": "rappterverse",
-      "kind": "output-freshness"
+    "gh_status": {
+      "domain": "github",
+      "kind": "reachability"
     },
-    "rv_meaningful_activity": {
-      "domain": "rappterverse",
-      "kind": "output-freshness"
-    },
-    "rv_validation": {
-      "domain": "rappterverse",
-      "kind": "run-status"
-    },
-    "rv_pr_queue": {
-      "domain": "rappterverse",
+    "ip_hygiene": {
+      "domain": "self",
       "kind": "consistency"
     },
-    "rb_workflows": {
-      "domain": "rappterbook",
-      "kind": "run-status"
+    "page_fetch": {
+      "domain": "sites",
+      "kind": "reachability"
     },
-    "rb_wf_starved": {
-      "domain": "rappterbook",
-      "kind": "run-status"
-    },
-    "rb_json_parses": {
+    "rails_fresh": {
       "domain": "rappterbook",
       "kind": "consistency"
     },
@@ -85,9 +86,17 @@
       "domain": "rappterbook",
       "kind": "consistency"
     },
+    "rb_json_parses": {
+      "domain": "rappterbook",
+      "kind": "consistency"
+    },
     "rb_public_surface": {
       "domain": "rappterbook",
       "kind": "reachability"
+    },
+    "rb_rejection_rate": {
+      "domain": "rappterbook",
+      "kind": "consistency"
     },
     "rb_rollup_coverage": {
       "domain": "rappterbook",
@@ -97,31 +106,43 @@
       "domain": "rappterbook",
       "kind": "output-freshness"
     },
-    "gh_status": {
-      "domain": "github",
-      "kind": "reachability"
+    "rb_wf_starved": {
+      "domain": "rappterbook",
+      "kind": "run-status"
+    },
+    "rb_workflows": {
+      "domain": "rappterbook",
+      "kind": "run-status"
+    },
+    "rv_meaningful_activity": {
+      "domain": "rappterverse",
+      "kind": "output-freshness"
+    },
+    "rv_pr_queue": {
+      "domain": "rappterverse",
+      "kind": "consistency"
+    },
+    "rv_validation": {
+      "domain": "rappterverse",
+      "kind": "run-status"
+    },
+    "rv_world_merging": {
+      "domain": "rappterverse",
+      "kind": "output-freshness"
     },
     "sites": {
       "domain": "sites",
       "kind": "reachability"
     },
-    "page_fetch": {
-      "domain": "sites",
-      "kind": "reachability"
-    },
-    "cadence_honest": {
-      "domain": "sites",
-      "kind": "consistency"
-    },
-    "channel": {
-      "domain": "channel",
-      "kind": "reachability"
-    },
-    "alert_delivery": {
-      "domain": "delivery",
+    "w_anchor_ledger": {
+      "domain": "watchers",
       "kind": "watcher"
     },
     "w_brainstem": {
+      "domain": "watchers",
+      "kind": "watcher"
+    },
+    "w_evolve_worker": {
       "domain": "watchers",
       "kind": "watcher"
     },
@@ -133,11 +154,11 @@
       "domain": "watchers",
       "kind": "watcher"
     },
-    "w_anchor_ledger": {
+    "w_outsider_coverage": {
       "domain": "watchers",
       "kind": "watcher"
     },
-    "w_outsider_coverage": {
+    "w_outsider_smoke": {
       "domain": "watchers",
       "kind": "watcher"
     },
@@ -150,22 +171,6 @@
       "kind": "watcher"
     },
     "w_test_baseline": {
-      "domain": "self",
-      "kind": "consistency"
-    },
-    "rails_fresh": {
-      "domain": "rappterbook",
-      "kind": "consistency"
-    },
-    "rb_rejection_rate": {
-      "domain": "rappterbook",
-      "kind": "consistency"
-    },
-    "w_outsider_smoke": {
-      "domain": "watchers",
-      "kind": "watcher"
-    },
-    "ip_hygiene": {
       "domain": "self",
       "kind": "consistency"
     }

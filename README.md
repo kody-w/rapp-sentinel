@@ -238,6 +238,11 @@ the same branch that already re-read the merge commit from `origin/main` and
 compared the merged bytes to the gated bytes — so if the text arrives, the art
 is live at the URL in it.
 
+The **View** link is probed after the merge before the message is queued:
+Pages publishes on its own schedule, so a bounded retry runs first, then the
+raw file URL as a fallback (labelled as such), and if neither answers the
+message says so. A triumphant 404 teaches the reader to ignore the next one.
+
 It is queued through the ordinary outbox exactly once, like every other alert,
 and the delivery layer classifies it: sent, unverified, or dead-lettered after
 its retries. This worker never asserts delivery — it hands the message over and
@@ -305,10 +310,22 @@ Everything the fan-out produces is still just text. The parent controller
 remains the only thing in this system that touches git or GitHub, after the
 same deterministic gates and the same health re-probe.
 
-Honest limit: stripping `GH_TOKEN` is what makes a child unable to publish, so
-on a machine whose Copilot CLI authenticates *through* that variable the
-children will fail explicitly rather than quietly gain write access — that
-direction is the intended one, and `strip_env` is where an operator decides.
+Verified against the real CLI, not just asserted: `RAPP_CLI_PROBE=1 python3 -m
+unittest test_worker_liveness` spends a few model calls to check that a
+zero-tool child still answers, that the maker can write inside `--add-dir` but
+reports no shell, and that it cannot create a file outside it. The argv/env
+unit tests assert the strings; those probes assert reality.
+
+Honest limits:
+
+- Inference auth is a GitHub token, so an isolated HOME needs
+  `COPILOT_GITHUB_TOKEN` (or `fanout.auth_env_var`) set for the job. Unset,
+  with `isolated_home: true`, the cycle fails **explicitly** rather than
+  falling back to the operator's real `~/.copilot` — that direction is
+  deliberate.
+- `sandbox_exec` (macOS `sandbox-exec` file-write confinement) is available
+  and off by default: tool and path restriction is the mandatory layer, and a
+  second belt that silently strangled inference would be worse than none.
 
 ---
 

@@ -209,7 +209,7 @@ def publish_head_hook(cfg):
         log(f"head publish hook exited {rc}: {err}")
 
 
-def run_health():
+def run_health(receipts=False):
     # CODE, not HOME: the runner is a code artifact. The child inherits this
     # process's environment, so it resolves the same SENTINEL_HOME.
     #
@@ -223,9 +223,18 @@ def run_health():
     # exists to refuse; a health run we could not finish is "blind", said
     # once per state change like any other degradation (found by the
     # 2026-08-16 review sweep).
+    env = dict(os.environ)
+    if receipts:
+        # A secondary runner (the evolve worker) probes health WHILE the tick
+        # is probing it. coverage.json and pagescan.json are receipts, not
+        # shared state, and two writers interleaving produce a document that
+        # is neither run's answer. Give the secondary its own directory.
+        scratch = HOME / "state" / "health-receipts" / "worker"
+        scratch.mkdir(parents=True, exist_ok=True)
+        env["SENTINEL_HEALTH_RECEIPTS"] = str(scratch)
     try:
         r = subprocess.run([sys.executable, str(CODE / "health.py")],
-                           capture_output=True, text=True,
+                           capture_output=True, text=True, env=env,
                            timeout=int(os.environ.get("SENTINEL_HEALTH_TIMEOUT_S", "600")))
         return json.loads(r.stdout)
     except subprocess.TimeoutExpired:

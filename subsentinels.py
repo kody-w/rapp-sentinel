@@ -31,17 +31,62 @@ the surviving candidates still satisfy the exactly-ten-finalists invariant, and
 otherwise the cycle fails, loudly, having published nothing.
 """
 
+import hashlib
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 CHILD_SCHEMA = "rapp-subsentinel-report/1.0"
-REPORT_NAME = "report.json"
 DEPTH_ENV = "RAPP_SENTINEL_DEPTH"
+
+# ── model confinement ───────────────────────────────────────────────────────
+# --allow-all is three permissions in a trench coat: all tools, all paths, all
+# URLs. Nothing here needs any of that, and the blast radius of getting it
+# wrong is the operator's whole machine. So both layers are enumerated.
+#
+# A sub-sentinel gets NO tools at all: it reads what the parent handed it in
+# the prompt and answers with JSON on stdout. A tool it does not have is a
+# tool that cannot be talked into anything.
+CHILD_TOOLS = ()
+
+# The maker may read and write files, inside --add-dir, and nothing else. No
+# shell, no git, no gh, no MCP, no fetch: the controller owns every operation
+# that touches the world.
+MAKER_TOOLS = ("view", "glob", "grep", "create", "edit", "write", "apply_patch")
+
+# Named explicitly rather than "everything else", so a new tool in a future
+# CLI release is not silently granted by an allowlist we forgot to update —
+# --available-tools already restricts to the allowlist; this is the second
+# lock on the same door.
+DENIED_TOOLS = ("bash", "read_bash", "stop_bash", "powershell",
+                "read_powershell", "stop_powershell", "fetch", "web_search",
+                "task", "ask_user", "lsp")
+
+# Everything the CLI does on its own that we did not ask for.
+CONFINEMENT_FLAGS = (
+    "--disable-builtin-mcps",     # no github-mcp-server, no write-capable MCP
+    "--no-custom-instructions",   # no AGENTS.md/CLAUDE.md from any repo
+    "--no-bash-env",              # BASH_ENV cannot smuggle a shell init file
+    "--disallow-temp-dir",        # no automatic access to the system temp dir
+    "--no-ask-user",              # nobody is at the terminal
+    "--no-remote",                # no remote control of this session
+    "--no-remote-export",
+    "--no-auto-update",           # a sentinel must not swap its own binary
+    "--no-experimental",
+    "--silent",                   # the response, not the session furniture
+)
+
+# The only variables that survive into a model process. Everything else —
+# including the operator's real tokens, agent sockets and shell rc state — is
+# absent rather than trusted.
+ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TERM",
+                 "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS")
 
 # Exactly ten finalists reach the maker. The number is not decoration: it is
 # the round-one candidate set the submission's own _dada_cycle must contain,
@@ -78,6 +123,7 @@ DEFAULT_ROLES = [
     {
         "name": "adversarial-verifier",
         "wave": 2,
+        "verifier": True,
         "brief": "You see the candidates the others proposed, in pool.json. "
                  "Attack them. A high-severity critique VETOES a candidate and "
                  "removes it from the cycle, so spend that authority on "
@@ -108,6 +154,10 @@ FANOUT_DEFAULTS = {
     "max_report_bytes": 65536,
     "kill_grace_s": 5,
     "model": "",                    # empty = the worker's model
+    "require_verifier": True,       # wave 2 critic is not optional
+    "isolated_home": True,          # HOME/XDG/GH config inside the workspace
+    "auth_env_var": "COPILOT_GITHUB_TOKEN",
+    "sandbox_exec": False,          # macOS sandbox-exec, defence in depth
     # A child with a GitHub token is a child that can publish. These come out
     # of the environment before exec, and gh is pointed at an empty config
     # directory, so "no write authority" is a property of the process rather
@@ -163,6 +213,7 @@ def roles_for(fcfg):
         wave = int(spec.get("wave", 1) or 1)
         roles.append({"name": name,
                       "wave": min(max(wave, 1), MAX_WAVES),
+                      "verifier": bool(spec.get("verifier")) or wave >= MAX_WAVES,
                       "brief": str(spec.get("brief") or "").strip()})
     return roles
 
@@ -223,10 +274,149 @@ def plan_children(fcfg, history, depth, now=None):
     # criticise: generators are seated first.
     ordered = sorted(roles, key=lambda r: (r["wave"], roles.index(r)))
     chosen = ordered[:count]
+
+    # The critic is not the seat that gets cut when the budget is tight. A
+    # fan-out whose adversarial verifier was quietly dropped for capacity is
+    # exactly the shape of "we deliberated" with the disagreement removed —
+    # so if the cast cannot include one, there is no cast (#7).
+    if fcfg.get("require_verifier", True):
+        verifiers = [r for r in roles if r.get("verifier")]
+        if not verifiers:
+            return [], ("no adversarial verifier is configured and "
+                        "require_verifier is on")
+        if not any(r.get("verifier") for r in chosen):
+            if len(chosen) < 2:
+                return [], (f"{len(chosen)} slot(s) cannot seat both a "
+                            f"generator and the adversarial verifier")
+            chosen = chosen[:count - 1] + [verifiers[0]]
+        if not any(not r.get("verifier") for r in chosen):
+            return [], "the cast is all critics and no generators"
+
     if len(chosen) < int(fcfg.get("min_healthy_children", 2)):
         return [], (f"only {len(chosen)} child slot(s) available, "
                     f"min_healthy_children is {fcfg.get('min_healthy_children', 2)}")
     return chosen, f"{len(chosen)} children ({used}/{fcfg.get('daily_child_budget', 24)} spent today)"
+
+
+# ── confinement ─────────────────────────────────────────────────────────────
+
+def confined_argv(prompt, model, cwd, tools=(), add_dirs=(), secret_vars=(),
+                  log_dir=None):
+    """The exact command line a model process is allowed to have.
+
+    Two independent restrictions, because one of them being wrong should not
+    be enough: --available-tools decides what the model can even see, and
+    --deny-tool/--excluded-tools name the dangerous ones explicitly so a tool
+    added by a future CLI release cannot arrive pre-approved. --add-dir is the
+    only place file tools may touch; no --allow-all-paths, no --allow-all.
+    """
+    argv = ["copilot", "-p", str(prompt), "--model", str(model),
+            "--available-tools=" + ",".join(tools),
+            "--excluded-tools=" + ",".join(DENIED_TOOLS),
+            "--deny-tool=" + ",".join(DENIED_TOOLS)]
+    if tools:
+        argv.append("--allow-tool=" + ",".join(tools))
+    argv += list(CONFINEMENT_FLAGS)
+    argv += ["-C", str(cwd)]
+    for directory in add_dirs:
+        argv += ["--add-dir", str(directory)]
+    if secret_vars:
+        argv.append("--secret-env-vars=" + ",".join(secret_vars))
+    argv += ["--log-level", "none", "--log-dir",
+             str(log_dir or Path(cwd) / "copilot-logs")]
+    return argv
+
+
+SANDBOX_PROFILE = """(version 1)
+;; Defence in depth behind the CLI's own permissions: even a tool we did not
+;; expect cannot write outside the workspace. Reads and network stay open
+;; because model inference needs both.
+(allow default)
+(deny file-write*)
+(allow file-write* (subpath "{workspace}"))
+(allow file-write* (literal "/dev/null") (literal "/dev/dtracehelper"))
+(allow file-write-data (regex #"^/dev/(tty|fd|std(in|out|err))"))
+"""
+
+
+def sandbox_wrap(argv, workspace, enabled):
+    """Optionally re-exec the model under macOS sandbox-exec.
+
+    Off by default: it is a second belt, and a second belt that silently
+    strangles inference would be worse than none. When on, the profile denies
+    every write outside the workspace — which is where the isolated HOME, XDG
+    and temp directories already live.
+    """
+    if not enabled:
+        return argv
+    workspace = Path(workspace)
+    profile = workspace / "sandbox.sb"
+    profile.write_text(SANDBOX_PROFILE.format(workspace=workspace),
+                       encoding="utf-8")
+    return ["/usr/bin/sandbox-exec", "-f", str(profile), *argv]
+
+
+class AuthUnavailable(RuntimeError):
+    """No inference credential to hand a confined process."""
+
+
+def confined_env(fcfg, workspace, depth, env=None):
+    """A model process's whole environment, built up rather than filtered down.
+
+    Only ENV_ALLOWLIST survives from the parent. HOME, XDG, TMPDIR, the gh
+    config and the git config all point inside the workspace, so the model
+    cannot read the operator's credentials, cannot find a gh auth token, and
+    cannot leave state behind after the workspace is deleted.
+
+    Inference auth arrives as ONE named variable, which is also passed to
+    --secret-env-vars so the CLI strips it from any shell or MCP environment
+    and redacts it from output. Missing it is an explicit failure: quietly
+    falling back to the real HOME would hand a model the operator's whole
+    credential set to save one line of config.
+    """
+    src = dict(env if env is not None else os.environ)
+    out = {k: src[k] for k in ENV_ALLOWLIST if k in src}
+    out.setdefault("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
+
+    workspace = Path(workspace)
+    isolated = bool(fcfg.get("isolated_home", True))
+    home = workspace / "home"
+    for path in (home, workspace / "tmp", workspace / "gh-config",
+                 workspace / "xdg-config", workspace / "xdg-data",
+                 workspace / "xdg-cache", workspace / "copilot-logs"):
+        path.mkdir(parents=True, exist_ok=True)
+    git_config = workspace / "gitconfig"
+    if not git_config.exists():
+        git_config.write_text("# empty: model processes have no git identity\n",
+                              encoding="utf-8")
+
+    out["HOME"] = str(home) if isolated else src.get("HOME", str(home))
+    out["TMPDIR"] = str(workspace / "tmp")
+    out["XDG_CONFIG_HOME"] = str(workspace / "xdg-config")
+    out["XDG_DATA_HOME"] = str(workspace / "xdg-data")
+    out["XDG_CACHE_HOME"] = str(workspace / "xdg-cache")
+    out["GH_CONFIG_DIR"] = str(workspace / "gh-config")
+    out["GIT_CONFIG_GLOBAL"] = str(git_config)
+    out["GIT_CONFIG_SYSTEM"] = os.devnull
+    out["GIT_TERMINAL_PROMPT"] = "0"
+    out["GIT_ASKPASS"] = "/usr/bin/false"
+    out["COPILOT_CUSTOM_INSTRUCTIONS_DIRS"] = ""
+    out[DEPTH_ENV] = str(depth + 1)
+
+    auth_var = str(fcfg.get("auth_env_var") or "COPILOT_GITHUB_TOKEN")
+    token = src.get(auth_var, "")
+    if token:
+        out[auth_var] = token
+    elif isolated:
+        raise AuthUnavailable(
+            f"{auth_var} is not set, and an isolated HOME has no credentials "
+            f"of its own — set it, or set evolve_worker.fanout.isolated_home "
+            f"to false to run models against the operator's real HOME")
+    return out
+
+
+def secret_vars_for(fcfg):
+    return (str(fcfg.get("auth_env_var") or "COPILOT_GITHUB_TOKEN"),)
 
 
 # ── the child prompt ────────────────────────────────────────────────────────
@@ -237,21 +427,26 @@ on cycle {cycle}. Your role is: {role}
 
 {brief}
 
-WHAT YOU MAY DO
-Read {workspace}/brief.json (the situation), {workspace}/prior.json (every
-submission the collective has already published){pool_note}. Think. Then write
-exactly one file: {workspace}/{report} — and nothing else, anywhere.
+WHAT YOU HAVE
+You have NO tools. Not a shell, not a file editor, not a browser, not git, not
+gh, not an MCP server — nothing. Everything you need is in this prompt, and
+your entire output is the JSON below. That is deliberate: a tool you do not
+have is a tool nobody can talk you into misusing, and a parent controller —
+code, not a model — owns every operation that touches the world.
 
-WHAT YOU MAY NOT DO — THIS IS ABSOLUTE
-You have NO publishing authority of any kind. Do not run git or gh. Do not
-clone, commit, push, open a pull request, comment, or merge. Do not call any
-network API that writes. Do not start another agent, sentinel or sub-sentinel;
-you are already the deepest layer this system permits. Do not write outside
-{workspace}. You have no repository and no GitHub credentials on purpose: a
-parent controller — code, not a model — owns every operation that touches the
-world, and it will discard everything you produce if you overstep.
+Do not describe running commands. Do not claim to have opened a pull request.
+Do not start another agent or sub-sentinel; you are the deepest layer this
+system permits.
 
-WHAT TO WRITE — {report}, strictly this shape:
+THE SITUATION
+{situation}
+
+WHAT ALREADY EXISTS (every published submission)
+{prior}
+
+{pool}
+
+YOUR ANSWER — reply with ONE json object, and nothing else:
 {{
   "schema": "{schema}",
   "role": "{role}",
@@ -269,7 +464,7 @@ WHAT TO WRITE — {report}, strictly this shape:
     ... at most {max_evidence} ...
   ],
   "critique": [
-    {{"target": "<a candidate id from pool.json, or your own, or \\"pool\\">",
+    {{"target": "<a candidate id from the pool above, or one of yours>",
       "finding": "what is wrong with it, <= {max_text} characters",
       "severity": "low|medium|high"}}
     ... at most {max_critique} ...
@@ -277,32 +472,48 @@ WHAT TO WRITE — {report}, strictly this shape:
 }}
 
 Every score is a number from 0 to 10 on all six dimensions
-({dimensions}). A "high" severity critique VETOES that candidate — it will be
-removed from the cycle deterministically, so use it when you can defend it.
+({dimensions}). A "high" severity critique VETOES that candidate — it is
+removed from the cycle deterministically, so spend that authority on claims
+you can defend.
 
 Bounds are enforced by a parser, not by goodwill: more than
 {max_candidates} candidates, a missing dimension, a non-numeric score, an
-unknown key, or a file over {max_bytes} bytes makes your whole report a named
-failure. Write valid JSON. No prose outside the file. No markdown fences.
+unknown key, or a reply over {max_bytes} bytes makes your whole report a named
+failure that is recorded and shown to the maker.
 
-If you genuinely cannot do the work, still write {report} with an empty
-candidates list and a critique saying why. Silence is the one thing that
-cannot be read.
+If you genuinely cannot do the work, still answer with the object above, an
+empty candidates list, and a critique saying why. Silence is the one thing
+that cannot be read.
 """
 
 
-def child_prompt(spec, fcfg, workspace, cycle, collective, parent_role, pooled):
+def child_prompt(spec, fcfg, cycle, collective, parent_role, situation, prior,
+                 pool):
+    """Everything the child gets. It has no tools, so this is the whole world.
+
+    prior and pool are inlined and bounded here rather than left on disk: a
+    child with no file tools cannot read a file, and handing it a path it
+    cannot open would be a prompt that lies about its own situation.
+    """
     example = ", ".join(f'"{d}": 7' for d in SCORE_DIMENSIONS)
+    prior_text = "\n".join(
+        f"  - {row.get('slug')}: {row.get('title')} [{row.get('kind')}] "
+        f"{str(row.get('statement') or '')[:200]}"
+        for row in (prior or [])[:60]) or "  (nothing published yet)"
+    pool_text = ""
+    if pool:
+        pool_text = ("THE CANDIDATES THE EARLIER WAVE PROPOSED — critique these\n"
+                     + "\n".join(f'  - id "{c["id"]}" (from {c["from"]}): '
+                                 f'{c["premise"][:200]}' for c in pool))
     return CHILD_PROMPT.format(
         collective=collective,
         parent_role=parent_role,
         cycle=cycle,
         role=spec["name"],
         brief=spec.get("brief") or "Decide from your role.",
-        workspace=str(workspace),
-        pool_note=(", and {}/pool.json (the candidates the earlier wave "
-                   "proposed)".format(workspace) if pooled else ""),
-        report=REPORT_NAME,
+        situation=situation,
+        prior=prior_text,
+        pool=pool_text,
         schema=CHILD_SCHEMA,
         want=int(fcfg.get("candidates_per_child", 6)),
         max_candidates=int(fcfg.get("max_candidates_per_child", 8)),
@@ -335,29 +546,56 @@ def _score(value, where):
     return float(value)
 
 
-def validate_report(path, spec, fcfg, cycle):
-    """Parse one child's report, or say exactly what is wrong with it."""
-    from pathlib import Path
-    p = Path(path)
-    if not p.exists():
-        raise ChildError(f"{spec['name']} wrote no {REPORT_NAME}")
-    size = p.stat().st_size
-    limit = int(fcfg.get("max_report_bytes", 65536))
+def extract_report(text, limit):
+    """Find the one JSON object in a model's reply, or say why there is none.
+
+    The reply is the whole channel — children have no tools and no file to
+    write — so this has to cope with a model that wrapped its answer in a
+    fence while staying strict about what counts: something that PARSES as an
+    object. Prose alone, a truncated object, or a wall of text over the cap is
+    a named failure, not an empty report.
+    """
+    if text is None:
+        raise ChildError("the child produced no output at all")
+    raw = text.strip()
+    if not raw:
+        raise ChildError("the child produced no output at all")
+    size = len(raw.encode("utf-8"))
     if size > limit:
-        raise ChildError(f"{REPORT_NAME} is {size} bytes, over the {limit} cap")
-    if size == 0:
-        raise ChildError(f"{REPORT_NAME} is empty")
-    try:
-        doc = json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        raise ChildError(f"{REPORT_NAME} is not valid json: {e}")
-    if not isinstance(doc, dict):
-        raise ChildError(f"{REPORT_NAME} is not an object")
+        raise ChildError(f"reply is {size} bytes, over the {limit} cap")
+
+    candidates = []
+    for match in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", raw, re.S):
+        candidates.append(match.group(1))
+    depth, start = 0, None
+    for i, ch in enumerate(raw):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                candidates.append(raw[start:i + 1])
+    for blob in reversed(candidates):
+        try:
+            doc = json.loads(blob)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if isinstance(doc, dict):
+            return doc
+    raise ChildError("the reply contains no parseable json object")
+
+
+def validate_report(source, spec, fcfg, cycle):
+    """Parse one child's report, or say exactly what is wrong with it."""
+    limit = int(fcfg.get("max_report_bytes", 65536))
+    doc = extract_report(source, limit)
 
     known = {"schema", "role", "cycle", "candidates", "evidence", "critique"}
     extra = [k for k in doc if k not in known and not str(k).startswith("_")]
     if extra:
-        raise ChildError(f"{REPORT_NAME} carries unknown keys: {', '.join(sorted(extra))}")
+        raise ChildError(f"report carries unknown keys: {', '.join(sorted(extra))}")
     if doc.get("schema") != CHILD_SCHEMA:
         raise ChildError(f"schema is {doc.get('schema')!r}, expected {CHILD_SCHEMA!r}")
     if doc.get("role") != spec["name"]:
@@ -434,31 +672,6 @@ def validate_report(path, spec, fcfg, cycle):
 
 # ── running children ────────────────────────────────────────────────────────
 
-def child_env(fcfg, workspace, depth, env=None):
-    """The environment a child gets: no tokens, no gh config, one step deeper."""
-    base = dict(env if env is not None else os.environ)
-    for key in fcfg.get("strip_env") or []:
-        base.pop(str(key), None)
-    gh_config = os.path.join(str(workspace), "gh-config")
-    git_config = os.path.join(str(workspace), "gitconfig")
-    os.makedirs(gh_config, exist_ok=True)
-    if not os.path.exists(git_config):
-        with open(git_config, "w", encoding="utf-8") as fh:
-            fh.write("# intentionally empty: children have no git identity\n")
-    base["GH_CONFIG_DIR"] = gh_config
-    base["GIT_CONFIG_GLOBAL"] = git_config
-    base["GIT_CONFIG_SYSTEM"] = os.devnull
-    base["GIT_TERMINAL_PROMPT"] = "0"
-    base["GIT_ASKPASS"] = "/usr/bin/false"
-    base[DEPTH_ENV] = str(depth + 1)
-    return base
-
-
-def _child_argv(spec, fcfg, prompt):
-    model = fcfg.get("model") or fcfg.get("_parent_model") or "claude-sonnet-4.6"
-    return ["copilot", "-p", prompt, "--allow-all", "--model", model]
-
-
 def _kill_group(proc, grace):
     """Take down the child AND anything it started.
 
@@ -489,15 +702,15 @@ def _kill_group(proc, grace):
 
 
 def _run_child(spec, fcfg, workspace, cycle, collective, parent_role, prior,
-               pool, depth, deadline, live, logger=None):
+               pool, depth, deadline, live, logger=None, situation=""):
     """One child, start to finish. Never raises: it returns its verdict."""
-    from pathlib import Path
     started = time.monotonic()
     ws = Path(workspace) / "children" / spec["name"]
     ws.mkdir(parents=True, exist_ok=True)
-    result = {"role": spec["name"], "wave": spec["wave"], "ok": False,
+    result = {"role": spec["name"], "wave": spec["wave"],
+              "verifier": bool(spec.get("verifier")), "ok": False,
               "error": "", "timed_out": False, "exit_code": None,
-              "elapsed_s": 0.0, "report": None}
+              "elapsed_s": 0.0, "report": None, "argv": [], "pid": None}
 
     remaining = deadline - time.monotonic()
     per_child = float(fcfg.get("child_timeout_s", 600))
@@ -506,20 +719,24 @@ def _run_child(spec, fcfg, workspace, cycle, collective, parent_role, prior,
         result["error"] = "no time left in the cycle's fan-out budget"
         return result
 
-    (ws / "brief.json").write_text(json.dumps({
-        "cycle": cycle, "collective": collective, "for_neighbor": parent_role,
-        "role": spec["name"], "brief": spec.get("brief", ""),
-    }, indent=2), encoding="utf-8")
-    (ws / "prior.json").write_text(json.dumps(prior, indent=2), encoding="utf-8")
-    if pool:
-        (ws / "pool.json").write_text(json.dumps(pool, indent=2), encoding="utf-8")
-
-    prompt = child_prompt(spec, fcfg, ws, cycle, collective, parent_role, bool(pool))
-    env = child_env(fcfg, ws, depth)
+    prompt = child_prompt(spec, fcfg, cycle, collective, parent_role,
+                          situation, prior, pool)
     try:
-        proc = subprocess.Popen(_child_argv(spec, fcfg, prompt), cwd=str(ws),
-                                env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True,
+        env = confined_env(fcfg, ws, depth)
+    except AuthUnavailable as e:
+        result["error"] = str(e)
+        return result
+    argv = sandbox_wrap(
+        confined_argv(prompt, fcfg.get("model") or fcfg.get("_parent_model")
+                      or "claude-sonnet-4.6", ws, tools=CHILD_TOOLS,
+                      secret_vars=secret_vars_for(fcfg),
+                      log_dir=ws / "copilot-logs"),
+        ws, bool(fcfg.get("sandbox_exec")))
+    result["argv"] = argv
+    try:
+        proc = subprocess.Popen(argv, cwd=str(ws), env=env,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
                                 start_new_session=True)
     except FileNotFoundError:
         result["error"] = "copilot CLI not found on PATH"
@@ -529,19 +746,25 @@ def _run_child(spec, fcfg, workspace, cycle, collective, parent_role, prior,
         return result
 
     live.append(proc)
-    out = ""
+    result["pid"] = proc.pid
+    out, err = "", ""
     try:
-        out, _ = proc.communicate(timeout=budget)
+        out, err = proc.communicate(timeout=budget)
         result["exit_code"] = proc.returncode
     except subprocess.TimeoutExpired:
         result["timed_out"] = True
         _kill_group(proc, float(fcfg.get("kill_grace_s", 5)))
         try:
-            out, _ = proc.communicate(timeout=10)
+            out, err = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
-            out = ""
+            out, err = "", ""
         result["exit_code"] = proc.returncode
         result["error"] = f"timed out after {budget:.0f}s"
+    except BaseException:
+        # Ctrl-C, SIGTERM-driven unwind, anything: the child does not get to
+        # outlive the decision to stop.
+        _kill_group(proc, float(fcfg.get("kill_grace_s", 5)))
+        raise
     finally:
         result["elapsed_s"] = round(time.monotonic() - started, 1)
         try:
@@ -549,17 +772,22 @@ def _run_child(spec, fcfg, workspace, cycle, collective, parent_role, prior,
         except ValueError:
             pass
         try:
-            (ws / "child.log").write_text(out or "", encoding="utf-8")
+            (ws / "child.log").write_text((out or "") + (err or ""),
+                                          encoding="utf-8")
         except OSError:
             pass
 
     if result["timed_out"]:
         return result
     if result["exit_code"] != 0:
-        result["error"] = f"exited {result['exit_code']}"
+        detail = (err or out or "").strip().splitlines()
+        result["error"] = (f"exited {result['exit_code']}"
+                           + (f": {detail[-1][:160]}" if detail else ""))
         return result
     try:
-        result["report"] = validate_report(ws / REPORT_NAME, spec, fcfg, cycle)
+        # stdout only: stderr is the CLI's own chatter, and a report parsed
+        # out of it would be a report we cannot attribute to the model.
+        result["report"] = validate_report(out, spec, fcfg, cycle)
         result["ok"] = True
     except ChildError as e:
         result["error"] = str(e)
@@ -567,7 +795,7 @@ def _run_child(spec, fcfg, workspace, cycle, collective, parent_role, prior,
 
 
 def run_children(specs, fcfg, workspace, cycle, collective, parent_role, prior,
-                 depth, logger=None):
+                 depth, logger=None, situation=""):
     """Run the cast wave by wave, bounded in count, time and blast radius."""
     say = logger or (lambda msg: None)
     results, pool, live = [], [], []
@@ -582,7 +810,7 @@ def run_children(specs, fcfg, workspace, cycle, collective, parent_role, prior,
             with ThreadPoolExecutor(max_workers=min(concurrency, len(batch))) as ex:
                 futures = [ex.submit(_run_child, spec, fcfg, workspace, cycle,
                                      collective, parent_role, prior, list(pool),
-                                     depth, deadline, live, say)
+                                     depth, deadline, live, say, situation)
                            for spec in batch]
                 wave_results = [f.result() for f in futures]
             for res in wave_results:
@@ -606,6 +834,64 @@ def run_children(specs, fcfg, workspace, cycle, collective, parent_role, prior,
 
 # ── deterministic aggregation ───────────────────────────────────────────────
 
+RECORD_FIELDS = ("id", "from", "premise", "rationale", "scores",
+                 "evidence_digest")
+
+
+def _canonical(payload):
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=False)
+
+
+def evidence_digest(evidence):
+    """One hash for a child's whole evidence list, bound into its candidates."""
+    rows = [{"claim": e.get("claim", ""), "source": e.get("source", "")}
+            for e in (evidence or [])]
+    return hashlib.sha256(_canonical(rows).encode("utf-8")).hexdigest()
+
+
+def canonical_record(candidate, from_role, evidence_hash):
+    """The finalist as a checkable object, not a label.
+
+    A finalist is its premise, its rationale, all six scores, which
+    sub-sentinel produced it, and the evidence that sub-sentinel offered. Bind
+    the id alone and a maker can publish "r1c3" with any content it likes and
+    still pass — the deliberation becomes a name-check (#2).
+    """
+    return {
+        "id": str(candidate["id"]),
+        "from": str(from_role),
+        "premise": str(candidate["premise"]),
+        "rationale": str(candidate.get("rationale") or ""),
+        "scores": {d: round(float(candidate["scores"][d]), 4)
+                   for d in SCORE_DIMENSIONS},
+        "evidence_digest": str(evidence_hash),
+    }
+
+
+def record_digest(record):
+    """sha256 over the canonical record. Recomputable by anyone, from the
+    published meta.json alone."""
+    try:
+        payload = {
+            "id": str(record["id"]),
+            "from": str(record["from"]),
+            "premise": str(record["premise"]),
+            "rationale": str(record.get("rationale") or ""),
+            "scores": {d: round(float(record["scores"][d]), 4)
+                       for d in SCORE_DIMENSIONS},
+            "evidence_digest": str(record["evidence_digest"]),
+        }
+    except (KeyError, TypeError, ValueError) as e:
+        raise FanoutError(f"cannot digest a malformed finalist record: {e}")
+    return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
+
+
+def expected_round1(finalists):
+    """{id: digest} — what the published round one must reproduce exactly."""
+    return {f["id"]: f["digest"] for f in finalists}
+
+
 def aggregate(results, fcfg):
     """Exactly ten finalists, or an explicit failure. Never a quiet fallback.
 
@@ -623,13 +909,31 @@ def aggregate(results, fcfg):
             f"only {len(healthy)} healthy child(ren), {minimum} required"
             + (f" — failures: {'; '.join(failures)}" if failures else ""))
 
+    # The critic is load-bearing. A cycle whose adversarial verifier crashed
+    # produced candidates nobody attacked, and publishing those while calling
+    # it deliberation is the failure this whole fan-out exists to prevent (#7).
+    if fcfg.get("require_verifier", True):
+        seated = [r for r in results if r.get("verifier")]
+        if not seated:
+            raise FanoutError("no adversarial verifier ran; a cycle without a "
+                              "critic is not a deliberation")
+        broken = [r for r in seated if not r["ok"]]
+        if broken:
+            raise FanoutError(
+                "the adversarial verifier failed and cannot be skipped: "
+                + "; ".join(f"{r['role']}: {r['error']}" for r in broken))
+
     candidates, vetoes, mediums = {}, {}, {}
     for res in healthy:
+        digest_of_evidence = evidence_digest(res["report"]["evidence"])
         for cand in res["report"]["candidates"]:
             key = f"{res['role']}#{cand['id']}"
-            candidates[key] = {**cand, "id": key, "from": res["role"],
-                               "mean": round(sum(cand["scores"].values())
-                                             / len(SCORE_DIMENSIONS), 4)}
+            record = canonical_record({**cand, "id": key}, res["role"],
+                                      digest_of_evidence)
+            record["digest"] = record_digest(record)
+            record["mean"] = round(sum(cand["scores"].values())
+                                   / len(SCORE_DIMENSIONS), 4)
+            candidates[key] = record
     for res in healthy:
         for item in res["report"]["critique"]:
             target = item["target"]
@@ -659,7 +963,7 @@ def aggregate(results, fcfg):
 
     digest = {
         "children": [{"role": r["role"], "ok": r["ok"], "error": r["error"],
-                      "elapsed_s": r["elapsed_s"],
+                      "elapsed_s": r["elapsed_s"], "verifier": r.get("verifier", False),
                       "candidates": len(r["report"]["candidates"]) if r["ok"] else 0}
                      for r in results],
         "healthy": len(healthy),
@@ -673,15 +977,25 @@ def aggregate(results, fcfg):
     return finalists, digest
 
 
+def round1_array(finalists):
+    """Exactly what the maker must publish as round one of its cycle."""
+    return [{**{k: f[k] for k in RECORD_FIELDS}, "digest": f["digest"]}
+            for f in finalists]
+
+
 def finalists_block(finalists, digest):
-    """The bounded text the maker sees. Ids are load-bearing: the submission's
-    round one must contain exactly these."""
+    """The bounded text the maker sees. The records are load-bearing: round
+    one of the published cycle must reproduce them field for field."""
     lines = ["THE TEN FINALISTS YOUR SUB-SENTINELS PRODUCED",
-             "Round 1 of your _dada_cycle MUST be exactly these ten ids.",
+             "Round 1 of your _dada_cycle MUST be exactly these ten records,",
+             "copied field for field from round1.json in your workspace. The",
+             "controller recomputes a sha256 over id, from, premise, rationale,",
+             "all six scores and the evidence digest, and rejects the whole",
+             "submission if one character moved.",
              ""]
     for c in finalists:
-        lines.append(f'  - id "{c["id"]}" (from {c["from"]}, mean {c["mean"]}): '
-                     f'{c["premise"]}')
+        lines.append(f'  - id "{c["id"]}" (from {c["from"]}, mean {c["mean"]}, '
+                     f'digest {c["digest"][:12]}…): {c["premise"]}')
     if digest.get("evidence"):
         lines += ["", "EVIDENCE THEY CHECKED"]
         lines += [f"  - {e['claim']} ({e['source']})" for e in digest["evidence"]]
