@@ -18,6 +18,7 @@ import sys
 from datetime import datetime, timezone
 
 import checks as C
+import hub as HUB
 from paths import CODE, HOME
 
 
@@ -769,7 +770,15 @@ def check_freshness_pairing():
         return C.fail("w_freshness_paired",
                       "kinds map missing from required_checks.json - "
                       "pairing unknown", critical=False)
-    accepted = doc.get("unpaired_accepted") or {}
+    # Hub sentinels classify their own ids in their manifest; merge them so
+    # a hub run-status check without a freshness pair is visible too (R2).
+    kinds = dict(kinds, **HUB.declared_kinds())
+    accepted = dict(doc.get("unpaired_accepted") or {})
+    # An instance may accept a hub domain's gap in ITS config (config.json ->
+    # hub.unpaired_accepted {domain: why}); the code manifest stays the
+    # authority for native domains, and the acceptance is still a written
+    # decision, in the verdict, every tick.
+    accepted.update(HUB._config().get("unpaired_accepted") or {})
     domains = {}
     for cid, meta in kinds.items():
         if not isinstance(meta, dict):
@@ -858,6 +867,16 @@ def check_completeness(results, disabled=()):
         return C.fail("w_checks_complete",
                       f"required_checks.json unreadable: {type(e).__name__}: {e}",
                       critical=True)
+    # Hub sentinels (HOME/hub/, hub.py) are a promise this instance made by
+    # installing them: their declared ids join the required set for the tick,
+    # so a hub sentinel that stops emitting fails here like a lost @check
+    # line. No hub dir -> empty set -> byte-identical behaviour.
+    hub_ids = HUB.declared_ids()
+    required |= hub_ids
+    if hub_ids:
+        suffix_hub = f"; {len(hub_ids)} from hub"
+    else:
+        suffix_hub = ""
 
     honored = sorted(set(disabled) & required)
     typos = sorted(set(disabled) - required)
@@ -874,7 +893,7 @@ def check_completeness(results, disabled=()):
                       f"{len(missing)} required check(s) did not run: "
                       + ", ".join(missing) + suffix, critical=True)
     unlisted = sorted(ran - required)
-    detail = f"all {len(required) - len(honored)} required checks ran" + suffix
+    detail = f"all {len(required) - len(honored)} required checks ran" + suffix + suffix_hub
     if unlisted:
         detail += f"; {len(unlisted)} unlisted: {', '.join(unlisted)}"
     return C.ok("w_checks_complete", detail)
@@ -901,6 +920,8 @@ def main():
     # they carry no function of their own. Naming their producer anyway keeps
     # every line in the verdict traceable, and gives the duplicate-id guard
     # below something real to compare.
+    # Hub sentinels (HOME/hub/): additive, never raising, tagged hub:<name>.
+    results.extend(HUB.run_all())
     watcher_results, disabled_by_config = probe_watchers()
     for r in watcher_results:
         r.setdefault("produced_by", "probe_watchers")
