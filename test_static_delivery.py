@@ -383,13 +383,27 @@ class OutboxAttachmentTests(unittest.TestCase):
             script.index('tell application "Messages"', script.index("repeat with")),
         )
 
-    def test_unreadable_delivery_ledger_never_becomes_success(self):
+    def test_unreadable_delivery_ledger_sends_once_and_never_resends(self):
+        """osascript has already sent by the time chat.db turns out unreadable. The
+        old contract reported failure, requeued, and the next drain sent the same
+        alert again - the operator received every alert twice (Principal, 2026-08-18).
+        New contract: an unverifiable send is recorded as sent-unverified exactly once."""
         completed = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         with mock.patch.object(outbox, "_delivered_count", return_value=None), \
                 mock.patch.object(outbox.subprocess, "run", return_value=completed):
             ok, reason = outbox._send("alert", "recipient")
-        self.assertFalse(ok)
-        self.assertIn("unverifiable", reason)
+        self.assertTrue(ok)
+        self.assertIn("unverified", reason)
+        outbox.enqueue("alert once", "recipient")
+        with mock.patch.object(outbox, "_delivered_count", return_value=None), \
+                mock.patch.object(outbox.subprocess, "run", return_value=completed):
+            sent, kept, why = outbox.drain()
+            self.assertEqual((sent, kept), (1, 0))
+            self.assertIn("unverified", why)
+            sent2, kept2, _ = outbox.drain()
+        self.assertEqual((sent2, kept2), (0, 0), "an unverified send must never be sent again")
+        ledger = outbox.SENT.read_text().strip().splitlines()
+        self.assertTrue(ledger and "unverified" in ledger[-1])
 
     def test_drain_keeps_enqueue_from_another_process(self):
         outbox.enqueue("first", "recipient")

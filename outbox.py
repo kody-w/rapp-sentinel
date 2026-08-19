@@ -238,7 +238,16 @@ def _send(text, to, attachments=None):
     if p.returncode != 0:
         return False, p.stderr.strip()[:160]
     if before is None or any(v is None for v in attachment_before.values()):
-        return False, "delivery unverifiable: chat.db unreadable"
+        # osascript already SENT this message. Reporting a failure here put it back
+        # in the queue, and the next drain sent it again - the operator got every
+        # alert twice while the log said "unverifiable" (the Principal's first
+        # finding, 2026-08-18: 10 such copies queued on the estate sentinel). An
+        # unreadable chat.db means we cannot PROVE delivery, not that it did not
+        # happen; a send we cannot verify is recorded as sent-unverified exactly
+        # once, never repeated. (A refused/unroutable handle still fails above on
+        # returncode; the falsely-successful-send case this docstring guards is the
+        # one where chat.db IS readable and gains no row - that path is unchanged.)
+        return True, "sent unverified: chat.db unreadable in this context (no Full Disk Access)"
 
     for _ in range(40):                      # attachments can take longer to index
         text_landed = not text or (_delivered_count(to) or 0) > before
@@ -289,6 +298,9 @@ def drain(limit=20):
             if not ok:
                 why = err
                 break
+            if err:                      # sent, but unverified - say so in the ledger and the drain record
+                m = dict(m, unverified=err)
+                why = err
             try:
                 _append_sent(m)
             except OSError as e:
