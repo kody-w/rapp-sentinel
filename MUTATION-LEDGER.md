@@ -173,6 +173,7 @@ check keeps its history.*
 | *(evolve situation)* | `prove_critique_situation.py` (prompt guarantees, not a check) | proven |
 | `w_outsider_smoke` | `prove_outsider_smoke.py` | proven |
 | `w_neighbor_moving` | `prove_neighbor_moving.py` (ships with the check): stale chain / alive-but-never-worked / no declaration | proven |
+| `hub_<slug>_load` + hub-declared ids | `prove_hub_loader.py` (ships with hub.py): silent id / raising file / stranger critical / bad manifest / growth path | proven |
 
 The two UNPROVEN rows are the honest debt: both ids landed in #62 with unit
 tests that exercise their fail and pass branches, but neither has been through

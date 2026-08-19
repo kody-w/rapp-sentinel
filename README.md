@@ -60,6 +60,19 @@ An outside neighbor is trusted exactly as far as its published head can be
 checked against what it published before: you can catch a peer that **stalled**,
 and you cannot catch a peer that **lied**. Build only on the first.
 
+## Growing it from the hub
+
+Checks you did not write live on the **[RAPP Sentinel Hub](https://kody-w.github.io/rapp-sentinel-hub/)** —
+single-file sentinels (`rapp-sentinel/1.0`) posted the way RAR posts `agent.py`s. Drop one into
+`hub/` and the next tick runs it; its check ids join the required set so it can never silently
+stop. Trust is a dial (`hub.critical_allowed` in config.json), not a switch.
+
+```bash
+curl -O https://raw.githubusercontent.com/kody-w/rapp-sentinel-hub/main/sentinel_sdk.py
+python3 sentinel_sdk.py install @kody-w/output_moving_sentinel --home ~/rapp-sentinel
+python3 health.py | grep -A3 hub:      # produced_by=hub:@kody-w/output_moving_sentinel
+```
+
 ## Install
 
 ```bash
