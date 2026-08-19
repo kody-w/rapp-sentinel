@@ -2124,6 +2124,7 @@ def alerts_can_actually_reach_you():
     missing = int(st.get("missing_attachments") or 0)
     unverified = int(st.get("unverified") or 0)
     dead_letter = int(st.get("dead_letter") or 0)
+    expired = int(st.get("expired") or 0)
     last = st.get("last_drain") or {}
     why = (last.get("why") or "").strip()
     if missing:
@@ -2155,7 +2156,10 @@ def alerts_can_actually_reach_you():
     if not n and why.startswith("delivery unverified:"):
         return fail("alert_delivery", why[:180], critical=False)
     if not n:
-        return ok("alert_delivery", "no queued alerts")
+        detail = "no queued alerts"
+        if expired:
+            detail += f"; {expired} historical undelivered report(s) retained as expired"
+        return ok("alert_delivery", detail)
     if age and age > 180:
         return fail("alert_delivery",
                     f"{n} alert(s) undelivered for {age:.0f}m — persistent "

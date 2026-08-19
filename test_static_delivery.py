@@ -274,7 +274,7 @@ class OutboxAttachmentTests(unittest.TestCase):
         self.old = (
             outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
             outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
-            outbox.DEAD_LETTER)
+            outbox.DEAD_LETTER, outbox.EXPIRED)
         outbox.QUEUE = root / "outbox.jsonl"
         outbox.SENT = root / "sent.jsonl"
         outbox.LAST_DRAIN = root / "last.json"
@@ -283,12 +283,13 @@ class OutboxAttachmentTests(unittest.TestCase):
         outbox.DRAIN_LOCK = root / "outbox-drain.lock"
         outbox.UNVERIFIED = root / "outbox-unverified.jsonl"
         outbox.DEAD_LETTER = root / "outbox-dead-letter.jsonl"
+        outbox.EXPIRED = root / "outbox-expired.jsonl"
         outbox.REPORTS.mkdir()
 
     def tearDown(self):
         (outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
          outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
-         outbox.DEAD_LETTER) = self.old
+         outbox.DEAD_LETTER, outbox.EXPIRED) = self.old
         self.temp.cleanup()
 
     def test_drain_passes_attachment_and_cleans_generated_snapshot(self):
@@ -446,7 +447,7 @@ class WatcherOutboxTests(unittest.TestCase):
         self.old = (
             outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
             outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
-            outbox.DEAD_LETTER, watcher_outbox.CLAIMS,
+            outbox.DEAD_LETTER, outbox.EXPIRED, watcher_outbox.CLAIMS,
             watcher_outbox.ATTEMPTS)
         outbox.QUEUE = root / "outbox.jsonl"
         outbox.SENT = root / "sent.jsonl"
@@ -456,6 +457,7 @@ class WatcherOutboxTests(unittest.TestCase):
         outbox.DRAIN_LOCK = root / "outbox-drain.lock"
         outbox.UNVERIFIED = root / "outbox-unverified.jsonl"
         outbox.DEAD_LETTER = root / "outbox-dead-letter.jsonl"
+        outbox.EXPIRED = root / "outbox-expired.jsonl"
         watcher_outbox.CLAIMS = root / "watcher-claims"
         watcher_outbox.ATTEMPTS = root / "outbox-attempts.json"
         outbox.REPORTS.mkdir()
@@ -463,7 +465,7 @@ class WatcherOutboxTests(unittest.TestCase):
     def tearDown(self):
         (outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
          outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
-         outbox.DEAD_LETTER, watcher_outbox.CLAIMS,
+         outbox.DEAD_LETTER, outbox.EXPIRED, watcher_outbox.CLAIMS,
          watcher_outbox.ATTEMPTS) = self.old
         self.temp.cleanup()
 
@@ -563,7 +565,7 @@ class VerifyOutboxTests(unittest.TestCase):
         self.old = (
             outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
             outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
-            outbox.DEAD_LETTER, verify_outbox.CHAT_DB)
+            outbox.DEAD_LETTER, outbox.EXPIRED, verify_outbox.CHAT_DB)
         outbox.QUEUE = root / "outbox.jsonl"
         outbox.SENT = root / "sent.jsonl"
         outbox.LAST_DRAIN = root / "last.json"
@@ -572,6 +574,7 @@ class VerifyOutboxTests(unittest.TestCase):
         outbox.DRAIN_LOCK = root / "outbox-drain.lock"
         outbox.UNVERIFIED = root / "outbox-unverified.jsonl"
         outbox.DEAD_LETTER = root / "outbox-dead-letter.jsonl"
+        outbox.EXPIRED = root / "outbox-expired.jsonl"
         outbox.REPORTS.mkdir()
         verify_outbox.CHAT_DB = root / "chat.db"
         self.connection = sqlite3.connect(verify_outbox.CHAT_DB)
@@ -597,7 +600,7 @@ class VerifyOutboxTests(unittest.TestCase):
         self.connection.close()
         (outbox.QUEUE, outbox.SENT, outbox.LAST_DRAIN, outbox.REPORTS,
          outbox.LOCK, outbox.DRAIN_LOCK, outbox.UNVERIFIED,
-         outbox.DEAD_LETTER, verify_outbox.CHAT_DB) = self.old
+         outbox.DEAD_LETTER, outbox.EXPIRED, verify_outbox.CHAT_DB) = self.old
         self.temp.cleanup()
 
     @staticmethod
@@ -724,6 +727,20 @@ class AlertDeliveryTests(unittest.TestCase):
             result = checks.alerts_can_actually_reach_you()
         self.assertFalse(result["ok"])
         self.assertIn("dead-letter", result["detail"])
+
+    def test_expired_history_is_visible_without_becoming_active_failure(self):
+        with mock.patch.object(outbox, "status", return_value={
+            "pending": 0,
+            "oldest_minutes": None,
+            "missing_attachments": 0,
+            "unverified": 0,
+            "dead_letter": 0,
+            "expired": 16,
+            "last_drain": {"why": "expired by operator"},
+        }):
+            result = checks.alerts_can_actually_reach_you()
+        self.assertTrue(result["ok"])
+        self.assertIn("16 historical undelivered", result["detail"])
 
 
 class MeaningfulActivityTests(unittest.TestCase):

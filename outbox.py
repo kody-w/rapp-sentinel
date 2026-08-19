@@ -45,6 +45,7 @@ QUEUE = STATE / "outbox.jsonl"
 SENT = STATE / "outbox-sent.jsonl"
 UNVERIFIED = STATE / "outbox-unverified.jsonl"
 DEAD_LETTER = STATE / "outbox-dead-letter.jsonl"
+EXPIRED = STATE / "outbox-expired.jsonl"
 REPORTS = STATE / "reports"
 LOCK = STATE / "outbox.lock"
 DRAIN_LOCK = STATE / "outbox-drain.lock"
@@ -383,6 +384,7 @@ def status():
         "missing_attachments": missing,
         "unverified": count_lines(UNVERIFIED),
         "dead_letter": count_lines(DEAD_LETTER),
+        "expired": count_lines(EXPIRED),
     }
     if not pending:
         return {**base, "pending": 0, "oldest_minutes": None}
