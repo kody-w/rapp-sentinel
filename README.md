@@ -512,6 +512,7 @@ Stated plainly because the whole argument here is that unverifiable claims are w
 | `rapp.py` | vendored reference implementation from [rapp-1](https://github.com/kody-w/rapp-1) |
 | `TRIFECTA-PATTERN.md` | the pattern, portable to other domains |
 | `BLOG-the-agent-that-refused.md` | the long-form writeup |
+| `BLOG-it-just-wakes-up.md` | the Principal, the morning memo, and the new way of working |
 
 MIT. The `rapp/1` reference implementation is vendored from [kody-w/rapp-1](https://github.com/kody-w/rapp-1) under its own terms.
 
