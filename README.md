@@ -518,3 +518,20 @@ MIT. The `rapp/1` reference implementation is vendored from [kody-w/rapp-1](http
 ## The pattern, generalized
 
 Three watchers is the smallest case. For the general one — **any number of AIs, from any vendors, as mutually-verifying peers** — see [N-AIS-WALK-INTO-A-BAR.md](N-AIS-WALK-INTO-A-BAR.md). Seat your own cast in `config.json`'s `neighbors` map; no code edit.
+
+## The Principal — a sentinel that sits in on sentinels
+
+`principal.py` is a watcher whose classrooms are *other* sentinels, anywhere on the tailnet
+(local paths or ssh, bash or PowerShell hosts). Like a school principal it drops in unannounced
+(random visits, everyone within a window), sits at the back, and grades the **teacher against the
+job it declared** — not the world it watches: attendance (tick on schedule and *moving*), record
+(chains verify, nothing truncated), the job (verdict covers `cares_about`; standing reds that
+nobody decided; criticals), honesty (status agrees with the failing list; alerts not rotting
+undelivered), discipline (budgets). That rubric is the deterministic floor; then the principal —
+an AI in the neighborhood — reads the same evidence and writes its own note (grade, what works,
+what fails, one change). Disagreement between the two is recorded, not resolved.
+
+Every visit is a `principal.visited` frame on its own chain, a row in `state/observations.jsonl`,
+a line on `state/report-card.json`, and `dashboard/principal.html`. It texts only when a grade
+changes. Instance: `SENTINEL_HOME=~/.principal` with `classrooms` in config.json; launchd
+template `com.rapp.principal.plist.template`. Proof: `prove_principal.py`.
