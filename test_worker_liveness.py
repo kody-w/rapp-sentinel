@@ -329,6 +329,24 @@ class LiveCliPermissionProbes(unittest.TestCase):
         doc = SS.extract_report(proc.stdout, 65536)
         self.assertEqual({"ok": True}, doc)
 
+    def test_a_child_in_json_mode_yields_one_assistant_message(self):
+        """The real event stream, read the way the worker reads it."""
+        argv = SS.confined_argv(
+            'Think briefly about the number seven, then reply with exactly '
+            'this JSON and nothing else: {"ok": true, "n": 7}',
+            self.MODEL, self.ws, tools=SS.CHILD_TOOLS,
+            secret_vars=SS.secret_vars_for(self.cfg), json_output=True)
+        env = SS.confined_env(self.cfg, self.ws, 0)
+        proc = subprocess.run(argv, cwd=str(self.ws), env=env, text=True,
+                              capture_output=True, timeout=300)
+        self.assertEqual(0, proc.returncode, proc.stderr[:400])
+        self.assertIn('"type":"assistant.message"', proc.stdout.replace(" ", ""))
+        content = SS.extract_assistant_message(proc.stdout)
+        self.assertEqual({"ok": True, "n": 7},
+                         SS.extract_report(content, 65536))
+        # the reasoning event exists and is NOT what we read
+        self.assertIn("assistant.reasoning", proc.stdout)
+
     def test_the_maker_can_write_in_its_workspace_but_has_no_shell(self):
         canary = Path("/tmp/rapp-cli-probe-should-not-exist")
         if canary.exists():

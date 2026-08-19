@@ -38,6 +38,7 @@ import re
 import shlex
 import signal
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -79,7 +80,6 @@ CONFINEMENT_FLAGS = (
     "--no-remote-export",
     "--no-auto-update",           # a sentinel must not swap its own binary
     "--no-experimental",
-    "--silent",                   # the response, not the session furniture
 )
 
 # The only variables that survive into a model process. Everything else —
@@ -158,6 +158,8 @@ FANOUT_DEFAULTS = {
     "isolated_home": True,          # HOME/XDG/GH config inside the workspace
     "auth_env_var": "COPILOT_GITHUB_TOKEN",
     "sandbox_exec": False,          # macOS sandbox-exec, defence in depth
+    "format_repair_attempts": 1,    # one more process, only for bad JSON
+    "max_transcript_bytes": 262144, # what is kept on disk per attempt
     # A child with a GitHub token is a child that can publish. These come out
     # of the environment before exec, and gh is pointed at an empty config
     # directory, so "no write authority" is a property of the process rather
@@ -301,7 +303,7 @@ def plan_children(fcfg, history, depth, now=None):
 # ── confinement ─────────────────────────────────────────────────────────────
 
 def confined_argv(prompt, model, cwd, tools=(), add_dirs=(), secret_vars=(),
-                  log_dir=None):
+                  log_dir=None, json_output=False):
     """The exact command line a model process is allowed to have.
 
     Two independent restrictions, because one of them being wrong should not
@@ -317,6 +319,10 @@ def confined_argv(prompt, model, cwd, tools=(), add_dirs=(), secret_vars=(),
     if tools:
         argv.append("--allow-tool=" + ",".join(tools))
     argv += list(CONFINEMENT_FLAGS)
+    # JSONL events, so the report is read from a typed `assistant.message`
+    # rather than scraped out of prose. Text mode keeps --silent, where the
+    # response IS the stream.
+    argv += ["--output-format", "json"] if json_output else ["--silent"]
     argv += ["-C", str(cwd)]
     for directory in add_dirs:
         argv += ["--add-dir", str(directory)]
@@ -515,6 +521,50 @@ that cannot be read.
 """
 
 
+REPAIR_PROMPT = """
+Your previous reply could not be read, and this is the ONLY retry.
+
+WHAT WENT WRONG
+{error}
+
+WHAT YOU SENT (truncated)
+{prior}
+
+Send the SAME analysis again, as ONE json object and nothing else — no
+prose before it, no commentary after it, no markdown fence needed. Do not
+change your candidates to make them easier to format; change only the
+format. You still have no tools.
+
+{{
+  "schema": "{schema}",
+  "role": "{role}",
+  "cycle": {cycle},
+  "candidates": [
+    {{"id": "c1", "premise": "...", "rationale": "...",
+      "scores": {{{score_example}}}}}
+    ... at most {max_candidates}, unique ids, every score a number 0-10 ...
+  ],
+  "evidence": [{{"claim": "...", "source": "..."}}],
+  "critique": [{{"target": "...", "finding": "...",
+                "severity": "low|medium|high"}}]
+}}
+"""
+
+
+def repair_prompt(spec, fcfg, cycle, error, prior_content):
+    example = ", ".join(f'"{d}": 7' for d in SCORE_DIMENSIONS)
+    bound = int(fcfg.get("max_text", 400)) * 4
+    return REPAIR_PROMPT.format(
+        error=str(error)[:400],
+        prior=(prior_content or "(nothing)")[:bound],
+        schema=CHILD_SCHEMA,
+        role=spec["name"],
+        cycle=cycle,
+        max_candidates=int(fcfg.get("max_candidates_per_child", 8)),
+        score_example=example,
+    )
+
+
 def child_prompt(spec, fcfg, cycle, collective, parent_role, situation, prior,
                  pool):
     """Everything the child gets. It has no tools, so this is the whole world.
@@ -572,6 +622,54 @@ def _score(value, where):
     if not (0 <= value <= 10):
         raise ChildError(f"{where} is outside 0..10")
     return float(value)
+
+
+MAX_TRANSCRIPT_BYTES = 4 * 1024 * 1024
+MAX_TRANSCRIPT_EVENTS = 20000
+ASSISTANT_MESSAGE = "assistant.message"
+
+
+def extract_assistant_message(stdout, max_bytes=MAX_TRANSCRIPT_BYTES,
+                              max_events=MAX_TRANSCRIPT_EVENTS):
+    """The final assistant message, and nothing else in the transcript.
+
+    The CLI's JSONL carries the same words in several places: reasoning
+    deltas, `assistant.reasoning`, `model.message`, `model.response`,
+    snapshots. A child asked for JSON usually thinks about that JSON out loud
+    first — measured: the reasoning event for a one-line reply contained the
+    exact object the reply did. Scraping "the last JSON-looking thing" would
+    therefore read the model's THOUGHTS as its answer, which is a different
+    claim by a different speaker.
+
+    So this accepts exactly one event type, takes `data.content`, and ignores
+    stats, tool data and everything ephemeral. Bounded in bytes and events,
+    because a transcript is attacker-adjacent input like any other.
+    """
+    if stdout is None:
+        raise ChildError("the child produced no output at all")
+    size = len(stdout.encode("utf-8", "replace"))
+    if size > max_bytes:
+        raise ChildError(f"transcript is {size} bytes, over the {max_bytes} cap")
+    content, events = None, 0
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        events += 1
+        if events > max_events:
+            raise ChildError(f"transcript holds more than {max_events} events")
+        try:
+            event = json.loads(line)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(event, dict) or event.get("type") != ASSISTANT_MESSAGE:
+            continue
+        data = event.get("data")
+        if isinstance(data, dict) and isinstance(data.get("content"), str):
+            content = data["content"]
+    if content is None:
+        raise ChildError("the transcript holds no assistant.message event")
+    return content
 
 
 def extract_report(text, limit):
@@ -729,101 +827,180 @@ def _kill_group(proc, grace):
             time.sleep(0.05)
 
 
+def _write_transcript(transcript_dir, cycle, role, attempt, stdout, stderr,
+                      fcfg):
+    """Keep the evidence outside the workspace that is about to be deleted.
+
+    A child that failed is exactly the child whose transcript is worth having,
+    and until now it lived in a directory the worker removes on its way out.
+    Bounded, and scrubbed of the one value that could be in an environment
+    this process was given.
+    """
+    if not transcript_dir:
+        return ""
+    limit = int(fcfg.get("max_transcript_bytes", 262144))
+    secret = os.environ.get(str(fcfg.get("auth_env_var")
+                                or "COPILOT_GITHUB_TOKEN"), "")
+    body = ((stdout or "") + ("\n--- stderr ---\n" + stderr if stderr else ""))
+    if secret:
+        body = body.replace(secret, "<redacted>")
+    if len(body) > limit:
+        body = body[:limit] + f"\n--- truncated at {limit} bytes ---\n"
+    try:
+        target = Path(transcript_dir)
+        target.mkdir(parents=True, exist_ok=True)
+        path = target / f"{cycle}-{role}-{attempt}.log"
+        path.write_text(body, encoding="utf-8")
+        return str(path)
+    except OSError:
+        return ""
+
+
+def _spawn_child(argv, ws, env, budget, fcfg, live):
+    """One process. Returns (exit_code, timed_out, stdout, stderr)."""
+    try:
+        proc = subprocess.Popen(argv, cwd=str(ws), env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+    except FileNotFoundError:
+        return None, False, "", "copilot CLI not found on PATH"
+    except OSError as e:
+        return None, False, "", f"could not start the child: {type(e).__name__}: {e}"
+    live.append(proc)
+    out, err, timed_out = "", "", False
+    try:
+        out, err = proc.communicate(timeout=budget)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        _kill_group(proc, float(fcfg.get("kill_grace_s", 5)))
+        try:
+            out, err = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            out, err = "", ""
+    except BaseException:
+        _kill_group(proc, float(fcfg.get("kill_grace_s", 5)))
+        raise
+    finally:
+        try:
+            live.remove(proc)
+        except ValueError:
+            pass
+    return proc.returncode, timed_out, out, err
+
+
 def _run_child(spec, fcfg, workspace, cycle, collective, parent_role, prior,
-               pool, depth, deadline, live, logger=None, situation=""):
-    """One child, start to finish. Never raises: it returns its verdict."""
+               pool, depth, deadline, live, logger=None, situation="",
+               transcript_dir=None, spare_processes=None):
+    """One child, start to finish, with at most one format repair.
+
+    Never raises: it returns its verdict. A reply that cannot be parsed is
+    worth exactly one more process — models fail at JSON far more often than
+    they fail at thinking, and losing a whole cycle's deliberation to a stray
+    sentence is a bad trade. Two bad replies is a failed child, and a failed
+    verifier is still a failed cycle.
+    """
+    say = logger or (lambda msg: None)
     started = time.monotonic()
     ws = Path(workspace) / "children" / spec["name"]
     ws.mkdir(parents=True, exist_ok=True)
     result = {"role": spec["name"], "wave": spec["wave"],
               "verifier": bool(spec.get("verifier")), "ok": False,
               "error": "", "timed_out": False, "exit_code": None,
-              "elapsed_s": 0.0, "report": None, "argv": [], "pid": None}
+              "elapsed_s": 0.0, "report": None, "argv": [], "pid": None,
+              "attempts": 0, "processes": 0, "transcripts": [], "repaired": False}
 
-    remaining = deadline - time.monotonic()
-    per_child = float(fcfg.get("child_timeout_s", 600))
-    budget = min(per_child, remaining)
-    if budget <= 1:
-        result["error"] = "no time left in the cycle's fan-out budget"
-        return result
-
-    prompt = child_prompt(spec, fcfg, cycle, collective, parent_role,
-                          situation, prior, pool)
     try:
         env = confined_env(fcfg, ws, depth)
     except AuthUnavailable as e:
         result["error"] = str(e)
         return result
-    argv = sandbox_wrap(
-        confined_argv(prompt, fcfg.get("model") or fcfg.get("_parent_model")
-                      or "claude-sonnet-4.6", ws, tools=CHILD_TOOLS,
-                      secret_vars=secret_vars_for(fcfg),
-                      log_dir=ws / "copilot-logs"),
-        [ws], bool(fcfg.get("sandbox_exec")))
-    result["argv"] = argv
-    try:
-        proc = subprocess.Popen(argv, cwd=str(ws), env=env,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True,
-                                start_new_session=True)
-    except FileNotFoundError:
-        result["error"] = "copilot CLI not found on PATH"
-        return result
-    except OSError as e:
-        result["error"] = f"could not start the child: {type(e).__name__}: {e}"
-        return result
 
-    live.append(proc)
-    result["pid"] = proc.pid
-    out, err = "", ""
-    try:
-        out, err = proc.communicate(timeout=budget)
-        result["exit_code"] = proc.returncode
-    except subprocess.TimeoutExpired:
-        result["timed_out"] = True
-        _kill_group(proc, float(fcfg.get("kill_grace_s", 5)))
-        try:
-            out, err = proc.communicate(timeout=10)
-        except subprocess.TimeoutExpired:
-            out, err = "", ""
-        result["exit_code"] = proc.returncode
-        result["error"] = f"timed out after {budget:.0f}s"
-    except BaseException:
-        # Ctrl-C, SIGTERM-driven unwind, anything: the child does not get to
-        # outlive the decision to stop.
-        _kill_group(proc, float(fcfg.get("kill_grace_s", 5)))
-        raise
-    finally:
-        result["elapsed_s"] = round(time.monotonic() - started, 1)
-        try:
-            live.remove(proc)
-        except ValueError:
-            pass
-        try:
-            (ws / "child.log").write_text((out or "") + (err or ""),
-                                          encoding="utf-8")
-        except OSError:
-            pass
+    prompt = child_prompt(spec, fcfg, cycle, collective, parent_role,
+                          situation, prior, pool)
+    max_repairs = max(0, int(fcfg.get("format_repair_attempts", 1)))
+    last_content, last_error = "", ""
 
-    if result["timed_out"]:
-        return result
-    if result["exit_code"] != 0:
-        detail = (err or out or "").strip().splitlines()
-        result["error"] = (f"exited {result['exit_code']}"
-                           + (f": {detail[-1][:160]}" if detail else ""))
-        return result
-    try:
-        # stdout only: stderr is the CLI's own chatter, and a report parsed
-        # out of it would be a report we cannot attribute to the model.
-        result["report"] = validate_report(out, spec, fcfg, cycle)
-        result["ok"] = True
-    except ChildError as e:
-        result["error"] = str(e)
+    for attempt in range(1, max_repairs + 2):
+        remaining = deadline - time.monotonic()
+        per_child = float(fcfg.get("child_timeout_s", 600))
+        budget = min(per_child, remaining)
+        if budget <= 1:
+            result["error"] = (result["error"]
+                               or "no time left in the cycle's fan-out budget")
+            break
+        if attempt > 1:
+            if spare_processes is not None and not spare_processes.take():
+                result["error"] = (f"{last_error} (no process left in the "
+                                   f"cycle's cap for a format repair)")
+                break
+            say(f"  {spec['name']}: unreadable reply, one format repair")
+            prompt = repair_prompt(spec, fcfg, cycle, last_error, last_content)
+
+        argv = sandbox_wrap(
+            confined_argv(prompt, fcfg.get("model") or fcfg.get("_parent_model")
+                          or "claude-sonnet-4.6", ws, tools=CHILD_TOOLS,
+                          secret_vars=secret_vars_for(fcfg),
+                          log_dir=ws / "copilot-logs", json_output=True),
+            [ws], bool(fcfg.get("sandbox_exec")))
+        result["argv"] = argv
+        result["attempts"] = attempt
+        result["processes"] += 1
+
+        code, timed_out, out, err = _spawn_child(argv, ws, env, budget, fcfg,
+                                                 live)
+        result["exit_code"] = code
+        path = _write_transcript(transcript_dir, cycle, spec["name"], attempt,
+                                 out, err, fcfg)
+        if path:
+            result["transcripts"].append(path)
+
+        if timed_out:
+            result["timed_out"] = True
+            result["error"] = f"timed out after {budget:.0f}s"
+            break
+        if code is None:
+            result["error"] = err or "the child could not be started"
+            break
+        if code != 0:
+            detail = (err or out or "").strip().splitlines()
+            result["error"] = (f"exited {code}"
+                               + (f": {detail[-1][:160]}" if detail else ""))
+            break
+        try:
+            content = extract_assistant_message(
+                out, int(fcfg.get("max_transcript_bytes", 262144)) * 16)
+            last_content = content
+            result["report"] = validate_report(content, spec, fcfg, cycle)
+            result["ok"] = True
+            result["repaired"] = attempt > 1
+            result["error"] = ""
+            break
+        except ChildError as e:
+            last_error = str(e)
+            result["error"] = str(e)
+
+    result["elapsed_s"] = round(time.monotonic() - started, 1)
     return result
 
 
+class SpareProcesses:
+    """The cycle's remaining process allowance, shared across children."""
+
+    def __init__(self, count):
+        self.remaining = max(0, int(count))
+        self._lock = threading.Lock()
+
+    def take(self):
+        with self._lock:
+            if self.remaining <= 0:
+                return False
+            self.remaining -= 1
+            return True
+
+
 def run_children(specs, fcfg, workspace, cycle, collective, parent_role, prior,
-                 depth, logger=None, situation=""):
+                 depth, logger=None, situation="", transcript_dir=None,
+                 spare_processes=None):
     """Run the cast wave by wave, bounded in count, time and blast radius."""
     say = logger or (lambda msg: None)
     results, pool, live = [], [], []
@@ -838,7 +1015,8 @@ def run_children(specs, fcfg, workspace, cycle, collective, parent_role, prior,
             with ThreadPoolExecutor(max_workers=min(concurrency, len(batch))) as ex:
                 futures = [ex.submit(_run_child, spec, fcfg, workspace, cycle,
                                      collective, parent_role, prior, list(pool),
-                                     depth, deadline, live, say, situation)
+                                     depth, deadline, live, say, situation,
+                                     transcript_dir, spare_processes)
                            for spec in batch]
                 wave_results = [f.result() for f in futures]
             for res in wave_results:

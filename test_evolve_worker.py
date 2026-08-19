@@ -1988,7 +1988,7 @@ class CleanupIntegrityTests(WorkerEnv):
         import ast
         path = Path(__file__).resolve().parent / "evolve_worker.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        allowed = {"_git", "_git_bytes", "_credential_helper", "_gh"}
+        allowed = {"_git", "_git_bytes", "_gh", "assert_publish_auth"}
         found = {}
 
         def argv0_is_a_binary(call):
@@ -2110,22 +2110,20 @@ class CloneIsolationTests(WorkerEnv):
         config = Path(env["GIT_CONFIG_GLOBAL"]).read_text(encoding="utf-8")
         directives = [line for line in config.splitlines()
                       if line.strip() and not line.lstrip().startswith("#")]
-        self.assertTrue(all(d.startswith(("[credential]", "\thelper"))
+        self.assertTrue(all(d.startswith(('[credential "https://github.com"]',
+                                          "\thelper"))
                             for d in directives),
                         f"the sanitized config holds more than a helper: "
                         f"{directives}")
 
-    def test_a_shell_credential_helper_is_never_carried_over(self):
-        with mock.patch.object(EW.subprocess, "run",
-                               return_value=subprocess.CompletedProcess(
-                                   [], 0, stdout="!evil --steal\n", stderr="")):
-            self.assertEqual("", EW._credential_helper())
-
-    def test_a_plain_credential_helper_is_carried_over(self):
-        with mock.patch.object(EW.subprocess, "run",
-                               return_value=subprocess.CompletedProcess(
-                                   [], 0, stdout="osxkeychain\n", stderr="")):
-            self.assertEqual("osxkeychain", EW._credential_helper())
+    def test_the_helper_is_generated_from_the_pinned_gh(self):
+        # nothing is inherited any more: the helper is a file this code
+        # writes, naming the validated gh binary and one fixed subcommand
+        helper = EW.credential_helper_path(None, self.home / "githome")
+        body = helper.read_text()
+        self.assertIn(EW.gh_binary(), body)
+        self.assertIn("auth git-credential", body)
+        self.assertNotIn("credential.helper", body)
 
     # ── url shapes ──
     def test_hostile_repo_urls_are_refused_before_git_sees_them(self):
@@ -2395,11 +2393,13 @@ class FakeGitOnPathTests(WorkerEnv):
                         "the fake binary")
 
     # ── and cannot win anywhere in the controller ──
-    def test_credential_helper_discovery_uses_the_pinned_binary(self):
+    def test_building_the_credential_helper_uses_pinned_binaries(self):
         with mock.patch.dict(os.environ, self.hostile_path), self.fresh():
-            EW._credential_helper()
+            helper = EW.credential_helper_path(None, self.home / "githome")
+            EW.controller_git_env(home=self.home / "githome2")
         self.assertFalse(self.marker.exists(),
-                         "the credential helper read ran a fake git")
+                         "building the credential path ran a fake git")
+        self.assertNotIn(str(self.fakebin), helper.read_text())
 
     def test_initial_acquisition_uses_the_pinned_binary(self):
         clone = self.home / "clone"
@@ -3047,6 +3047,175 @@ class StagingLeakageCycleTests(WorkerEnv):
     def test_the_clean_cycle_still_contributes(self):
         summary = self.run_with(lambda s: None)
         self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+
+
+class PublishAuthTests(WorkerEnv):
+    """Three live cycles made art and then could not push (#B)."""
+
+    def setUp(self):
+        super().setUp()
+        self.wcfg = dict(EW.worker_config({}),
+                         repo="kody-w/public-art-collective")
+
+    def fake_fill(self, stdout, returncode=0):
+        real_run = subprocess.run
+
+        def run(argv, *a, **kw):
+            if len(argv) > 1 and argv[1] == "credential":
+                return subprocess.CompletedProcess(argv, returncode,
+                                                   stdout=stdout, stderr="")
+            return real_run(argv, *a, **kw)
+        return run
+
+    # ── the generated helper ──
+    def test_the_helper_is_generated_not_inherited(self):
+        home = self.home / "githome"
+        helper = EW.credential_helper_path(self.wcfg, home)
+        body = helper.read_text()
+        self.assertIn("auth git-credential", body)
+        self.assertIn(str(EW.REAL_HOME), body)
+        self.assertIn(str(EW.real_gh_config_dir()), body)
+        self.assertEqual(0o700, helper.stat().st_mode & 0o777)
+        self.assertTrue(body.startswith("#!/bin/sh"))
+
+    def test_a_malicious_global_helper_is_never_carried_over(self):
+        with mock.patch.object(EW, "_GIT_ENV", None):
+            env = EW.controller_git_env(home=self.home / "gh2")
+        config = Path(env["GIT_CONFIG_GLOBAL"]).read_text()
+        self.assertNotIn("!", config.split("helper =")[-1],
+                         "a shell helper string must never reach the config")
+        self.assertIn("gh-credential-helper", config)
+        self.assertIn('[credential "https://github.com"]', config)
+
+    def test_the_generated_config_holds_nothing_else(self):
+        with mock.patch.object(EW, "_GIT_ENV", None):
+            env = EW.controller_git_env(home=self.home / "gh3")
+        directives = [ln for ln in
+                      Path(env["GIT_CONFIG_GLOBAL"]).read_text().splitlines()
+                      if ln.strip() and not ln.lstrip().startswith("#")]
+        self.assertEqual(2, len(directives), directives)
+        self.assertTrue(directives[0].startswith('[credential "https://github.com"]'))
+        self.assertTrue(directives[1].strip().startswith("helper = /"))
+
+    # ── isolation of the credential material ──
+    def test_git_never_sees_the_gh_config_dir(self):
+        with mock.patch.object(EW, "_GIT_ENV", None):
+            env = EW.controller_git_env(home=self.home / "gh4")
+        self.assertNotIn("GH_CONFIG_DIR", env)
+        self.assertNotEqual(str(EW.REAL_HOME), env["HOME"])
+
+    def test_gh_gets_the_real_home_and_config_and_nothing_ambient(self):
+        with mock.patch.dict(os.environ, {"GIT_EXEC_PATH": "/hostile",
+                                          "https_proxy": "http://evil"}):
+            env = EW.controller_gh_env(self.wcfg)
+        self.assertEqual(str(EW.REAL_HOME), env["HOME"])
+        self.assertEqual(str(EW.real_gh_config_dir()), env["GH_CONFIG_DIR"])
+        self.assertNotIn("GIT_EXEC_PATH", env)
+        self.assertNotIn("https_proxy", env)
+
+    def test_no_model_process_can_see_the_gh_config_or_token(self):
+        ws = self.home / "modelws"
+        ws.mkdir()
+        env = SS.confined_env(SS.fanout_config({"fanout": {"isolated_home": False}}),
+                              ws, 0, env={"HOME": "/Users/x",
+                                          "GH_CONFIG_DIR": str(EW.real_gh_config_dir()),
+                                          "GITHUB_TOKEN": "secret"})
+        self.assertTrue(env["GH_CONFIG_DIR"].startswith(str(ws)),
+                        "the model's gh config must be an empty workspace dir")
+        self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertNotEqual(str(EW.real_gh_config_dir()), env["GH_CONFIG_DIR"])
+
+    # ── the gh config directory itself ──
+    def test_a_gh_config_dir_outside_the_real_home_is_refused(self):
+        with self.assertRaises(EW.GateError) as cm:
+            EW.real_gh_config_dir({"gh_config_dir": "/etc"})
+        self.assertIn("not under", str(cm.exception))
+
+    def test_a_world_writable_gh_config_dir_is_refused(self):
+        loose = EW.REAL_HOME / f".rapp-test-gh-{uuid.uuid4().hex[:8]}"
+        loose.mkdir(mode=0o777)
+        self.addCleanup(loose.rmdir)
+        os.chmod(loose, 0o777)
+        with self.assertRaises(EW.GateError) as cm:
+            EW.real_gh_config_dir({"gh_config_dir": str(loose)})
+        self.assertIn("writable", str(cm.exception))
+
+    def test_a_missing_gh_config_dir_is_refused(self):
+        with self.assertRaises(EW.GateError):
+            EW.real_gh_config_dir({"gh_config_dir": str(EW.REAL_HOME / "nope-xyz")})
+
+    # ── the preflight ──
+    def test_the_preflight_passes_when_permission_and_credentials_exist(self):
+        with mock.patch.object(EW, "_gh",
+                               return_value='{"viewerPermission": "ADMIN"}'), \
+             mock.patch.object(EW.subprocess, "run",
+                               self.fake_fill("username=kody-w\npassword=gho_x\n")):
+            detail = EW.assert_publish_auth(self.wcfg)
+        self.assertIn("ADMIN", detail)
+        self.assertNotIn("gho_x", detail, "no secret may reach a log line")
+        self.assertIn("password 5 chars", detail)
+
+    def test_read_only_permission_stops_the_cycle(self):
+        with mock.patch.object(EW, "_gh",
+                               return_value='{"viewerPermission": "READ"}'):
+            with self.assertRaises(EW.AbortError) as cm:
+                EW.assert_publish_auth(self.wcfg)
+        self.assertIn("READ", str(cm.exception))
+
+    def test_missing_credentials_stop_the_cycle(self):
+        with mock.patch.object(EW, "_gh",
+                               return_value='{"viewerPermission": "WRITE"}'), \
+             mock.patch.object(EW.subprocess, "run", self.fake_fill("")):
+            with self.assertRaises(EW.AbortError) as cm:
+                EW.assert_publish_auth(self.wcfg)
+        self.assertIn("no username, password", str(cm.exception))
+
+    def test_a_failing_credential_helper_stops_the_cycle(self):
+        with mock.patch.object(EW, "_gh",
+                               return_value='{"viewerPermission": "WRITE"}'), \
+             mock.patch.object(EW.subprocess, "run",
+                               self.fake_fill("", returncode=1)):
+            with self.assertRaises(EW.AbortError) as cm:
+                EW.assert_publish_auth(self.wcfg)
+        self.assertIn("credential fill failed", str(cm.exception))
+
+    def test_a_local_repo_needs_no_credentials(self):
+        detail = EW.assert_publish_auth(dict(self.wcfg, repo=str(self.origin)))
+        self.assertIn("needs no credentials", detail)
+
+    # ── ordering: before any spend ──
+    def test_the_preflight_runs_before_any_child_or_maker(self):
+        cfg = worker_cfg(evolve_worker={
+            "repo": "kody-w/public-art-collective",
+            "fanout": {"enabled": True, "children": 3}})
+        with mock.patch.object(EW, "assert_publish_auth",
+                               side_effect=EW.AbortError("no credentials")), \
+             mock.patch.object(EW.SS, "run_children") as children, \
+             mock.patch.object(EW, "run_model") as maker:
+            summary = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+        self.assertEqual("skipped", summary["outcome"])
+        self.assertIn("publish auth unavailable", summary["reason"])
+        children.assert_not_called()
+        maker.assert_not_called()
+        self.assertFalse(EW.HISTORY_PATH.exists(),
+                         "an unpublishable cycle spends nothing")
+
+    def test_a_healthy_preflight_lets_the_cycle_proceed(self):
+        with mock.patch.object(EW, "assert_publish_auth",
+                               return_value="push permission ADMIN"), \
+             mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+
+    def test_no_secret_reaches_the_worker_log(self):
+        log_text = []
+        with mock.patch.object(EW, "log", side_effect=log_text.append), \
+             mock.patch.object(EW, "_gh",
+                               return_value='{"viewerPermission": "ADMIN"}'), \
+             mock.patch.object(EW.subprocess, "run",
+                               self.fake_fill("username=u\npassword=gho_supersecret\n")):
+            EW.assert_publish_auth(self.wcfg)
+        self.assertFalse(any("gho_supersecret" in line for line in log_text))
 
 
 class LifecycleTests(WorkerEnv):
