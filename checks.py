@@ -1263,24 +1263,42 @@ def rb_rollup_covers_corpus():
     only falls when the roll-up is computing the site's rankings from
     materially less than the platform contains. `real_posts_analyzed` is used
     when present so synthetic sidecar posts do not inflate corpus coverage.
+
+    Neither of the two reads this needs is allowed to page on its own failure.
+    On 2026-08-19T22:20Z the `gh api graphql` subprocess flaked and this check
+    reported "cannot read corpus size" at CRITICAL, waking the repair arm --
+    while in THE SAME verdict `rb_derived_truth` had already read the corpus
+    (15884) and `rb_content_moving` read the same roll-up green. That is the
+    mirror image of the 2026-08-14 incident (`prove_transport_failure_is_not_a
+    _content_stall.py`), where this check was the healthy control and
+    rb_content_moving raised the false page: the fix went to the sibling only,
+    so the un-retried single-sample read survived here and eventually fired.
+    A read we could not make is UNKNOWN, not a coverage shortfall, and not a
+    repair the repair arm can perform (#45, #51, #58, #59, #60).
     """
-    import json as _j
-    import urllib.request
-    url = f"https://raw.githubusercontent.com/{RB}/main/state/trending.json"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
-        with urllib.request.urlopen(req, timeout=25) as r:
-            meta = _j.loads(r.read().decode("utf-8")).get("_meta", {})
-        analyzed = real_posts_analyzed(meta)
-    except Exception as e:
-        return fail("rb_rollup_coverage", f"cannot read roll-up state ({str(e)[:40]})")
+    doc, err = public_json(RB, "state/trending.json", attempts=3)
+    if doc is None:
+        return fail("rb_rollup_coverage",
+                    f"cannot read roll-up state after 3 attempts: {err[:60]}",
+                    critical=False)
+    analyzed = real_posts_analyzed(doc.get("_meta") or {})
     q = ('{repository(owner:"%s",name:"%s")'
          '{discussions{totalCount}}}' % tuple(RB.split("/")))
-    data = gh(["api", "graphql", "-f", f"query={q}"], default=None)
+    data = gh(["api", "graphql", "-f", f"query={q}"], default=UNREADABLE)
+    if data is UNREADABLE:
+        # gh() returns its default on ANY failure, so `None` made a dead
+        # subprocess and a real answer the same value. Say blind, not broken.
+        return fail("rb_rollup_coverage",
+                    "cannot read corpus size (gh graphql read failed)",
+                    critical=False)
     try:
         actual = int(data["data"]["repository"]["discussions"]["totalCount"])
-    except Exception:
-        return fail("rb_rollup_coverage", "cannot read corpus size")
+    except Exception as e:
+        # We READ a response and it cannot state the corpus size: served but
+        # wrong, which is a defect in the answer rather than in our instrument.
+        return fail("rb_rollup_coverage",
+                    f"corpus size missing from a served response "
+                    f"({type(e).__name__}: {str(e)[:40]})")
     if actual <= 0:
         return fail("rb_rollup_coverage", "corpus reports zero discussions")
     pct = 100.0 * analyzed / actual
@@ -1351,24 +1369,47 @@ def derived_data_regenerating():
     The newest shard named by that index is then fetched, because an index
     naming a shard is not the site serving it — a 404 there is the original
     outage and stays critical.
+
+    Both fetches retry before they are believed, the same treatment
+    `rb_content_moving` and `outsider_can_join` already give this host: an
+    HTTP status is an answer and is raised on the first try, but a dropped
+    connection is re-sampled, because a single timed-out read is a statement
+    about our instrument and not about the generator.
     """
     import json as _j
+    import time
     import urllib.request
     import urllib.error
     base = f"https://raw.githubusercontent.com/{RB}/main/state/cache_shards"
 
-    def _get(url):
-        req = urllib.request.Request(url, headers={"User-Agent": "rapp-sentinel"})
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            return r.read().decode("utf-8")
+    def _get(url, attempts=3):
+        """Transport is retried before it is believed; an HTTP status is an
+        ANSWER, not a flake, so it is raised on the first try (#45/#51)."""
+        last = None
+        for i in range(attempts):
+            if i:
+                time.sleep(i)
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "rapp-sentinel"})
+                with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                    return r.read().decode("utf-8")
+            except urllib.error.HTTPError:
+                raise
+            except Exception as e:
+                last = e
+        raise last
 
     try:
         body = _get(f"https://raw.githubusercontent.com/{RB}/main/{_SHARD_INDEX_PATH}")
     except Exception as e:
         # Blind, not broken: one dropped connection must not read as a jammed
-        # write path (#45/#51).
+        # write path (#45/#51). Measured 2026-08-19T22:20Z -- a single 25s
+        # urlopen timeout reported the shard index unreadable while the index
+        # served in 0.1s on the very next read.
         return fail("rb_shards",
-                    f"cannot read shard index ({type(e).__name__}: {str(e)[:60]})",
+                    f"cannot read shard index after 3 attempts "
+                    f"({type(e).__name__}: {str(e)[:60]})",
                     critical=False)
     try:
         doc = _j.loads(body)
