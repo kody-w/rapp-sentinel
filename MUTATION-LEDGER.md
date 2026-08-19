@@ -147,7 +147,7 @@ check keeps its history.*
 | `rb_json_parses` | ledger row; `prove_starved_colors.py`; `prove_blind_green.py` | proven |
 | `rb_public_surface` | ledger row; `prove_starved_colors.py` | proven |
 | `rb_rejection_rate` | `prove_rejection_rate.py` | lands with #6's PR |
-| `rb_rollup_coverage` | ledger row; `prove_rollup_coverage.py` | proven |
+| `rb_rollup_coverage` | ledger row; `prove_rollup_coverage.py`; `prove_blind_corpus_is_not_a_coverage_outage.py` | proven |
 | `rb_shards` | ledger row; `prove_shards_regenerating.py` | proven |
 | `rb_wf_starved` | ledger row; `prove_absence.py`; `prove_starvation_confirm.py`; `prove_starved_colors.py`; `prove_unreadable_is_not_absence.py` | proven |
 | `rb_workflows` | ledger row; `prove_absence.py` | proven |
