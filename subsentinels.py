@@ -177,13 +177,38 @@ class ChildError(RuntimeError):
     """One child failed. Named, recorded, never silently dropped."""
 
 
+class ConfigError(FanoutError):
+    """The configuration asks for something the fan-out will not do."""
+
+
 # ── config ──────────────────────────────────────────────────────────────────
+
+# One repair, or none. A child that answers with unparseable JSON twice is
+# not having a bad moment, and a configuration asking for five retries is
+# quietly buying five more processes and five more chances for a wrong answer
+# to arrive dressed as a right one.
+MAX_FORMAT_REPAIRS = 1
+
+
+def validate_repair_attempts(value):
+    """`format_repair_attempts` must be an integer in 0..1, said plainly."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"fanout.format_repair_attempts must be an integer "
+                          f"in 0..{MAX_FORMAT_REPAIRS}, not {value!r}")
+    if not 0 <= value <= MAX_FORMAT_REPAIRS:
+        raise ConfigError(f"fanout.format_repair_attempts must be in "
+                          f"0..{MAX_FORMAT_REPAIRS}, not {value}")
+    return value
+
 
 def fanout_config(wcfg):
     block = wcfg.get("fanout")
     block = dict(block) if isinstance(block, dict) else {}
     merged = dict(FANOUT_DEFAULTS)
     merged.update(block)
+    merged["format_repair_attempts"] = validate_repair_attempts(
+        merged.get("format_repair_attempts", FANOUT_DEFAULTS[
+            "format_repair_attempts"]))
     merged["_parent_model"] = wcfg.get("model", "")
     return merged
 
@@ -917,7 +942,8 @@ def _run_child(spec, fcfg, workspace, cycle, collective, parent_role, prior,
 
     prompt = child_prompt(spec, fcfg, cycle, collective, parent_role,
                           situation, prior, pool)
-    max_repairs = max(0, int(fcfg.get("format_repair_attempts", 1)))
+    max_repairs = validate_repair_attempts(
+        fcfg.get("format_repair_attempts", 1))
     last_content, last_error = "", ""
 
     for attempt in range(1, max_repairs + 2):

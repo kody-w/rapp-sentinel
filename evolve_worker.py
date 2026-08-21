@@ -39,6 +39,7 @@ import fcntl
 import hashlib
 import json
 import os
+import posixpath
 import re
 import pwd
 import shlex
@@ -54,7 +55,7 @@ import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlsplit
 
 import neighborhood as NB
@@ -101,6 +102,22 @@ WORKER_DEFAULTS = {
     "max_meta_bytes": 262144,
     "max_state_bytes": 262144,
     "notify_declines": False,
+    # Optional second deployment. The canonical submission still lands in
+    # repo; this adapter mirrors the verified bytes into a RAPP Vision channel
+    # and finalization waits until both Pages surfaces answer.
+    "rapp_vision": {
+        "enabled": False,
+        "repo": "kody-w/rapp-vision",
+        "base_branch": "main",
+        "channel_id": "dada-collective",
+        "channel_name": "Dada Collective",
+        "channel_path": "dada/channel.json",
+        "media_dir": "dada/media",
+        "registry_path": "channels.json",
+        "branch_prefix": "art/dada-vision",
+        "player_url": "https://kody-w.github.io/rapp-vision",
+        "duration": 60,
+    },
     # Bounded sub-sentinel fan-out (subsentinels.py). Off by default; see
     # FANOUT_DEFAULTS there for the caps every key inherits.
     "fanout": {},
@@ -157,6 +174,10 @@ class AbortError(RuntimeError):
 
 class CommandError(RuntimeError):
     """A git/gh command failed or timed out."""
+
+
+class DeploymentPending(RuntimeError):
+    """A merge is real but both public Pages deployments are not ready yet."""
 
 
 # ── the process tree ────────────────────────────────────────────────────────
@@ -265,6 +286,232 @@ def roles_for(wcfg):
     declared = wcfg.get("roles") or []
     roles = [r for r in declared if r in NB.NEIGHBORS]
     return roles or list(NB.NEIGHBORS)
+
+
+VISION_CHANNEL_SCHEMA = "rapp-vision-channel/1.0"
+VISION_NETWORK_SCHEMA = "rapp-vision-network/1.0"
+
+
+def _repo_relative_path(value, label):
+    text = str(value or "").strip().strip("/")
+    path = PurePosixPath(text)
+    if (not text or path.is_absolute() or ".." in path.parts
+            or any(not part or part.startswith(".") for part in path.parts)):
+        raise GateError(f"{label} must be a plain repository-relative path")
+    return path.as_posix()
+
+
+def vision_config(wcfg):
+    defaults = dict(WORKER_DEFAULTS["rapp_vision"])
+    block = wcfg.get("rapp_vision")
+    if isinstance(block, dict):
+        defaults.update(block)
+    defaults["enabled"] = bool(defaults.get("enabled"))
+    if not defaults["enabled"]:
+        return defaults
+    for key in ("channel_path", "media_dir", "registry_path"):
+        if defaults.get(key):
+            defaults[key] = _repo_relative_path(defaults[key], f"rapp_vision.{key}")
+    if not str(defaults.get("channel_path", "")).endswith(".json"):
+        raise GateError("rapp_vision.channel_path must end in .json")
+    if defaults.get("registry_path") and not str(
+            defaults["registry_path"]).endswith(".json"):
+        raise GateError("rapp_vision.registry_path must end in .json")
+    channel_id = str(defaults.get("channel_id") or "").strip()
+    if not SLUG_RE.fullmatch(channel_id):
+        raise GateError("rapp_vision.channel_id must be a lowercase slug")
+    defaults["channel_id"] = channel_id
+    defaults["channel_name"] = str(
+        defaults.get("channel_name") or channel_id).strip()
+    defaults["player_url"] = str(defaults.get("player_url") or "").rstrip("/")
+    if not defaults["player_url"].startswith("https://"):
+        raise GateError("rapp_vision.player_url must be https")
+    defaults["duration"] = max(12, min(600, int(defaults.get("duration") or 60)))
+    return defaults
+
+
+def vision_worker_config(wcfg, vcfg=None):
+    vcfg = vcfg or vision_config(wcfg)
+    merged = dict(wcfg)
+    merged.update({
+        "repo": vcfg["repo"],
+        "base_branch": vcfg.get("base_branch", "main"),
+        "branch_prefix": vcfg.get("branch_prefix", "art/dada-vision"),
+    })
+    return merged
+
+
+def vision_media_path(submission, vcfg):
+    extension = Path(submission["piece_path"]).suffix.lower()
+    return (PurePosixPath(vcfg["media_dir"]) /
+            f"{submission['slug']}{extension}").as_posix()
+
+
+def vision_video(submission, vcfg):
+    media = vision_media_path(submission, vcfg)
+    channel_parent = PurePosixPath(vcfg["channel_path"]).parent.as_posix()
+    thumb = posixpath.relpath(media, channel_parent if channel_parent != "." else "")
+    submitted = str(submission["meta"].get("submitted_at") or "")
+    published = submitted[:10] if re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}", submitted[:10]) else f"{sentinel.now():%Y-%m-%d}"
+    concept = concept_sentence(submission["meta"])
+    duration = int(vcfg["duration"])
+    return {
+        "id": submission["slug"],
+        "title": submission["title"],
+        "description": concept,
+        "published": published,
+        "duration": duration,
+        "width": 1280,
+        "height": 800,
+        "orientation": "landscape",
+        "tags": ["dada-collective", "public-art", "cc0"],
+        "thumb": thumb,
+        "sources": [],
+        "live": {
+            "kind": "rapp-vision-live/1.0",
+            "scenes": [
+                {
+                    "t": 0,
+                    "dur": 6,
+                    "card": {
+                        "title": submission["title"],
+                        "sub": "Dada Collective / Public Art Collective",
+                        "note": "CC0-1.0 - one finished autonomous artwork",
+                    },
+                },
+                {
+                    "t": 6,
+                    "dur": duration - 6,
+                    "app": media,
+                    "lower": {
+                        "title": submission["title"],
+                        "bench": "Public Art Collective",
+                        "fix": concept[:180],
+                    },
+                    "actions": [],
+                },
+            ],
+        },
+    }
+
+
+def vision_channel(vcfg):
+    repo = normalize_repo(vcfg["repo"], vcfg)
+    source = (f"https://github.com/{repo.owner}/{repo.name}"
+              if repo.owner and repo.name else str(vcfg["repo"]))
+    return {
+        "schema": VISION_CHANNEL_SCHEMA,
+        "id": vcfg["channel_id"],
+        "name": vcfg["channel_name"],
+        "handle": "@kody-w",
+        "tagline": "Final CC0 works from the Dada Collective, deployed only after verification.",
+        "avatar": "\U0001F3A8",
+        "links": [
+            {"label": "Public Art Collective",
+             "url": "https://kody-w.github.io/public-art-collective/"},
+            {"label": "Source repo", "url": source},
+        ],
+        "videos": [],
+    }
+
+
+def vision_registry_entry(vcfg):
+    repo = normalize_repo(vcfg["repo"], vcfg)
+    source = (f"https://github.com/{repo.owner}/{repo.name}"
+              if repo.owner and repo.name else str(vcfg["repo"]))
+    return {
+        "id": vcfg["channel_id"],
+        "name": vcfg["channel_name"],
+        "url": vcfg["channel_path"],
+        "repo": source,
+        "_why": "Verified Dada works mirrored from the Public Art Collective.",
+    }
+
+
+def _load_json_file(path, label):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise GateError(f"{label} is unreadable: {type(e).__name__}: {e}")
+    if not isinstance(value, dict):
+        raise GateError(f"{label} must hold a JSON object")
+    return value
+
+
+def write_vision_files(clone, submission, piece_bytes, vcfg):
+    """Materialize one idempotent RAPP Vision entry in a controller clone."""
+    clone = Path(clone)
+    entry = vision_video(submission, vcfg)
+    changed = []
+
+    media_rel = vision_media_path(submission, vcfg)
+    media_path = clone / media_rel
+    if media_path.exists():
+        if media_path.read_bytes() != piece_bytes:
+            raise GateError(f"RAPP Vision media id {submission['slug']!r} "
+                            "already exists with different bytes")
+    else:
+        media_path.parent.mkdir(parents=True, exist_ok=True)
+        media_path.write_bytes(piece_bytes)
+        changed.append(media_rel)
+
+    channel_rel = vcfg["channel_path"]
+    channel_path = clone / channel_rel
+    channel = _load_json_file(channel_path, channel_rel)
+    if channel is None:
+        channel = vision_channel(vcfg)
+    if channel.get("schema") != VISION_CHANNEL_SCHEMA:
+        raise GateError(f"{channel_rel} has schema {channel.get('schema')!r}")
+    if channel.get("id") != vcfg["channel_id"]:
+        raise GateError(f"{channel_rel} has channel id {channel.get('id')!r}")
+    videos = channel.get("videos")
+    if not isinstance(videos, list):
+        raise GateError(f"{channel_rel}.videos is not a list")
+    existing = next((video for video in videos
+                     if isinstance(video, dict)
+                     and video.get("id") == submission["slug"]), None)
+    if existing is not None and existing != entry:
+        raise GateError(f"RAPP Vision entry {submission['slug']!r} "
+                        "already exists with different metadata")
+    if existing is None:
+        videos.append(entry)
+        channel_path.parent.mkdir(parents=True, exist_ok=True)
+        channel_path.write_text(
+            json.dumps(channel, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+        changed.append(channel_rel)
+
+    registry_rel = vcfg.get("registry_path")
+    if registry_rel:
+        registry_path = clone / registry_rel
+        registry = _load_json_file(registry_path, registry_rel)
+        if registry is None or registry.get("schema") != VISION_NETWORK_SCHEMA:
+            raise GateError(f"{registry_rel} is not a {VISION_NETWORK_SCHEMA}")
+        channels = registry.get("channels")
+        if not isinstance(channels, list):
+            raise GateError(f"{registry_rel}.channels is not a list")
+        wanted = vision_registry_entry(vcfg)
+        registered = next((channel for channel in channels
+                           if isinstance(channel, dict)
+                           and channel.get("id") == vcfg["channel_id"]), None)
+        if registered is not None and any(
+                registered.get(key) != wanted[key]
+                for key in ("name", "url", "repo")):
+            raise GateError(f"registry id {vcfg['channel_id']!r} points elsewhere")
+        if registered is None:
+            channels.append(wanted)
+            revision = registry.setdefault("revision", {})
+            revision["sequence"] = int(revision.get("sequence") or 0) + 1
+            revision["updated"] = f"{sentinel.now():%Y-%m-%dT%H:%M:%SZ}"
+            registry_path.write_text(
+                json.dumps(registry, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8")
+            changed.append(registry_rel)
+
+    return entry, sorted(changed)
 
 
 # ── durable state: strict on the way in, atomic on the way out ──────────────
@@ -736,13 +983,25 @@ TRUSTED_PATH_DIRS = ("/usr/bin", "/bin", "/usr/sbin", "/sbin")
 
 GIT_BINARY_CANDIDATES = ("/usr/bin/git", "/bin/git")
 
+# Where gh is looked for, in order. A fixed list, not the ambient PATH: gh
+# holds the GitHub credentials, so an attacker directory arriving early in
+# PATH must not be able to answer for it. Package-manager prefixes are here
+# because that is where a real gh lives; each candidate is still validated as
+# an absolute, regular, non-group/world-writable executable.
+GH_DISCOVERY_DIRS = ("/usr/bin", "/bin", "/usr/local/bin", "/opt/homebrew/bin",
+                     "/home/linuxbrew/.linuxbrew/bin", "/opt/local/bin",
+                     "/snap/bin")
+
 # Only these protocols. `ext::` in particular runs a command of the URL's
 # choosing, which is a remote that executes.
 GIT_ALLOWED_PROTOCOLS = "https:file"
 
-_GIT_ENV = None
-_GIT_BINARY = None
-_GH_BINARY = None
+# No module-level caches. A cached binary or environment is a choice made in
+# one pass leaking into the next — and, in tests, into the next test. Every
+# pass builds one Controller and threads it through; callers without one get a
+# context keyed by the inputs that could change it, so a patched PATH or HOME
+# produces a different context rather than a stale answer.
+_CTX_CACHE = {}
 
 
 def _trusted_executable(path, roots, label):
@@ -781,18 +1040,14 @@ def git_binary(wcfg=None):
     integrity check, the url validation, the environment allowlist — is
     reasoning about a binary somebody else chose.
     """
-    global _GIT_BINARY
     configured = (wcfg or {}).get("git_binary")
     roots = tuple((wcfg or {}).get("trusted_bin_roots") or TRUSTED_BIN_ROOTS)
     if configured:
         return _trusted_executable(configured, roots, "git_binary")
-    if _GIT_BINARY:
-        return _GIT_BINARY
     problems = []
     for candidate in GIT_BINARY_CANDIDATES:
         try:
-            _GIT_BINARY = _trusted_executable(candidate, roots, "git")
-            return _GIT_BINARY
+            return _trusted_executable(candidate, roots, "git")
         except GateError as e:
             problems.append(str(e))
     raise GateError("no trusted git binary found: " + "; ".join(problems))
@@ -806,20 +1061,15 @@ def gh_binary(wcfg=None):
     It must still be an absolute, regular, executable file that is not
     group- or world-writable, and the choice is logged rather than assumed.
     """
-    global _GH_BINARY
     configured = (wcfg or {}).get("gh_binary")
     if configured:
         return _trusted_executable(configured, ("/",), "gh_binary")
-    if _GH_BINARY:
-        return _GH_BINARY
-    found = shutil.which("gh", path=os.pathsep.join(TRUSTED_PATH_DIRS))
+    dirs = tuple((wcfg or {}).get("gh_discovery_dirs") or GH_DISCOVERY_DIRS)
+    found = shutil.which("gh", path=os.pathsep.join(dirs))
     if not found:
-        found = shutil.which("gh", path=os.environ.get("PATH", ""))
-    if not found:
-        raise CommandError("gh is not on PATH")
-    _GH_BINARY = _trusted_executable(found, ("/",), "gh")
-    log(f"using gh at {_GH_BINARY}")
-    return _GH_BINARY
+        raise CommandError(f"no gh found in {', '.join(dirs)}; set "
+                           f"evolve_worker.gh_binary to an absolute path")
+    return _trusted_executable(found, ("/",), "gh")
 
 
 def trusted_path(wcfg=None):
@@ -940,10 +1190,6 @@ def controller_git_env(home=None, wcfg=None):
     transport binaries, not LD_PRELOAD, not GIT_CONFIG_PARAMETERS, not a
     proxy, not an ssh command.
     """
-    global _GIT_ENV
-    if _GIT_ENV is not None and home is None:
-        return dict(_GIT_ENV)
-
     env = _minimal_env(wcfg=wcfg)
     git_home = Path(home) if home else (STATE / "git-home")
     for path in (git_home, git_home / "xdg", git_home / "tmp"):
@@ -979,15 +1225,13 @@ def controller_git_env(home=None, wcfg=None):
         "GIT_ALLOW_PROTOCOL": GIT_ALLOWED_PROTOCOLS,
         "GIT_PROTOCOL_FROM_USER": "0",
     })
-    if home is None:
-        _GIT_ENV = dict(env)
     return env
 
 
 PUSH_PERMISSIONS = ("ADMIN", "MAINTAIN", "WRITE")
 
 
-def assert_publish_auth(wcfg, timeout=None):
+def assert_publish_auth(wcfg, timeout=None, ctx=None):
     """Prove, BEFORE spending a model, that this cycle could publish.
 
     Three live cycles made finished art and then died at `git push`. Every
@@ -1003,31 +1247,30 @@ def assert_publish_auth(wcfg, timeout=None):
 
     Neither answer is logged. What gets recorded is that they existed.
     """
-    repo = wcfg.get("repo", "")
-    url = validate_repo_url(repo, wcfg)
-    if not url.startswith("https://"):
-        return f"local repo {url} needs no credentials"
+    ctx = ctx or controller_for(wcfg)
+    if ctx.repo is None:
+        raise AbortError("no repository is configured")
+    if ctx.repo.is_local:
+        return f"local repo {ctx.repo.transport} needs no credentials"
 
     gh_t = int(timeout or wcfg.get("gh_timeout_s", 300))
-    owner, name = art_repo({}, wcfg)
     try:
-        view = json.loads(_gh("repo", "view", f"{owner}/{name}", "--json",
-                              "viewerPermission", timeout=gh_t, wcfg=wcfg))
+        view = json.loads(_gh("repo", "view", ctx.gh_repo(), "--json",
+                              "viewerPermission", timeout=gh_t, ctx=ctx))
     except (CommandError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
-        raise AbortError(f"cannot read push permission for {owner}/{name}: "
+        raise AbortError(f"cannot read push permission for {ctx.gh_repo()}: "
                          f"{type(e).__name__}: {str(e)[:160]}")
     permission = str(view.get("viewerPermission") or "").upper()
     if permission not in PUSH_PERMISSIONS:
-        raise AbortError(f"this account's permission on {owner}/{name} is "
+        raise AbortError(f"this account's permission on {ctx.gh_repo()} is "
                          f"{permission or 'unknown'}; push needs one of "
                          f"{', '.join(PUSH_PERMISSIONS)}")
 
-    parts = urlsplit(url)
-    request = f"protocol=https\nhost={parts.hostname}\n\n"
+    request = f"protocol=https\nhost={ctx.repo.host}\n\n"
     try:
-        proc = subprocess.run([git_binary(wcfg), "credential", "fill"],
+        proc = subprocess.run([ctx.git_path, "credential", "fill"],
                               input=request, capture_output=True, text=True,
-                              timeout=gh_t, env=controller_git_env(wcfg=wcfg))
+                              timeout=gh_t, env=ctx.git_env)
     except subprocess.TimeoutExpired:
         raise AbortError("git credential fill timed out")
     if proc.returncode != 0:
@@ -1040,27 +1283,132 @@ def assert_publish_auth(wcfg, timeout=None):
     missing = [k for k in ("username", "password") if not fields.get(k)]
     if missing:
         raise AbortError(f"the credential helper returned no "
-                         f"{', '.join(missing)} for {parts.hostname}")
+                         f"{', '.join(missing)} for {ctx.repo.host}")
     # Lengths, never values.
     return (f"push permission {permission}; credentials present "
             f"(username {len(fields['username'])} chars, password "
             f"{len(fields['password'])} chars)")
 
 
-def _git(cwd, *args, timeout=600, check=True, env=None):
-    r = subprocess.run([git_binary(), *args], cwd=str(cwd),
+class RepoNames:
+    """The configured repository, in the two shapes tools actually accept.
+
+    They are not interchangeable, and mixing them is how a cycle passed its
+    auth preflight and then died at `gh pr create`: git wants a transport —
+    an https URL or a path — and gh wants `[HOST/]OWNER/REPO`. One
+    normalisation, done once, so nothing downstream has to guess which shape
+    it was handed.
+    """
+
+    __slots__ = ("transport", "gh", "owner", "name", "host", "is_local")
+
+    def __init__(self, transport, gh, owner, name, host, is_local):
+        self.transport, self.gh = transport, gh
+        self.owner, self.name, self.host = owner, name, host
+        self.is_local = is_local
+
+    def __repr__(self):
+        return f"RepoNames(transport={self.transport!r}, gh={self.gh!r})"
+
+
+def normalize_repo(repo, wcfg=None):
+    """Validate once, and return every form the rest of the pass may need."""
+    transport = validate_repo_url(repo, wcfg)
+    if not transport.startswith("https://"):
+        return RepoNames(transport, None, None, None, None, True)
+    parts = urlsplit(transport)
+    segments = [s for s in parts.path.split("/") if s]
+    owner, name = segments[0], segments[1]
+    if name.endswith(".git"):
+        name = name[:-4]
+    host = parts.hostname
+    gh_name = (f"{owner}/{name}" if host == "github.com"
+               else f"{host}/{owner}/{name}")
+    return RepoNames(transport, gh_name, owner, name, host, False)
+
+
+class Controller:
+    """One validated set of choices, for one whole pass.
+
+    The pinned git and gh binaries, the sanitized git environment with its
+    generated credential helper, the gh environment that may see the real
+    HOME and gh config, and both repository forms — resolved once, together,
+    and threaded through every call. Before this, a preflight could validate
+    one gh binary and the merge could resolve another, or a fake config could
+    win after the checks had already passed.
+    """
+
+    def __init__(self, wcfg=None, git_home=None):
+        self.wcfg = dict(wcfg or {})
+        self.git_path = git_binary(self.wcfg)
+        self.repo = normalize_repo(self.wcfg["repo"], self.wcfg) \
+            if self.wcfg.get("repo") else None
+        self._gh_path = None
+        self._gh_env = None
+        self.git_home = Path(git_home) if git_home else (STATE / "git-home")
+        self.git_env = controller_git_env(self.git_home, self.wcfg)
+
+    @property
+    def gh_path(self):
+        if self._gh_path is None:
+            self._gh_path = gh_binary(self.wcfg)
+        return self._gh_path
+
+    @property
+    def gh_env(self):
+        if self._gh_env is None:
+            self._gh_env = controller_gh_env(self.wcfg)
+        return self._gh_env
+
+    def gh_repo(self):
+        """The `[HOST/]OWNER/REPO` gh insists on.
+
+        A local path has no such name; that only happens in tests, where gh
+        is a stand-in anyway, so it keeps the configured value and a real gh
+        would say plainly that it is not a repository.
+        """
+        if not self.repo:
+            raise GateError("no repository is configured")
+        return self.repo.gh or self.repo.transport
+
+
+def controller_for(wcfg=None, git_home=None):
+    """A context for this pass, cached only by what can change it."""
+    if git_home is not None:
+        return Controller(wcfg, git_home)
+    key = (json.dumps({k: v for k, v in sorted((wcfg or {}).items())
+                       if k in ("repo", "git_binary", "gh_binary",
+                                "gh_config_dir", "trusted_bin_roots",
+                                "trusted_path_dirs", "allowed_repo_hosts",
+                                "base_branch")}, default=str),
+           os.environ.get("PATH", ""), str(REAL_HOME))
+    ctx = _CTX_CACHE.get(key)
+    if ctx is None:
+        ctx = Controller(wcfg, git_home)
+        _CTX_CACHE[key] = ctx
+    return ctx
+
+
+def reset_controllers():
+    """Drop every cached context. Tests and long-lived processes call this."""
+    _CTX_CACHE.clear()
+
+
+def _git(cwd, *args, timeout=600, check=True, env=None, ctx=None):
+    ctx = ctx or controller_for()
+    r = subprocess.run([ctx.git_path, *args], cwd=str(cwd),
                        capture_output=True, text=True, timeout=timeout,
-                       env=env if env is not None else controller_git_env())
+                       env=env if env is not None else ctx.git_env)
     if check and r.returncode != 0:
         raise CommandError(f"git {' '.join(args)} exited {r.returncode}: "
                            f"{(r.stderr or r.stdout or '').strip()[:300]}")
     return r.stdout
 
 
-def _git_bytes(cwd, *args, timeout=600):
-    r = subprocess.run([git_binary(), *args], cwd=str(cwd),
-                       capture_output=True, timeout=timeout,
-                       env=controller_git_env())
+def _git_bytes(cwd, *args, timeout=600, ctx=None):
+    ctx = ctx or controller_for()
+    r = subprocess.run([ctx.git_path, *args], cwd=str(cwd),
+                       capture_output=True, timeout=timeout, env=ctx.git_env)
     if r.returncode != 0:
         raise CommandError(f"git {' '.join(args)} exited {r.returncode}")
     return r.stdout
@@ -1123,7 +1471,7 @@ NETWORK_GIT_VERBS = ("fetch", "push", "pull", "ls-remote", "clone",
                      "submodule", "archive")
 
 
-def _git_remote(clone, wcfg, *args, timeout=600, check=True):
+def _git_remote(clone, wcfg, *args, timeout=600, check=True, ctx=None):
     """Every git call that can reach the network goes through here.
 
     Not because callers are careless, but because "remember to check first"
@@ -1133,17 +1481,18 @@ def _git_remote(clone, wcfg, *args, timeout=600, check=True):
     branch orphaned on ours. The integrity check now lives at the chokepoint,
     so a new call site inherits it instead of having to remember it.
     """
+    ctx = ctx or controller_for(wcfg)
     verb = next((a for a in args if not a.startswith("-")), "")
     if verb not in NETWORK_GIT_VERBS:
         raise CommandError(f"_git_remote used for a local verb: {verb!r}")
-    assert_repo_integrity(clone, wcfg)
-    return _git(clone, *args, timeout=timeout, check=check)
+    assert_repo_integrity(clone, wcfg, ctx=ctx)
+    return _git(clone, *args, timeout=timeout, check=check, ctx=ctx)
 
 
-def _gh(*args, timeout=300, wcfg=None):
-    r = subprocess.run([gh_binary(wcfg), *args], capture_output=True,
-                       text=True, timeout=timeout,
-                       env=controller_gh_env(wcfg))
+def _gh(*args, timeout=300, wcfg=None, ctx=None):
+    ctx = ctx or controller_for(wcfg)
+    r = subprocess.run([ctx.gh_path, *args], capture_output=True,
+                       text=True, timeout=timeout, env=ctx.gh_env)
     if r.returncode != 0:
         raise CommandError(f"gh {' '.join(args)} exited {r.returncode}: "
                            f"{(r.stderr or r.stdout or '').strip()[:300]}")
@@ -1233,9 +1582,10 @@ def maker_argv(wcfg, staging, prompt="P"):
 
 # ── the deterministic gate ──────────────────────────────────────────────────
 
-def working_tree_changes(clone, timeout=600):
+def working_tree_changes(clone, timeout=600, ctx=None):
     """Every change in the clone, as (code, path, origin) triples."""
-    raw = _git(clone, "status", "--porcelain=v1", "-z", "-uall", timeout=timeout)
+    raw = _git(clone, "status", "--porcelain=v1", "-z", "-uall",
+               timeout=timeout, ctx=ctx)
     parts = [p for p in raw.split("\0") if p]
     changes, i = [], 0
     while i < len(parts):
@@ -1908,10 +2258,11 @@ def gate_directory(root, wcfg, expected_cycle, expected_previous,
     }
 
 
-def base_branch_slugs(clone, base_branch, wcfg):
+def base_branch_slugs(clone, base_branch, wcfg, ctx=None):
     """Every slug already published, read by the controller from its clone."""
+    ctx = ctx or controller_for(wcfg)
     listing = _git(clone, "ls-tree", "--name-only", base_branch, "submissions/",
-                   timeout=int(wcfg.get("git_timeout_s", 600)))
+                   timeout=int(wcfg.get("git_timeout_s", 600)), ctx=ctx)
     return {line.strip("/").split("/")[-1]
             for line in listing.splitlines() if line.strip()}
 
@@ -1937,19 +2288,20 @@ def install_into_clone(clone, submission):
     return directory
 
 
-def verify_clone_scope(clone, submission, wcfg, base_sha=None):
+def verify_clone_scope(clone, submission, wcfg, base_sha=None, ctx=None):
     """After the copy, the controller's clone must hold exactly two new files.
 
     The maker never had this directory — this catches the controller's own
     mistakes, and anything else that touched the clone while we worked.
     """
+    ctx = ctx or controller_for(wcfg)
     clone = Path(clone)
     git_t = int(wcfg.get("git_timeout_s", 600))
     if base_sha:
-        head = _git(clone, "rev-parse", "HEAD", timeout=git_t).strip()
+        head = _git(clone, "rev-parse", "HEAD", timeout=git_t, ctx=ctx).strip()
         if head != base_sha:
             raise GateError("the controller's clone moved its HEAD unexpectedly")
-    changes = working_tree_changes(clone, timeout=git_t)
+    changes = working_tree_changes(clone, timeout=git_t, ctx=ctx)
     slug, files = _new_submission_dir(changes)
     if slug != submission["slug"]:
         raise GateError(f"the clone holds {slug!r}, expected "
@@ -1984,7 +2336,7 @@ ALLOWED_CONFIG_KEYS = {
 }
 
 
-def assert_repo_integrity(clone, wcfg):
+def assert_repo_integrity(clone, wcfg, ctx=None):
     """Prove, immediately before touching git, that this is still OUR clone.
 
     A bounded repro of the real finding: the maker wrote into `clone/.git`,
@@ -1993,9 +2345,11 @@ def assert_repo_integrity(clone, wcfg):
     can no longer reach a repository at all — and this runs anyway, before
     every git operation, because "cannot happen" is not a check (#1).
     """
+    ctx = ctx or controller_for(wcfg)
     clone = Path(clone)
     git_t = int(wcfg.get("git_timeout_s", 600))
-    canonical = validate_repo_url(wcfg["repo"], wcfg)
+    canonical = (ctx.repo.transport if ctx.repo
+                 else validate_repo_url(wcfg["repo"], wcfg))
 
     dot_git = clone / ".git"
     if not dot_git.is_dir():
@@ -2016,13 +2370,14 @@ def assert_repo_integrity(clone, wcfg):
     # continuing would be treating an intrusion as a formatting problem.
     existing_push = _git(clone, "config", "--local", "--get-all",
                          "remote.origin.pushurl", timeout=git_t,
-                         check=False).strip()
+                         check=False, ctx=ctx).strip()
     if existing_push:
         raise GateError(f"the clone has a remote.origin.pushurl "
                         f"({existing_push.splitlines()[0][:80]}) — refusing to "
                         f"push anywhere but {canonical}")
 
-    raw = _git(clone, "config", "--local", "--list", timeout=git_t, check=False)
+    raw = _git(clone, "config", "--local", "--list", timeout=git_t,
+               check=False, ctx=ctx)
     for line in raw.splitlines():
         key = line.split("=", 1)[0].strip().lower()
         if not key or key in ALLOWED_CONFIG_KEYS:
@@ -2033,10 +2388,12 @@ def assert_repo_integrity(clone, wcfg):
             raise GateError(f"the clone carries an unexpected git config key: "
                             f"{key}")
 
-    _git(clone, "remote", "set-url", "origin", canonical, timeout=git_t)
-    fetch_url = _git(clone, "remote", "get-url", "origin", timeout=git_t).strip()
+    _git(clone, "remote", "set-url", "origin", canonical, timeout=git_t,
+         ctx=ctx)
+    fetch_url = _git(clone, "remote", "get-url", "origin", timeout=git_t,
+                     ctx=ctx).strip()
     push_url = _git(clone, "remote", "get-url", "--push", "origin",
-                    timeout=git_t).strip()
+                    timeout=git_t, ctx=ctx).strip()
     if fetch_url != canonical or push_url != canonical:
         raise GateError(f"origin points at {fetch_url!r}/{push_url!r}, expected "
                         f"{canonical!r}")
@@ -2085,7 +2442,7 @@ def probe_health(health, phase, wcfg):
     return verdict
 
 
-def verify_staged_tree(clone, submission, wcfg, paths):
+def verify_staged_tree(clone, submission, wcfg, paths, ctx=None):
     """What git will actually push, checked before anything leaves the machine.
 
     The working tree was gated; the INDEX is what gets pushed, and they are
@@ -2094,11 +2451,12 @@ def verify_staged_tree(clone, submission, wcfg, paths):
     post-merge verification would then be confirming something a human already
     merged (#3).
     """
+    ctx = ctx or controller_for(wcfg)
     git_t = int(wcfg.get("git_timeout_s", 600))
     staged = []
     for line in _git(clone, "ls-files", "--stage", "--",
                      f"submissions/{submission['slug']}",
-                     timeout=git_t).splitlines():
+                     timeout=git_t, ctx=ctx).splitlines():
         if not line.strip():
             continue
         info, _, path = line.partition("\t")
@@ -2115,17 +2473,20 @@ def verify_staged_tree(clone, submission, wcfg, paths):
                             f"100644 (a symlink stages as 120000)")
         if stage != "0":
             raise GateError(f"{path} is staged unmerged (stage {stage})")
-        kind = _git(clone, "cat-file", "-t", blob, timeout=git_t).strip()
+        kind = _git(clone, "cat-file", "-t", blob, timeout=git_t,
+                    ctx=ctx).strip()
         if kind != "blob":
             raise GateError(f"{path} points at a {kind}, not a blob")
-        body = _git_bytes(clone, "cat-file", "blob", blob, timeout=git_t)
+        body = _git_bytes(clone, "cat-file", "blob", blob, timeout=git_t,
+                          ctx=ctx)
         if hashlib.sha256(body).hexdigest() != digests[path]:
             raise GateError(f"{path} in the index is not the file that passed "
                             f"the gate")
     return {path: blob for _, blob, _, path in staged}
 
 
-def publish(clone, submission, wcfg, health, branch=None, transaction=None):
+def publish(clone, submission, wcfg, health, branch=None, transaction=None,
+            ctx=None):
     """Branch, commit, PR, verify, re-check health, merge, re-read main.
 
     Every remote step is preceded by a health run and followed by evidence
@@ -2139,8 +2500,9 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None):
     a process killed between the merge call and the ledger write can be
     reconciled on the next pass instead of losing a merged submission.
     """
+    ctx = ctx or controller_for(wcfg)
     clone = Path(clone)
-    repo = wcfg["repo"]
+    repo = ctx.gh_repo()
     base = wcfg.get("base_branch", "main")
     git_t = int(wcfg.get("git_timeout_s", 600))
     gh_t = int(wcfg.get("gh_timeout_s", 300))
@@ -2153,23 +2515,25 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None):
     # ran before the model: that reading is up to half an hour old by now, and
     # the estate is exactly what may have changed while the model thought.
     probe_health(health, "pre-write", wcfg)
-    assert_repo_integrity(clone, wcfg)
+    assert_repo_integrity(clone, wcfg, ctx=ctx)
 
-    _git_remote(clone, wcfg, "fetch", "--no-tags", "origin", base, timeout=git_t)
-    _git(clone, "checkout", "-b", branch, f"origin/{base}", timeout=git_t)
+    _git_remote(clone, wcfg, "fetch", "--no-tags", "origin", base,
+                timeout=git_t, ctx=ctx)
+    _git(clone, "checkout", "-b", branch, f"origin/{base}", timeout=git_t,
+         ctx=ctx)
     still_new = _git(clone, "ls-tree", "--name-only", f"origin/{base}",
-                     f"submissions/{slug}/", timeout=git_t).strip()
+                     f"submissions/{slug}/", timeout=git_t, ctx=ctx).strip()
     if still_new:
         raise GateError(f"slug {slug!r} appeared on origin/{base} while we worked")
 
-    _git(clone, "add", "--", f"submissions/{slug}", timeout=git_t)
+    _git(clone, "add", "--", f"submissions/{slug}", timeout=git_t, ctx=ctx)
     staged = [ln.split("\t") for ln in
               _git(clone, "diff", "--cached", "--name-status",
-                   timeout=git_t).splitlines() if ln.strip()]
+                   timeout=git_t, ctx=ctx).splitlines() if ln.strip()]
     if sorted(p for _, p in staged) != paths or any(s != "A" for s, _ in staged):
         raise GateError(f"staged set is {staged}, expected exactly two additions "
                         f"{paths}")
-    blobs = verify_staged_tree(clone, submission, wcfg, paths)
+    blobs = verify_staged_tree(clone, submission, wcfg, paths, ctx)
 
     message = (f"art: {submission['title']} ({slug})\n\n"
                f"Autonomous submission by the {wcfg.get('role', 'evolve')} "
@@ -2179,14 +2543,14 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None):
                f"{CANDIDATES_PER_ROUND} candidates.\n")
     _git(clone, "-c", f"user.name={wcfg['git_author_name']}",
          "-c", f"user.email={wcfg['git_author_email']}",
-         "commit", "-m", message, timeout=git_t)
-    head = _git(clone, "rev-parse", "HEAD", timeout=git_t).strip()
+         "commit", "-m", message, timeout=git_t, ctx=ctx)
+    head = _git(clone, "rev-parse", "HEAD", timeout=git_t, ctx=ctx).strip()
     note(phase="committed", branch=branch, commit=head, blobs=blobs, paths=paths)
     # The last thing before bytes leave this machine: the chokepoint proves
     # the remote is still the one we configured, not one somebody wrote into
     # .git after the last check.
     _git_remote(clone, wcfg, "push", "--set-upstream", "origin", branch,
-                timeout=git_t)
+                timeout=git_t, ctx=ctx)
     note(phase="pushed", branch=branch, commit=head)
 
     pr_url, pr_number = "", ""
@@ -2195,14 +2559,15 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None):
         pr_url = _gh("pr", "create", "--repo", repo, "--base", base,
                      "--head", branch, "--title",
                      f"art: {submission['title']} ({slug})",
-                     "--body", body, timeout=gh_t).strip().splitlines()[-1].strip()
+                     "--body", body, timeout=gh_t,
+                     ctx=ctx).strip().splitlines()[-1].strip()
         pr_number = pr_url.rstrip("/").split("/")[-1]
         note(phase="pr-open", pr_url=pr_url, pr_number=pr_number)
 
         # What GitHub says the PR contains, not what we think we pushed.
         view = json.loads(_gh("pr", "view", pr_number, "--repo", repo, "--json",
                               "files,state,baseRefName,headRefName,isCrossRepository",
-                              timeout=gh_t))
+                              timeout=gh_t, ctx=ctx))
         remote_paths = sorted(f.get("path") for f in view.get("files", []))
         if remote_paths != paths:
             raise GateError(f"the PR touches {remote_paths}, expected {paths}")
@@ -2218,7 +2583,7 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None):
 
         note(phase="merging", pr_url=pr_url, pr_number=pr_number)
         _gh("pr", "merge", pr_number, "--repo", repo, "--squash",
-            "--delete-branch", timeout=gh_t)
+            "--delete-branch", timeout=gh_t, ctx=ctx)
         note(phase="merge-called", pr_url=pr_url, pr_number=pr_number)
     except BaseException:
         # EVERY exception, not three named ones: a gh timeout, a malformed
@@ -2226,31 +2591,33 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None):
         # this function. Whatever it was, an open PR nobody is going to
         # finish is worse than no PR.
         if pr_number:
-            _close_pr(repo, pr_number, gh_t)
+            _close_pr(repo, pr_number, gh_t, ctx)
         else:
-            _delete_remote_branch(clone, branch, wcfg, git_t)
+            _delete_remote_branch(clone, branch, wcfg, git_t, ctx)
         note(phase="cleaned-up")
         raise
 
-    receipts = confirm_merge(clone, submission, wcfg, pr_number, paths)
+    receipts = confirm_merge(clone, submission, wcfg, pr_number, paths, ctx)
     receipts.update({"branch": branch, "commit": head, "pr_url": pr_url,
                      "pr_number": pr_number})
     note(phase="merged", **receipts)
     return receipts
 
 
-def confirm_merge(clone, submission, wcfg, pr_number, paths):
+def confirm_merge(clone, submission, wcfg, pr_number, paths, ctx=None):
     """Evidence, freshly re-read: merged state, merge commit, its file scope,
     and the bytes now living on the base branch (R1). Used both by publish()
     and by reconciliation of a cycle that died mid-flight."""
+    ctx = ctx or controller_for(wcfg)
     clone = Path(clone)
-    repo = wcfg["repo"]
+    repo = ctx.gh_repo()
     base = wcfg.get("base_branch", "main")
     git_t = int(wcfg.get("git_timeout_s", 600))
     gh_t = int(wcfg.get("gh_timeout_s", 300))
 
     merged = json.loads(_gh("pr", "view", str(pr_number), "--repo", repo,
-                            "--json", "state,merged,mergeCommit", timeout=gh_t))
+                            "--json", "state,merged,mergeCommit",
+                            timeout=gh_t, ctx=ctx))
     if not merged.get("merged") or str(merged.get("state")).upper() != "MERGED":
         raise CommandError(f"PR {pr_number} is not merged: "
                            f"{merged.get('state')!r}")
@@ -2258,37 +2625,39 @@ def confirm_merge(clone, submission, wcfg, pr_number, paths):
     if not merge_sha:
         raise CommandError(f"PR {pr_number} reports no merge commit")
 
-    _git_remote(clone, wcfg, "fetch", "--no-tags", "origin", base, timeout=git_t)
-    main_sha = _git(clone, "rev-parse", f"origin/{base}", timeout=git_t).strip()
+    _git_remote(clone, wcfg, "fetch", "--no-tags", "origin", base,
+                timeout=git_t, ctx=ctx)
+    main_sha = _git(clone, "rev-parse", f"origin/{base}", timeout=git_t,
+                    ctx=ctx).strip()
     _git(clone, "merge-base", "--is-ancestor", merge_sha, f"origin/{base}",
-         timeout=git_t)
+         timeout=git_t, ctx=ctx)
     touched = [ln.split("\t") for ln in
                _git(clone, "show", "--name-status", "--format=", merge_sha,
-                    timeout=git_t).splitlines() if ln.strip()]
+                    timeout=git_t, ctx=ctx).splitlines() if ln.strip()]
     if sorted(p for _, p in touched) != paths or any(s != "A" for s, _ in touched):
         raise CommandError(f"the merge commit touches {touched}, expected exactly "
                            f"two additions {paths}")
     for path, digest in ((submission["meta_path"], submission["meta_sha256"]),
                          (submission["piece_path"], submission["piece_sha256"])):
         blob = _git_bytes(clone, "cat-file", "blob", f"origin/{base}:{path}",
-                          timeout=git_t)
+                          timeout=git_t, ctx=ctx)
         if hashlib.sha256(blob).hexdigest() != digest:
             raise CommandError(f"{path} on origin/{base} is not the file we gated")
     return {"merge_commit": merge_sha, "base_sha": main_sha, "paths": paths}
 
 
-def _close_pr(repo, pr_number, timeout):
+def _close_pr(repo, pr_number, timeout, ctx=None):
     if not pr_number:
         return
     try:
         _gh("pr", "close", str(pr_number), "--repo", repo, "--delete-branch",
-            timeout=timeout)
+            timeout=timeout, ctx=ctx)
         log(f"closed PR {pr_number} after aborting the cycle")
     except Exception as e:
         log(f"could not close PR {pr_number}: {type(e).__name__}: {e}")
 
 
-def _delete_remote_branch(clone, branch, wcfg, timeout=None):
+def _delete_remote_branch(clone, branch, wcfg, timeout=None, ctx=None):
     """Remove a branch we pushed, from the canonical repo and nowhere else.
 
     Two paths, and neither can reach a remote we did not configure:
@@ -2305,10 +2674,17 @@ def _delete_remote_branch(clone, branch, wcfg, timeout=None):
     trustworthy.
     """
     timeout = int(timeout or wcfg.get("git_timeout_s", 600))
-    canonical = _repo_url(wcfg["repo"])
+    try:
+        ctx = ctx or controller_for(wcfg)
+        canonical = ctx.repo.transport
+    except (GateError, CommandError) as e:
+        # Cleanup cannot invent a destination. Without a canonical repo there
+        # is nothing safe to push a deletion to, so say so and stop.
+        log(f"cannot delete branch {branch}: {type(e).__name__}: {e}")
+        return False
     try:
         _git_remote(clone, wcfg, "push", "origin", "--delete", branch,
-                    timeout=timeout)
+                    timeout=timeout, ctx=ctx)
         log(f"deleted the pushed branch {branch} after aborting the cycle")
         return True
     except GateError as e:
@@ -2319,21 +2695,20 @@ def _delete_remote_branch(clone, branch, wcfg, timeout=None):
             f"{type(e).__name__}: {e}")
 
     scratch = Path(clone).parent / f"cleanup-{uuid.uuid4().hex[:8]}"
-    env = controller_git_env()
+    env = ctx.git_env
     try:
-        canonical = validate_repo_url(wcfg["repo"], wcfg)
         scratch.mkdir(parents=True, exist_ok=True)
-        _git(scratch, "init", "-q", timeout=timeout, env=env)
+        _git(scratch, "init", "-q", timeout=timeout, env=env, ctx=ctx)
         # sanctioned-network-git: a fresh empty repo with no origin to
         # verify, addressing the validated canonical url explicitly, in the
         # sanitized environment. This is the path that exists BECAUSE the
         # clone could not be trusted.
         _git(scratch, "push", canonical, "--delete", branch, timeout=timeout,
-             env=env)
+             env=env, ctx=ctx)
         # sanctioned-network-git: read-back confirmation on the same
         # sanitized repo and the same validated url.
         left = _git(scratch, "ls-remote", "--heads", canonical, branch,
-                    timeout=timeout, env=env, check=False)
+                    timeout=timeout, env=env, check=False, ctx=ctx)
         if left.strip():
             log(f"branch {branch} still exists on {canonical} after deletion")
             return False
@@ -2364,6 +2739,244 @@ def _pr_body(submission, wcfg):
         f"controller validated the working tree against the submission protocol "
         f"and owns every git and GitHub operation here.\n"
     )
+
+
+def vision_urls(vcfg, submission):
+    repo = normalize_repo(vcfg["repo"], vcfg)
+    if not repo.owner or not repo.name:
+        return {"watch_url": "", "channel_url": "", "media_url": "",
+                "source_url": ""}
+    root = f"https://{repo.owner.lower()}.github.io/{repo.name}"
+    media_path = "/".join(
+        quote(part, safe="") for part in vision_media_path(
+            submission, vcfg).split("/"))
+    channel_path = "/".join(
+        quote(part, safe="") for part in vcfg["channel_path"].split("/"))
+    return {
+        "watch_url": (f"{vcfg['player_url']}/#/watch/"
+                      f"{quote(submission['slug'], safe='')}"),
+        "channel_url": f"{root}/{channel_path}",
+        "media_url": f"{root}/{media_path}",
+        "source_url": (f"https://github.com/{repo.owner}/{repo.name}/blob/"
+                       f"{quote(str(vcfg.get('base_branch', 'main')), safe='')}/"
+                       f"{media_path}"),
+    }
+
+
+def confirm_vision_state(clone, submission, piece_bytes, vcfg, ctx,
+                         merge_sha="", expected_paths=None):
+    clone = Path(clone)
+    base = vcfg.get("base_branch", "main")
+    git_t = int(vcfg.get("git_timeout_s", 600))
+    media_rel = vision_media_path(submission, vcfg)
+    channel_rel = vcfg["channel_path"]
+    media = _git_bytes(clone, "cat-file", "blob",
+                       f"origin/{base}:{media_rel}", timeout=git_t, ctx=ctx)
+    if media != piece_bytes:
+        raise CommandError(f"{media_rel} on origin/{base} is not the gated art")
+    channel_blob = _git_bytes(
+        clone, "cat-file", "blob", f"origin/{base}:{channel_rel}",
+        timeout=git_t, ctx=ctx)
+    try:
+        channel = json.loads(channel_blob.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise CommandError(f"{channel_rel} on origin/{base} is invalid: {e}")
+    expected_entry = vision_video(submission, vcfg)
+    actual = next((video for video in channel.get("videos", [])
+                   if isinstance(video, dict)
+                   and video.get("id") == submission["slug"]), None)
+    if actual != expected_entry:
+        raise CommandError(f"{channel_rel} does not contain the verified "
+                           f"{submission['slug']!r} entry")
+    registry_rel = vcfg.get("registry_path")
+    if registry_rel:
+        registry_blob = _git_bytes(
+            clone, "cat-file", "blob", f"origin/{base}:{registry_rel}",
+            timeout=git_t, ctx=ctx)
+        try:
+            registry = json.loads(registry_blob.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise CommandError(f"{registry_rel} on origin/{base} is invalid: {e}")
+        registered = next((item for item in registry.get("channels", [])
+                           if isinstance(item, dict)
+                           and item.get("id") == vcfg["channel_id"]), None)
+        wanted = vision_registry_entry(vcfg)
+        if registered is None or any(
+                registered.get(key) != wanted[key]
+                for key in ("name", "url", "repo")):
+            raise CommandError(f"{registry_rel} does not register "
+                               f"{vcfg['channel_id']!r}")
+    base_sha = _git(clone, "rev-parse", f"origin/{base}",
+                    timeout=git_t, ctx=ctx).strip()
+    receipts = {
+        "merge_commit": merge_sha or base_sha,
+        "base_sha": base_sha,
+        "paths": sorted(expected_paths or [media_rel, channel_rel]),
+        **vision_urls(vcfg, submission),
+    }
+    return receipts
+
+
+def publish_rapp_vision(workspace, submission, piece_bytes, wcfg, health,
+                        transaction=None, ctx=None):
+    """Deploy the already-gated art into its RAPP Vision channel.
+
+    The adapter is idempotent against origin/main. A crash after the merge but
+    before the collective ledger moves simply re-enters here, sees the exact
+    media and channel entry, and returns the same public receipts.
+    """
+    vcfg = vision_config(wcfg)
+    if not vcfg["enabled"]:
+        return {}
+    vwcfg = vision_worker_config(wcfg, vcfg)
+    ctx = ctx or controller_for(
+        vwcfg, git_home=STATE / "git-home-rapp-vision")
+    clone = Path(workspace) / "vision-clone"
+    base = vcfg.get("base_branch", "main")
+    git_t = int(vwcfg.get("git_timeout_s", 600))
+    gh_t = int(vwcfg.get("gh_timeout_s", 300))
+    repo = ctx.gh_repo()
+    note = transaction or (lambda **_: None)
+
+    _clone_repo(vwcfg, clone, ctx)
+    assert_repo_integrity(clone, vwcfg, ctx=ctx)
+    entry, changed = write_vision_files(
+        clone, submission, piece_bytes, vcfg)
+    if not changed:
+        return confirm_vision_state(
+            clone, submission, piece_bytes, vcfg, ctx)
+    _git(clone, "reset", "--hard", f"origin/{base}", timeout=git_t, ctx=ctx)
+    _git(clone, "clean", "-fd", timeout=git_t, ctx=ctx)
+
+    branch = (f"{vcfg.get('branch_prefix', 'art/dada-vision')}/"
+              f"{submission['slug']}-{uuid.uuid4().hex[:8]}")
+    probe_health(health, "pre-vision-write", wcfg)
+    _git(clone, "checkout", "-b", branch, f"origin/{base}",
+         timeout=git_t, ctx=ctx)
+    # Reapply after checkout because the base checkout replaced the prepared
+    # working tree.
+    entry, changed = write_vision_files(
+        clone, submission, piece_bytes, vcfg)
+    _git(clone, "add", "--", *changed, timeout=git_t, ctx=ctx)
+    staged = [line.split("\t") for line in
+              _git(clone, "diff", "--cached", "--name-status",
+                   timeout=git_t, ctx=ctx).splitlines() if line.strip()]
+    if sorted(path for _, path in staged) != sorted(changed):
+        raise GateError(f"RAPP Vision staged set is {staged}, expected {changed}")
+    if any(status not in ("A", "M") for status, _ in staged):
+        raise GateError(f"RAPP Vision staged an unsupported change: {staged}")
+    _git(clone, "-c", f"user.name={wcfg['git_author_name']}",
+         "-c", f"user.email={wcfg['git_author_email']}",
+         "commit", "-m",
+         f"art: deploy {submission['title']} to RAPP Vision",
+         timeout=git_t, ctx=ctx)
+    head = _git(clone, "rev-parse", "HEAD", timeout=git_t, ctx=ctx).strip()
+    note(vision_phase="committed", vision_branch=branch,
+         vision_commit=head, vision_paths=changed)
+    _git_remote(clone, vwcfg, "push", "--set-upstream", "origin", branch,
+                timeout=git_t, ctx=ctx)
+    note(vision_phase="pushed")
+
+    pr_number = ""
+    try:
+        pr_url = _gh(
+            "pr", "create", "--repo", repo, "--base", base, "--head", branch,
+            "--title", f"art: {submission['title']} on RAPP Vision",
+            "--body",
+            "Deploy the exact gated CC0 artwork from Public Art Collective "
+            f"as `{vcfg['channel_id']}` entry `{submission['slug']}`.",
+            timeout=gh_t, ctx=ctx).strip().splitlines()[-1].strip()
+        pr_number = pr_url.rstrip("/").split("/")[-1]
+        note(vision_phase="pr-open", vision_pr_url=pr_url,
+             vision_pr_number=pr_number)
+        view = json.loads(_gh(
+            "pr", "view", pr_number, "--repo", repo, "--json",
+            "files,state,baseRefName,headRefName,isCrossRepository",
+            timeout=gh_t, ctx=ctx))
+        remote_paths = sorted(item.get("path") for item in view.get("files", []))
+        if remote_paths != sorted(changed):
+            raise GateError(f"RAPP Vision PR touches {remote_paths}, "
+                            f"expected {sorted(changed)}")
+        if view.get("baseRefName") != base or view.get("headRefName") != branch:
+            raise GateError("RAPP Vision PR branch or base changed")
+        probe_health(health, "pre-vision-merge", wcfg)
+        note(vision_phase="merging")
+        _gh("pr", "merge", pr_number, "--repo", repo, "--squash",
+            "--delete-branch", timeout=gh_t, ctx=ctx)
+        note(vision_phase="merge-called")
+    except BaseException:
+        if pr_number:
+            _close_pr(repo, pr_number, gh_t, ctx)
+        else:
+            _delete_remote_branch(clone, branch, vwcfg, git_t, ctx)
+        note(vision_phase="cleaned-up")
+        raise
+
+    merged = json.loads(_gh(
+        "pr", "view", pr_number, "--repo", repo, "--json",
+        "state,merged,mergeCommit", timeout=gh_t, ctx=ctx))
+    if not merged.get("merged") or str(merged.get("state")).upper() != "MERGED":
+        raise CommandError(f"RAPP Vision PR {pr_number} is not merged")
+    merge_sha = ((merged.get("mergeCommit") or {}).get("oid") or "").strip()
+    _git_remote(clone, vwcfg, "fetch", "--no-tags", "origin", base,
+                timeout=git_t, ctx=ctx)
+    _git(clone, "merge-base", "--is-ancestor", merge_sha, f"origin/{base}",
+         timeout=git_t, ctx=ctx)
+    touched = [line.split("\t") for line in
+               _git(clone, "show", "--name-status", "--format=", merge_sha,
+                    timeout=git_t, ctx=ctx).splitlines() if line.strip()]
+    if sorted(path for _, path in touched) != sorted(changed):
+        raise CommandError(f"RAPP Vision merge touches {touched}, "
+                           f"expected {changed}")
+    if any(status not in ("A", "M") for status, _ in touched):
+        raise CommandError(f"RAPP Vision merge has unsupported changes {touched}")
+    receipts = confirm_vision_state(
+        clone, submission, piece_bytes, vcfg, ctx, merge_sha, changed)
+    receipts.update({"branch": branch, "commit": head, "pr_url": pr_url,
+                     "pr_number": pr_number, "entry": entry})
+    note(vision_phase="merged", vision_receipts=receipts)
+    return receipts
+
+
+def verify_dual_pages(cfg, wcfg, submission, vision_receipts, probe=None,
+                      sleep=None):
+    """Require both actual GitHub Pages experiences before finalizing."""
+    vcfg = vision_config(wcfg)
+    if not vcfg["enabled"]:
+        view, kind, note = verified_view(cfg, wcfg, submission, probe, sleep)
+        return {"collective_url": view, "collective_kind": kind, "note": note}
+    probe = probe or probe_url
+    sleep = sleep or time.sleep
+    collective_url, _ = art_urls(cfg, wcfg, submission)
+    vision = vision_receipts or vision_urls(vcfg, submission)
+    required = [
+        ("Public Art Collective", collective_url),
+        ("RAPP Vision channel", vision.get("channel_url", "")),
+        ("RAPP Vision media", vision.get("media_url", "")),
+        ("RAPP Vision player", vcfg["player_url"]),
+    ]
+    timeout = int(wcfg.get("view_probe_timeout_s", 10))
+    backoff = list(wcfg.get("view_probe_backoff") or (5, 10, 20, 30))
+    attempts = max(1, int(wcfg.get("view_probe_attempts", len(backoff) + 1)))
+    last = []
+    for attempt in range(attempts):
+        last = []
+        for label, url in required:
+            ok, detail = probe(url, timeout) if url else (False, "no url")
+            if not ok:
+                last.append(f"{label}: {detail}")
+        if not last:
+            return {
+                "collective_url": collective_url,
+                "collective_kind": "pages",
+                "vision_url": vision["watch_url"],
+                "vision_channel_url": vision["channel_url"],
+                "vision_media_url": vision["media_url"],
+                "note": "",
+            }
+        if attempt + 1 < attempts:
+            sleep(backoff[min(attempt, len(backoff) - 1)])
+    raise DeploymentPending("public deployment is not ready: " + "; ".join(last))
 
 
 # ── bookkeeping ─────────────────────────────────────────────────────────────
@@ -2545,28 +3158,25 @@ def art_recipient(cfg):
 
 
 def art_notification(cfg, wcfg, submission, receipts, view="", note=""):
-    """The message a verified merge earns. One message, one tap to the art.
+    """The message a verified deployment earns. Only public experience links.
 
     `view` is a URL that was PROBED after the merge, not one that was derived
     and hoped for.
     """
-    _, source = art_urls(cfg, wcfg, submission)
     lines = [f"{SUCCESS_PREFIX} {sentinel.instance_name(cfg)}: "
              f"\u201c{submission['title']}\u201d is merged.",
              "",
              concept_sentence(submission["meta"])]
     if view:
-        lines += ["", f"View: {view}"]
-    if source:
-        lines.append(f"Source: {source}")
-    pr_url = (receipts or {}).get("pr_url", "")
-    if pr_url:
-        lines.append(f"PR: {pr_url}")
+        lines += ["", f"Public Art Collective: {view}"]
+    vision_url = ((receipts or {}).get("vision_url")
+                  or ((receipts or {}).get("vision") or {}).get("watch_url", ""))
+    if vision_url:
+        lines.append(f"RAPP Vision: {vision_url}")
     if note:
         lines += ["", note]
-    if not view and not source:
-        # Say so rather than send a triumphant message with nowhere to go.
-        lines += ["", "(no public URL derivable — set commons_repo to owner/name)"]
+    if not view:
+        lines += ["", "(no Public Art Collective Pages URL was verified)"]
     return "\n".join(lines)
 
 
@@ -2660,7 +3270,53 @@ def clear_transaction():
         log(f"could not clear the transaction file: {e}")
 
 
-def reconcile(cfg, wcfg, history):
+def finish_platform_deployments(cfg, wcfg, workspace, collective_clone,
+                                submission, collective_receipts, health,
+                                transaction=None):
+    """Verify the canonical merge and, when enabled, its RAPP Vision mirror."""
+    vcfg = vision_config(wcfg)
+    if not vcfg["enabled"]:
+        return dict(collective_receipts)
+    base = wcfg.get("base_branch", "main")
+    git_t = int(wcfg.get("git_timeout_s", 600))
+    ctx = controller_for(wcfg)
+    piece_bytes = _git_bytes(
+        collective_clone, "cat-file", "blob",
+        f"origin/{base}:{submission['piece_path']}",
+        timeout=git_t, ctx=ctx)
+    if hashlib.sha256(piece_bytes).hexdigest() != submission["piece_sha256"]:
+        raise CommandError("the collective bytes changed before RAPP Vision deploy")
+    vwcfg = vision_worker_config(wcfg, vcfg)
+    vctx = controller_for(
+        vwcfg, git_home=STATE / "git-home-rapp-vision")
+    assert_publish_auth(vwcfg, ctx=vctx)
+    vision_receipts = publish_rapp_vision(
+        workspace, submission, piece_bytes, wcfg, health,
+        transaction=transaction, ctx=vctx)
+    deployed = verify_dual_pages(
+        cfg, wcfg, submission, vision_receipts)
+    receipts = dict(collective_receipts)
+    receipts["vision"] = vision_receipts
+    receipts.update(deployed)
+    if transaction:
+        transaction(phase="platforms-verified",
+                    vision_receipts=vision_receipts,
+                    deployment_receipts=deployed)
+    return receipts
+
+
+def deployment_pending(history, row, error):
+    detail = f"dual publication pending: {type(error).__name__}: {error}"
+    row["detail"] = detail[:400]
+    save_history(history)
+    write_status("deployment-pending", detail, role=row.get("role", ""),
+                 cycle=row.get("cycle"), slug=row.get("slug", ""))
+    log(detail)
+    return {"outcome": "deployment-pending", "reason": detail,
+            "detail": detail}
+
+
+def reconcile(cfg, wcfg, history, ctx=None, health=None):
     """Finish, or clean up after, a cycle that died mid-publish.
 
     The dangerous window is between `gh pr merge` and the ledger write: the
@@ -2671,6 +3327,8 @@ def reconcile(cfg, wcfg, history):
 
     Returns a summary dict when it did something, else None.
     """
+    ctx = ctx or controller_for(wcfg)
+    health = health or (lambda phase: sentinel.run_health(receipts=True))
     state = strict_load(TRANSACTION_PATH, {}, expect=dict)
     if not state:
         return None
@@ -2701,17 +3359,18 @@ def reconcile(cfg, wcfg, history):
     workspace = _make_workspace(wcfg)
     try:
         clone = workspace / "clone"
-        _clone_repo(wcfg, clone)
-        assert_repo_integrity(clone, wcfg)
+        _clone_repo(wcfg, clone, ctx=ctx)
+        assert_repo_integrity(clone, wcfg, ctx=ctx)
         submission = state.get("submission") or {}
         try:
             receipts = confirm_merge(clone, submission, wcfg, pr_number,
-                                     sorted(state.get("paths") or []))
+                                     sorted(state.get("paths") or []), ctx)
         except (CommandError, subprocess.TimeoutExpired, json.JSONDecodeError,
                 KeyError, OSError) as e:
             # Not merged (or not verifiably merged): close it and say so.
             log(f"interrupted cycle did not land: {type(e).__name__}: {e}")
-            _close_pr(wcfg["repo"], pr_number, int(wcfg.get("gh_timeout_s", 300)))
+            _close_pr(ctx.gh_repo(), pr_number,
+                      int(wcfg.get("gh_timeout_s", 300)), ctx)
             row["outcome"] = OUTCOME_ABORTED
             row["detail"] = (f"interrupted at {state.get('phase')}; PR "
                              f"{pr_number} was not verifiably merged and has "
@@ -2723,6 +3382,15 @@ def reconcile(cfg, wcfg, history):
         receipts.update({"pr_url": state.get("pr_url", ""),
                          "pr_number": pr_number,
                          "branch": state.get("branch", "")})
+        note = transaction_writer(row["id"], state)
+        try:
+            receipts = finish_platform_deployments(
+                cfg, wcfg, workspace, clone, submission, receipts,
+                health=health, transaction=note)
+        except (DeploymentPending, AbortError, GateError, CommandError,
+                subprocess.TimeoutExpired, json.JSONDecodeError, OSError,
+                ValueError, KeyError) as e:
+            return deployment_pending(history, row, e)
         finalize_success(cfg, wcfg, history, row, submission, receipts,
                          state.get("next_state") or {},
                          int(state.get("cycle") or row.get("cycle") or 1))
@@ -2769,6 +3437,15 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         return _skip(f"nested run refused — {SS.DEPTH_ENV}={depth}; "
                      f"sub-sentinels may not run the worker")
 
+    # One validated set of choices for the entire pass: pinned binaries, the
+    # sanitized git environment with its generated credential helper, the gh
+    # environment, and both repository forms. Everything below is handed this
+    # context rather than re-deriving its own (#2).
+    try:
+        ctx = controller_for(wcfg)
+    except (GateError, CommandError) as e:
+        return _skip(f"controller cannot be built: {e}")
+
     lock = acquire_lock()
     if lock is None:
         return _skip("another worker holds the lock — a cycle is still running")
@@ -2780,7 +3457,7 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         # Before anything else: finish or clean up an interrupted cycle. A
         # merged submission nobody recorded would otherwise make every future
         # cycle compute the wrong number and stay silent about live art (#5).
-        healed = reconcile(cfg, wcfg, history)
+        healed = reconcile(cfg, wcfg, history, ctx, health)
         if healed:
             write_status(healed["outcome"], healed.get("detail", ""))
             return healed
@@ -2827,9 +3504,16 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         # Can this cycle publish at all? Ask before spending anything: three
         # live cycles made art and then failed at the push (#B).
         try:
-            auth = assert_publish_auth(wcfg)
+            auth = assert_publish_auth(wcfg, ctx=ctx)
             log(f"publish auth ok — {auth}")
-        except AbortError as e:
+            vcfg = vision_config(wcfg)
+            if vcfg["enabled"]:
+                vwcfg = vision_worker_config(wcfg, vcfg)
+                vctx = controller_for(
+                    vwcfg, git_home=STATE / "git-home-rapp-vision")
+                vision_auth = assert_publish_auth(vwcfg, ctx=vctx)
+                log(f"RAPP Vision publish auth ok — {vision_auth}")
+        except (AbortError, GateError, CommandError) as e:
             return _skip(f"publish auth unavailable: {e}")
 
         # The fan-out cast is decided BEFORE the workspace exists, so an
@@ -2848,10 +3532,10 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         # in its toolset can make a directory (#1).
         prepare_staging(staging)
         (workspace / "runtime").mkdir(parents=True, exist_ok=True)
-        base_sha = _clone_repo(wcfg, clone)
-        assert_repo_integrity(clone, wcfg)
+        base_sha = _clone_repo(wcfg, clone, ctx)
+        assert_repo_integrity(clone, wcfg, ctx)
         known_slugs = base_branch_slugs(clone, wcfg.get("base_branch", "main"),
-                                        wcfg)
+                                        wcfg, ctx)
         if creative:
             atomic_write_json(staging / "state-in.json", creative)
 
@@ -2953,7 +3637,7 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
                                         if finalists else None,
                                         known_slugs)
             install_into_clone(clone, submission)
-            verify_clone_scope(clone, submission, wcfg, base_sha)
+            verify_clone_scope(clone, submission, wcfg, base_sha, ctx)
         except GateError as e:
             if str(line).upper().startswith("DECLINED") and "no new submission" in str(e):
                 return _finish(cfg, wcfg, history, row, OUTCOME_DECLINED, line)
@@ -2983,9 +3667,12 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             # contract, and reconciliation re-reads the merged file anyway)
             "next_state": next_state,
         })
+        row["slug"] = submission["slug"]
+        save_history(history)
         note()
         try:
-            receipts = publish(clone, submission, wcfg, health, transaction=note)
+            receipts = publish(clone, submission, wcfg, health,
+                               transaction=note, ctx=ctx)
         except AbortError as e:
             clear_transaction()
             return _finish(cfg, wcfg, history, row, OUTCOME_ABORTED, str(e))
@@ -2998,7 +3685,21 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             return _finish(cfg, wcfg, history, row, OUTCOME_FAILED,
                            f"publish: {type(e).__name__}: {e}")
 
-        # Only here — merged, re-read, byte-checked — does the ledger move.
+        note(phase="collective-merged", collective_receipts=receipts)
+        try:
+            receipts = finish_platform_deployments(
+                cfg, wcfg, workspace, clone, submission, receipts, health,
+                transaction=note)
+        except (DeploymentPending, AbortError, GateError, CommandError,
+                subprocess.TimeoutExpired, json.JSONDecodeError, OSError,
+                ValueError, KeyError) as e:
+            # The Public Art merge is already real. Keep the row and
+            # transaction pending so the next pass retries only deployment;
+            # never spend another model or announce a partial release.
+            return deployment_pending(history, row, e)
+
+        # Only here — both merged, re-read, byte-checked and live on Pages —
+        # does the ledger move or a message leave the machine.
         summary = finalize_success(cfg, wcfg, history, row, submission, receipts,
                                    next_state, expected_cycle)
         clear_transaction()
@@ -3086,12 +3787,21 @@ def _finish(cfg, wcfg, history, row, outcome, detail, receipts=None,
         # rebuild=True: the static report attached to this alert renders the
         # chains this cycle just wrote. Rebuilding first is the difference
         # between linked evidence and linked yesterday.
-        view, kind, view_note = verified_view(cfg, wcfg, submission)
+        if receipts.get("collective_url"):
+            view = receipts["collective_url"]
+            kind = "pages"
+            view_note = ""
+        else:
+            view, kind, view_note = verified_view(cfg, wcfg, submission)
         row["view_url"], row["view_kind"] = view, kind
+        row["vision_url"] = (receipts.get("vision_url")
+                             or (receipts.get("vision") or {}).get(
+                                 "watch_url", ""))
         save_history(history)
         sentinel.notify(cfg, art_notification(cfg, wcfg, submission, receipts,
                                               view, view_note),
-                        to=art_recipient(cfg), rebuild=True)
+                        to=art_recipient(cfg), kind="art",
+                        attach_report=False)
     elif text and (outcome != OUTCOME_DECLINED or wcfg.get("notify_declines")):
         sentinel.notify(cfg, text)
     log(f"{row['role']}: {outcome} — {row['detail'][:200]}")
@@ -3112,7 +3822,7 @@ def _make_workspace(wcfg):
     return workspace
 
 
-def _clone_repo(wcfg, clone):
+def _clone_repo(wcfg, clone, ctx=None):
     """Build the controller's clone without ever running `git clone`.
 
     `git clone <url>` reads global and system config BEFORE it resolves the
@@ -3129,27 +3839,32 @@ def _clone_repo(wcfg, clone):
     rewrite, proxy, helper, template or alternates file from outside can
     take part.
     """
+    ctx = ctx or controller_for(wcfg)
     clone = Path(clone)
-    canonical = validate_repo_url(wcfg["repo"], wcfg)
+    canonical = (ctx.repo.transport if ctx.repo
+                 else validate_repo_url(wcfg["repo"], wcfg))
     base = wcfg.get("base_branch", "main")
     git_t = int(wcfg.get("git_timeout_s", 600))
     depth = int(wcfg.get("clone_depth", 50) or 0)
 
     clone.mkdir(parents=True, exist_ok=True)
-    _git(clone, "init", "-q", "-b", base, timeout=git_t)
-    _git(clone, "config", "remote.origin.url", canonical, timeout=git_t)
+    _git(clone, "init", "-q", "-b", base, timeout=git_t, ctx=ctx)
+    _git(clone, "config", "remote.origin.url", canonical, timeout=git_t,
+         ctx=ctx)
     _git(clone, "config", "remote.origin.fetch",
-         f"+refs/heads/{base}:refs/remotes/origin/{base}", timeout=git_t)
+         f"+refs/heads/{base}:refs/remotes/origin/{base}", timeout=git_t,
+         ctx=ctx)
     # Before the first network byte, not after it.
-    assert_repo_integrity(clone, wcfg)
+    assert_repo_integrity(clone, wcfg, ctx=ctx)
 
     fetch_args = ["fetch", "--no-tags"]
     if depth > 0:
         fetch_args += ["--depth", str(depth)]
     fetch_args += ["origin", base]
-    _git_remote(clone, wcfg, *fetch_args, timeout=git_t)
-    _git(clone, "checkout", "-q", "-B", base, f"origin/{base}", timeout=git_t)
-    return _git(clone, "rev-parse", "HEAD", timeout=git_t).strip()
+    _git_remote(clone, wcfg, *fetch_args, timeout=git_t, ctx=ctx)
+    _git(clone, "checkout", "-q", "-B", base, f"origin/{base}",
+         timeout=git_t, ctx=ctx)
+    return _git(clone, "rev-parse", "HEAD", timeout=git_t, ctx=ctx).strip()
 
 
 def _repo_url(repo):

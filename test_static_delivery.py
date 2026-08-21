@@ -103,6 +103,13 @@ class PortableReportTests(unittest.TestCase):
         self.assertIn('$DIR/$OLABEL.plist.template', script)
         self.assertIn('launchctl load "$OPLIST"', script)
 
+    def test_install_script_reconciles_art_and_nightwatch_jobs(self):
+        root = Path(__file__).resolve().parent
+        script = (root / "install-launchd.sh").read_text(encoding="utf-8")
+        self.assertIn("config_allows_nightwatch", script)
+        self.assertIn('launchctl disable "gui/$(id -u)/$NLABEL"', script)
+        self.assertIn('launchctl enable "gui/$(id -u)/$ELABEL"', script)
+
 
 class ServeRoutePolicyTests(unittest.TestCase):
     def setUp(self):
@@ -932,6 +939,19 @@ class MessageContentTests(unittest.TestCase):
         source = Path(nightwatch.__file__).read_text(encoding="utf-8")
         self.assertNotIn("http://localhost:9797", source)
         self.assertIn("Static HTML report:", source)
+
+    def test_art_only_mode_suppresses_nightwatch(self):
+        with mock.patch.object(nightwatch, "cfg",
+                               return_value={"notification_mode": "art-only"}), \
+             mock.patch.object(nightwatch, "send") as send:
+            self.assertEqual(0, nightwatch.main())
+        send.assert_not_called()
+
+    def test_art_only_mode_filters_operational_messages(self):
+        cfg = {"notify": True, "notification_mode": "art-only",
+               "notify_handle": "test"}
+        self.assertFalse(sentinel.notification_allowed(cfg, "operational"))
+        self.assertTrue(sentinel.notification_allowed(cfg, "art"))
 
     def test_repairs_render_as_repairs_instead_of_question_marks(self):
         outcome, transcript_kind = standup.action_outcome({

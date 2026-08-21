@@ -980,5 +980,49 @@ def _reap(proc):
         pass
 
 
+class RepairAttemptConfigTests(unittest.TestCase):
+    """One repair, or none (#3).
+
+    A config asking for five retries is quietly buying five more processes and
+    five more chances for a wrong answer to arrive dressed as a right one, so
+    the number is validated where it is read rather than clamped where it is
+    used.
+    """
+
+    def cfg(self, value):
+        return SS.fanout_config({"fanout": {"format_repair_attempts": value}})
+
+    def test_the_default_is_one(self):
+        self.assertEqual(1, SS.fanout_config({})["format_repair_attempts"])
+        self.assertEqual(1, SS.MAX_FORMAT_REPAIRS)
+
+    def test_zero_and_one_are_accepted(self):
+        self.assertEqual(0, self.cfg(0)["format_repair_attempts"])
+        self.assertEqual(1, self.cfg(1)["format_repair_attempts"])
+
+    def test_more_than_one_is_refused_not_clamped(self):
+        for value in (2, 3, 99):
+            with self.assertRaises(SS.ConfigError) as cm:
+                self.cfg(value)
+            self.assertIn("0..1", str(cm.exception))
+
+    def test_a_negative_count_is_refused(self):
+        with self.assertRaises(SS.ConfigError):
+            self.cfg(-1)
+
+    def test_a_non_integer_is_refused(self):
+        for value in ("1", 1.0, None, True, [1]):
+            with self.assertRaises(SS.ConfigError, msg=repr(value)) as cm:
+                self.cfg(value)
+            self.assertIn("must be an integer", str(cm.exception))
+
+    def test_the_runner_reads_the_validated_number(self):
+        """_run_child validates too, so a hand-built cfg cannot smuggle a
+        larger budget past the config layer."""
+        with self.assertRaises(SS.ConfigError):
+            SS.validate_repair_attempts(5)
+        self.assertEqual(0, SS.validate_repair_attempts(0))
+
+
 if __name__ == "__main__":
     unittest.main()
