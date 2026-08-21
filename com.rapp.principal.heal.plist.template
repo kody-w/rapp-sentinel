@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.rapp.principal.heal</string>
+  <key>ProgramArguments</key><array><string>/usr/bin/python3</string><string>__HOME__/rapp-sentinel/principal.py</string><string>heal</string></array>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>__HOME__</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__HOME__/.local/bin</string>
+    <key>SENTINEL_HOME</key><string>__HOME__/.principal</string>
+  </dict>
+  <key>StartCalendarInterval</key><array><dict><key>Minute</key><integer>20</integer></dict><dict><key>Minute</key><integer>50</integer></dict></array>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>__HOME__/.principal/logs/heal.out.log</string>
+  <key>StandardErrorPath</key><string>__HOME__/.principal/logs/heal.err.log</string>
+</dict></plist>

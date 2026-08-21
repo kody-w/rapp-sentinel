@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      :root {
+        --bg: #07080d;
+        --bar: #0d0f18;
+        --amber: #f0b429;
+        --amber-dim: #7a5a1a;
+        --green: #3ddc84;
+        --ink: #e8e9f0;
+        --muted: #6b7086;
+        --line: rgba(255,255,255,0.07);
+        --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      }
+      html, body {
+        width: 1920px; height: 1080px; overflow: hidden;
+        background: var(--bg); color: var(--ink);
+        font-family: var(--mono);
+      }
+      #stage {
+        position: relative; width: 1920px; height: 1080px;
+        background:
+          radial-gradient(1200px 700px at 50% -8%, rgba(240,180,41,0.10), transparent 60%),
+          radial-gradient(900px 600px at 50% 120%, rgba(61,220,132,0.06), transparent 60%),
+          var(--bg);
+      }
+      /* faint scanline / bar-counter texture */
+      #stage::after {
+        content:""; position:absolute; inset:0; pointer-events:none;
+        background: repeating-linear-gradient(0deg, rgba(255,255,255,0.015) 0 1px, transparent 1px 4px);
+        opacity: 0.5;
+      }
+      .scene { position: absolute; inset: 0; }
+
+      /* ---------- beat 1: the sign ---------- */
+      #b1 { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:26px; }
+      #sign {
+        font-weight: 800; letter-spacing: 2px; text-align:center; line-height: 1.02;
+        font-size: 118px; color: var(--amber);
+        text-shadow: 0 0 24px rgba(240,180,41,0.55), 0 0 60px rgba(240,180,41,0.25);
+        font-family: var(--mono);
+      }
+      #sign .lil { font-size: 66px; color: var(--ink); text-shadow:none; opacity:.9; }
+      #sub1 { color: var(--muted); font-size: 34px; letter-spacing: 6px; text-transform: uppercase; }
+      #sub1 b { color: var(--green); font-weight:700; }
+
+      /* ---------- beats 2+3: the bar counter ---------- */
+      #barwrap { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100%; gap:22px; }
+      #barhead { display:flex; justify-content:space-between; width:1360px; align-items:baseline; }
+      #barhead .t { color: var(--amber); font-size: 40px; font-weight:700; letter-spacing:1px; }
+      #barhead .r { color: var(--muted); font-size: 26px; }
+      #rows { width:1360px; display:flex; flex-direction:column; gap:10px; }
+      .row {
+        display:grid; grid-template-columns: 210px 150px 1fr 190px; align-items:center;
+        gap: 20px; padding: 14px 22px; border:1px solid var(--line); border-radius:12px;
+        background: linear-gradient(90deg, rgba(255,255,255,0.02), rgba(255,255,255,0.005));
+      }
+      .row .slug { color: var(--ink); font-size: 30px; font-weight:700; }
+      .row .vendor { color: #b6bbd0; font-size: 23px; }
+      .row .rappid { color: var(--amber); font-size: 24px; opacity:1; white-space:nowrap; overflow:hidden; }
+      .row .rappid .k { color: #9aa0bb; }
+      .row .stamp {
+        justify-self:end; display:flex; align-items:center; gap:10px;
+        color: var(--green); font-size: 24px; font-weight:700; letter-spacing:1px;
+        border:1px solid rgba(61,220,132,0.4); border-radius:999px; padding:6px 16px;
+        background: rgba(61,220,132,0.08);
+      }
+      .row .stamp .dot { width:9px; height:9px; border-radius:50%; background:var(--green); box-shadow:0 0 10px var(--green); }
+
+      /* ---------- beat 4: the published head ---------- */
+      #b4 { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:30px; }
+      #headcard {
+        width: 980px; border:1px solid rgba(240,180,41,0.35); border-radius:18px; padding:44px 52px;
+        background: linear-gradient(180deg, rgba(240,180,41,0.06), rgba(255,255,255,0.01));
+        text-align:center;
+      }
+      #headcard .lbl { color: var(--muted); font-size:26px; letter-spacing:4px; text-transform:uppercase; }
+      #headcard .big { color: var(--ink); font-size:52px; font-weight:800; margin:10px 0 18px; }
+      #headcard .big b { color: var(--green); }
+      #headcard .hash { color: var(--amber); font-size:30px; }
+      #outsider { color: var(--muted); font-size: 30px; text-align:center; max-width: 1100px; }
+      #outsider b { color: var(--ink); }
+
+      /* ---------- beat 5: tagline ---------- */
+      #b5 { display:flex; flex-direction:column; align-items:center; justify-content:center; gap:26px; }
+      #tag { text-align:center; font-size: 74px; font-weight:800; line-height:1.18; letter-spacing:1px; }
+      #tag .a { color: var(--ink); } #tag .b { color: var(--amber); } #tag .c { color: var(--green); }
+      #mark { color: var(--muted); font-size: 30px; letter-spacing:6px; text-transform:uppercase; }
+      #mark b { color: var(--ink); }
+
+      /* caption band (VO-synced text; a voiceover WAV slots under it without reflow) */
+      #cap {
+        position:absolute; left:0; right:0; bottom:52px; text-align:center;
+        color: var(--muted); font-size: 30px; letter-spacing:1px; padding:0 120px;
+      }
+      #cap b { color: var(--ink); }
+    </style>
+  </head>
+  <body>
+    <div id="stage" data-composition-id="eight-ais-bar" data-start="0" data-width="1920" data-height="1080" data-duration="30">
+
+      <!-- BEAT 1 -->
+      <div class="scene clip" id="b1" data-start="0" data-duration="4.2">
+        <div id="sign"><span class="lil">eight AIs walk into</span><br>A&nbsp;BAR</div>
+        <div id="sub1">a <b>rapp-sentinel</b> neighborhood</div>
+      </div>
+
+      <!-- BEATS 2 & 3 share the bar counter -->
+      <div class="scene clip" id="bar" data-start="4.2" data-duration="15.6">
+        <div id="barwrap">
+          <div id="barhead">
+            <div class="t">the bar</div>
+            <div class="r">each one signs a tamper-evident guest-book on the way in</div>
+          </div>
+          <div id="rows">
+            <!-- rows carry REAL rappid + head tails captured live -->
+            <div class="row" data-slug="gpt"><div class="slug">gpt</div><div class="vendor">OpenAI</div><div class="rappid"><span class="k">rappid:@kody-w/watcher-gpt:</span>16857d9ea5…</div><div class="stamp"><span class="dot"></span>VERIFIED</div></div>
+            <div class="row" data-slug="gemini"><div class="slug">gemini</div><div class="vendor">Google</div><div class="rappid"><span class="k">rappid:…watcher-gemini:</span>ebf4b8b9ed…</div><div class="stamp"><span class="dot"></span>VERIFIED</div></div>
+            <div class="row" data-slug="grok"><div class="slug">grok</div><div class="vendor">xAI</div><div class="rappid"><span class="k">rappid:…watcher-grok:</span>26aa27c5f2…</div><div class="stamp"><span class="dot"></span>VERIFIED</div></div>
+            <div class="row" data-slug="llama"><div class="slug">llama</div><div class="vendor">Meta</div><div class="rappid"><span class="k">rappid:…watcher-llama:</span>dbe0dc9a8d…</div><div class="stamp"><span class="dot"></span>VERIFIED</div></div>
+            <div class="row" data-slug="mistral"><div class="slug">mistral</div><div class="vendor">Mistral</div><div class="rappid"><span class="k">rappid:…watcher-mistral:</span>0f013a59d7…</div><div class="stamp"><span class="dot"></span>VERIFIED</div></div>
+            <div class="row" data-slug="deepseek"><div class="slug">deepseek</div><div class="vendor">DeepSeek</div><div class="rappid"><span class="k">rappid:…watcher-deepseek:</span>b87e2e35c2…</div><div class="stamp"><span class="dot"></span>VERIFIED</div></div>
+            <div class="row" data-slug="claude"><div class="slug">claude</div><div class="vendor">Anthropic</div><div class="rappid"><span class="k">rappid:…watcher-claude:</span>b9aecbdf2a…</div><div class="stamp"><span class="dot"></span>VERIFIED</div></div>
+            <div class="row" data-slug="molly"><div class="slug">molly</div><div class="vendor">a human</div><div class="rappid"><span class="k">rappid:…watcher-molly:</span>0de10c3433…</div><div class="stamp"><span class="dot"></span>VERIFIED</div></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- BEAT 4 -->
+      <div class="scene clip" id="b4" data-start="19.8" data-duration="6.0">
+        <div id="headcard">
+          <div class="lbl">one published head</div>
+          <div class="big"><b>8</b> watchers · <b>0</b> violations</div>
+          <div class="hash">head a074ac8f1df4 … + 7 more, all on-chain</div>
+        </div>
+        <div id="outsider">an outsider verifies the whole bar reading <b>nothing but public hashes</b>.<br>a record cannot be its own witness — so no watcher gets to just say "trust me."</div>
+      </div>
+
+      <!-- BEAT 5 -->
+      <div class="scene clip" id="b5" data-start="25.8" data-duration="4.2">
+        <div id="tag"><span class="a">any model.</span> <span class="b">any vendor.</span><br><span class="c">none of them can quietly lie.</span></div>
+        <div id="mark"><b>rapp</b>-sentinel · N AIs walk into a bar</div>
+      </div>
+
+      <!-- caption band, cross-beat -->
+      <div id="cap" class="clip" data-start="0.2" data-duration="29.6"><span id="captext"></span></div>
+
+      <!-- narration: VibeVoice-Realtime-0.5B (en-Davis_man), generated locally -->
+      <audio
+        id="vo"
+        src="assets/narration.wav"
+        data-start="0.15"
+        data-duration="25.6"
+        data-track-index="10"
+        data-volume="1"
+      ></audio>
+    </div>
+
+    <script>
+      const q = (s, r=document) => r.querySelector(s);
+      const qa = (s, r=document) => Array.from(r.querySelectorAll(s));
+      const tl = gsap.timeline({ paused: true });
+      window.__timelines = window.__timelines || {};
+      window.__timelines["eight-ais-bar"] = tl;
+
+      // ---- BEAT 1: the sign flickers on ----
+      tl.from("#sign", { autoAlpha: 0, y: 26, duration: 0.5, ease: "power2.out" }, 0.15);
+      // subtle neon flicker
+      tl.to("#sign", { opacity: 0.55, duration: 0.06, yoyo: true, repeat: 3, ease: "none" }, 0.7);
+      tl.from("#sub1", { autoAlpha: 0, y: 14, duration: 0.4 }, 0.9);
+      tl.to("#b1", { autoAlpha: 0, duration: 0.4 }, 3.9);
+
+      // ---- BEAT 2: the eight walk in (rows slide, rappids appear), stamps hidden ----
+      const rows = qa("#bar .row");
+      const barStart = 4.2;
+      gsap.set("#bar .stamp", { autoAlpha: 0 });
+      tl.from("#barhead", { autoAlpha: 0, y: -10, duration: 0.4 }, barStart);
+      rows.forEach((row, i) => {
+        const t = barStart + 0.35 + i * 0.42;
+        tl.from(row, { autoAlpha: 0, x: -60, duration: 0.42, ease: "power3.out" }, t);
+        tl.from(row.querySelector(".rappid"), { autoAlpha: 0, x: 20, duration: 0.3 }, t + 0.12);
+      });
+
+      // ---- BEAT 3: the bartender verifies — stamps cascade green ----
+      const verifyStart = barStart + 0.35 + rows.length * 0.42 + 0.6; // after all walked in
+      rows.forEach((row, i) => {
+        const t = verifyStart + i * 0.30;
+        tl.to(row.querySelector(".stamp"), { autoAlpha: 1, duration: 0.22, ease: "power2.out" }, t);
+        tl.fromTo(row.querySelector(".stamp"),
+          { scale: 0.6 }, { scale: 1, duration: 0.30, ease: "back.out(2.2)" }, t);
+        tl.fromTo(row, { backgroundColor: "rgba(61,220,132,0.16)" },
+          { backgroundColor: "rgba(255,255,255,0.012)", duration: 0.5 }, t);
+      });
+      tl.to("#bar", { autoAlpha: 0, duration: 0.45 }, 19.55);
+
+      // ---- BEAT 4: the published head ----
+      tl.from("#headcard", { autoAlpha: 0, y: 26, scale: 0.96, duration: 0.55, ease: "power3.out" }, 20.0);
+      tl.from("#headcard .big b", { color: "#e8e9f0", duration: 0.01 }, 20.4);
+      tl.from("#outsider", { autoAlpha: 0, y: 16, duration: 0.5 }, 20.7);
+      tl.to("#b4", { autoAlpha: 0, duration: 0.4 }, 25.5);
+
+      // ---- BEAT 5: tagline ----
+      tl.from("#tag .a", { autoAlpha: 0, y: 18, duration: 0.4 }, 26.0);
+      tl.from("#tag .b", { autoAlpha: 0, y: 18, duration: 0.4 }, 26.3);
+      tl.from("#tag .c", { autoAlpha: 0, y: 18, duration: 0.45 }, 26.7);
+      tl.from("#mark", { autoAlpha: 0, duration: 0.4 }, 27.4);
+
+      // ---- captions (VO-synced; a voiceover WAV drops under these without reflow) ----
+      const caps = [
+        [0.2,  4.0,  "eight AIs walk into a bar…"],
+        [4.4,  9.5,  "one <b>rapp-sentinel</b> neighborhood — eight models, eight vendors, one room"],
+        [14.0, 5.6,  "the bartender re-checks every record from genesis — nobody just says <b>“trust me”</b>"],
+        [20.0, 5.6,  "one published head, verified by an outsider reading <b>only public hashes</b>"],
+        [25.9, 4.0,  "any model. any vendor. <b>none of them can quietly lie.</b>"],
+      ];
+      const captext = q("#captext");
+      caps.forEach(([start, dur, html]) => {
+        tl.set(captext, { innerHTML: html }, start);
+        tl.fromTo("#cap", { autoAlpha: 0 }, { autoAlpha: 1, duration: 0.3 }, start);
+        tl.to("#cap", { autoAlpha: 0, duration: 0.3 }, start + dur - 0.3);
+      });
+
+      // expose exact duration
+      tl.set({}, {}, 30);
+    </script>
+  </body>
+</html>

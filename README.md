@@ -541,3 +541,22 @@ Every visit is a `principal.visited` frame on its own chain, a row in `state/obs
 a line on `state/report-card.json`, and `dashboard/principal.html`. It texts only when a grade
 changes. Instance: `SENTINEL_HOME=~/.principal` with `classrooms` in config.json; launchd
 template `com.rapp.principal.plist.template`. Proof: `prove_principal.py`.
+
+**It heals, it explains, it reorients.** A grade nobody acts on is decoration, so the Principal does
+three more things on a schedule of its own:
+
+| command | schedule | what it does |
+|---|---|---|
+| `principal.py heal` | `:20`, `:50` | Fixes the two ways a sentinel goes useless on its own machine: a **hung** tick (a slow network read wedges the job — killed) and an **absent** one (launchd's `StartInterval` stops firing after sleep — rewritten to `StartCalendarInterval` and kickstarted). Then it **re-visits to prove the fix took**; a heal that isn't verified is a hope. |
+| `principal.py relay` | `:05`, `:35` | Is the mouth for a classroom that can't speak. A sentinel whose iMessage send is blocked queues alerts forever — the finding exists, nobody hears it. The Principal moves those messages out under the classroom's own outbox lock, marks them `relayed_by`, and sends them on its own working channel. |
+| `principal.py memo` | 07:15 daily | Writes the morning memo: every classroom's grade, what's chronic (the same finding three visits running), what has no classroom yet, and the decisions waiting on you. |
+
+**Feedback, not just a letter.** Every visit now files its reasons *inside the classroom* at
+`state/principal-feedback.json` (+ `.jsonl` history): the rubric breakdown of which points were lost
+and why, the principal's note (what works, what fails, the one change), and — the important part —
+a proposed **reorientation**. Most sentinels don't need new code; they need their declared job
+pointed at the right thing. The proposal is written to `state/principal-reorientation.json` as a
+diff against `direction.json` and is *never applied* unless the principal's config says
+`"reorient": "apply"` — and even then the owner's `boundaries` are copied through untouched. A
+machine with no sentinel is marked `pending_hatch`: an empty room is a decision to make, not a
+teacher to fail every twenty minutes. Proof: `prove_principal_heal.py`.

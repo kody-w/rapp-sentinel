@@ -34,6 +34,7 @@ import random
 import shlex
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -68,6 +69,7 @@ out = {
   "escalations": rj(st / "escalations.json"),
   "outbox_last_drain": rj(st / "outbox-last-drain.json"),
   "outbox_queued": len([l for l in tail(st / "outbox.jsonl", 10000) if l.strip()]),
+  "outbox_tail": [l for l in tail(st / "outbox.jsonl", 10000) if l.strip()][:5],
   "direction": rj(home / "direction.json"),
   "config": {k: v for k, v in (rj(home / "config.json") or {}).items()
              if k in ("instance_name","instance_slug","level","notify","daily_escalation_budget","daily_evolve_budget",
@@ -287,10 +289,40 @@ PEERS: {peers}
 LOG TAIL:
 {log}
 RUBRIC (deterministic floor): score {score}/100 grade {grade}; points {points}; notes {notes}
+POINTS LOST AND WHY: {lost}
+
+Most sentinels do not need new code. They need REORIENTING: the job they declared has drifted from the job worth doing —
+they watch a repo that no longer matters, ignore one that does, run too often to be useful or too rarely to catch anything,
+or hold a freedom/budget that makes them unable to act on what they find. Propose a change to the DECLARED JOB
+(direction.json) only when the evidence supports it. Never propose changing `boundaries` — those are the owner's.
 
 YOU HAVE NO TOOLS. Reply with ONLY a JSON object:
 {{"grade":"A|B|C|D|F","what_works":"<one sentence>","what_fails":"<one sentence, or 'nothing material'>",
- "one_change":"<the single most useful change for this sentinel>","confidence":"high|medium|low"}}"""
+ "one_change":"<the single most useful change for this sentinel>","confidence":"high|medium|low",
+ "reorient":{{"needed":true|false,"add_cares":["..."],"drop_cares":["..."],"situation_note":"<one sentence to append, or ''>",
+ "freedom":<int or null>,"why":"<why this reorientation, citing the evidence above>"}}}}"""
+
+
+def lost_points(obs):
+    """Turn the rubric into a sentence per dimension: what was lost, and the note that explains it."""
+    out = []
+    for dim, cap in RUBRIC_MAX.items():
+        got = (obs.get("points") or {}).get(dim)
+        if got is None or got >= cap: continue
+        skip = ("present, on time", "principal's note grades")
+        why = [n for n in (obs.get("notes") or [])
+               if not any(sk in n.lower() for sk in skip)
+               and any(k in n.lower() for k in RUBRIC_HINTS.get(dim, []))]
+        out.append("%s %d/%d%s" % (dim, got, cap, (" — " + "; ".join(why[:2])) if why else ""))
+    return out or ["nothing lost — full marks"]
+
+
+RUBRIC_MAX = {"attendance": 25, "record": 20, "job": 25, "honesty": 15, "discipline": 15}
+RUBRIC_HINTS = {"attendance": ["tick", "absent", "late", "empty classroom", "never ticked"],
+                "record": ["chain", "roll", "record", "ledger", "truncat"],
+                "job": ["job", "check", "verdict", "watch", "declared", "stale", "frozen"],
+                "honesty": ["green", "claim", "unverified", "silent", "notify", "queued", "deliver"],
+                "discipline": ["budget", "red", "standing", "deciding", "escalat"]}
 
 
 def critique(room, snap, obs, cfg, timeout=300):
@@ -313,7 +345,8 @@ def critique(room, snap, obs, cfg, timeout=300):
         peers=json.dumps({k: {kk: vv for kk, vv in (val or {}).items() if kk in ("reachable", "advancing", "stalled_slugs", "age_minutes")}
                           for k, val in ((snap or {}).get("peers") or {}).items()})[:600],
         log="\n".join(((snap or {}).get("log_tail") or [])[-14:])[:1400],
-        score=obs["score"], grade=obs["grade"], points=json.dumps(obs["points"]), notes=json.dumps(obs["notes"][:5]))
+        score=obs["score"], grade=obs["grade"], points=json.dumps(obs["points"]), notes=json.dumps(obs["notes"][:5]),
+        lost="; ".join(lost_points(obs)))
     argv = ["copilot", "-p", prompt, "--model", cfg.get("copilot_model") or "claude-opus-5", "--available-tools=",
             "--excluded-tools=create,edit,web_fetch", "--log-level", "none", "--log-dir", str(HOME / "logs" / "copilot")]
     try:
@@ -332,10 +365,84 @@ def critique(room, snap, obs, cfg, timeout=300):
         doc = None
     if not isinstance(doc, dict):
         return {"error": "no JSON note", "raw": text[-300:]}
-    doc = {k: doc.get(k) for k in ("grade", "what_works", "what_fails", "one_change", "confidence")}
+    doc = {k: doc.get(k) for k in ("grade", "what_works", "what_fails", "one_change", "confidence", "reorient")}
+    if not isinstance(doc.get("reorient"), dict):
+        doc["reorient"] = {"needed": False}
     doc["model"] = cfg.get("copilot_model") or "claude-opus-5"
     doc["agrees_with_rubric"] = (str(doc.get("grade") or "").upper() == obs["grade"])
     return doc
+
+
+
+FEEDBACK_WRITE = r"""
+# Runs inside the classroom. Reads one JSON feedback document on stdin and files it where the
+# sentinel itself can read it: state/principal-feedback.json (latest) + .jsonl (every visit).
+# A reorientation is written NEXT TO direction.json as a proposal — never over it — unless the
+# document says apply, in which case boundaries are still left exactly as the owner wrote them.
+import json, os, sys
+home = os.path.expanduser(sys.argv[1]); st = os.path.join(home, "state"); os.makedirs(st, exist_ok=True)
+doc = json.load(sys.stdin)
+open(os.path.join(st, "principal-feedback.json"), "w").write(json.dumps(doc, indent=2) + "\n")
+with open(os.path.join(st, "principal-feedback.jsonl"), "a") as fh: fh.write(json.dumps(doc) + "\n")
+res = {"filed": True, "reoriented": False}
+r = doc.get("reorientation") or {}
+if r.get("needed"):
+    dpath = os.path.join(home, "direction.json")
+    try: cur = json.load(open(dpath))
+    except Exception: cur = {}
+    proposed = dict(cur)
+    cares = list(proposed.get("cares_about") or [])
+    for c in (r.get("drop_cares") or []):
+        if c in cares: cares.remove(c)
+    for c in (r.get("add_cares") or []):
+        if c and c not in cares: cares.append(c)
+    proposed["cares_about"] = cares
+    if r.get("situation_note"):
+        proposed["situation"] = (proposed.get("situation", "") + "\n\nPrincipal's note (%s): %s" % (doc.get("utc", ""), r["situation_note"])).strip()
+    if isinstance(r.get("freedom"), int): proposed["freedom"] = r["freedom"]
+    proposed["boundaries"] = cur.get("boundaries", [])          # never the principal's to change
+    proposed["reoriented_by"] = "principal"; proposed["reoriented_at"] = doc.get("utc")
+    open(os.path.join(st, "principal-reorientation.json"), "w").write(json.dumps(
+        {"why": r.get("why"), "proposed_direction": proposed, "current_direction": cur}, indent=2) + "\n")
+    if doc.get("apply"):
+        if cur: open(dpath + ".bak", "w").write(json.dumps(cur, indent=2) + "\n")
+        open(dpath, "w").write(json.dumps(proposed, indent=2) + "\n")
+        res["reoriented"] = True
+print(json.dumps(res))
+"""
+
+
+def deliver_feedback(room, obs, crit, cfg):
+    """Hand the classroom its own report card — the reasons, not just the letter.
+
+    A grade the teacher never sees cannot change anything. This writes the rubric breakdown (what
+    was lost and why), the principal's note, and any proposed reorientation into the sentinel's own
+    state, where its next tick can read it. Reorientation is a PROPOSAL by default: most sentinels
+    do not need new code, they need their declared job pointed at the right thing."""
+    doc = {"utc": utc_now(), "from": cfg.get("instance_name") or "The Principal",
+           "grade": obs["grade"], "score": obs["score"], "points": obs.get("points"),
+           "lost": lost_points(obs), "notes": obs.get("notes"), "evidence": obs.get("evidence"),
+           "note": {k: (crit or {}).get(k) for k in ("grade", "what_works", "what_fails", "one_change", "confidence")} if crit else None,
+           "reorientation": (crit or {}).get("reorient") or {},
+           "apply": str(cfg.get("reorient", "propose")).lower() == "apply"}
+    interp = room.get("python") or "python3"
+    payload = json.dumps(doc)
+    try:
+        prog = FEEDBACK_WRITE.replace("sys.argv[1]", repr(room["home"]))
+        if room.get("transport") == "local":
+            r = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True, timeout=30, input=payload)
+        else:
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", room["host"],
+                                "%s -c %s" % (interp, shlex.quote(prog))],
+                               capture_output=True, text=True, timeout=45, input=payload)
+        out = json.loads((r.stdout or "{}").strip().splitlines()[-1])
+    except Exception as e:
+        print("[principal] feedback to %s failed: %s: %s" % (room["slug"], type(e).__name__, e)); return None
+    if out.get("reoriented"):
+        print("[principal] reoriented %s (direction.json updated; .bak kept)" % room["slug"])
+    elif (doc["reorientation"] or {}).get("needed"):
+        print("[principal] proposed a reorientation for %s → state/principal-reorientation.json" % room["slug"])
+    return out
 
 
 def unreachable_observation(room, why):
@@ -347,6 +454,7 @@ def unreachable_observation(room, why):
 # ── who to visit ─────────────────────────────────────────────────────────────
 
 def choose_visits(rooms, card, cfg, now=None, seed=None):
+    rooms = [r for r in rooms if not r.get("pending_hatch")]
     """Random, but nobody escapes: overdue classrooms first, then a seeded draw."""
     now = now or datetime.now(timezone.utc)
     per_tick = int(cfg.get("visits_per_tick") or 2)
@@ -409,6 +517,9 @@ def tick(only=None):
     picks = rooms if only else choose_visits(rooms, card, cfg)
     results = []
     for room in picks:
+        if room.get("pending_hatch"):
+            print("[principal] %s — no classroom yet (%s)" % (room.get("name") or room["slug"], room.get("pending_hatch_why") or "sentinel not hatched"))
+            continue
         snap, err = gather(room)
         prev = ((card.get("classrooms") or {}).get(room["slug"]) or {}).get("latest")
         obs = unreachable_observation(room, err) if err else evaluate(room, snap, previous=prev)
@@ -419,6 +530,8 @@ def tick(only=None):
                 if note.get("grade") and not note.get("agrees_with_rubric") and not note.get("error"):
                     obs["notes"].append("principal's note grades %s vs rubric %s: %s" % (note["grade"], obs["grade"], (note.get("what_fails") or "")[:120]))
         prev_grade = record(obs, cfg)
+        if not err:
+            deliver_feedback(room, obs, obs.get("principal_note"), cfg)   # the teacher gets the reasons, not just the letter
         line = "%s — %s (%d): %s" % (obs["name"], obs["grade"], obs["score"], "; ".join(obs["notes"][:3]))
         print("[principal] " + line)
         if prev_grade != obs["grade"] and (prev_grade is not None or obs["grade"] in ("D", "F")):
@@ -458,12 +571,277 @@ def write_dashboard():
     (DASH / "principal.html").write_text(html, encoding="utf-8")
 
 
+
+RELAY = r"""
+import fcntl, json, os, sys
+home = os.path.expanduser(sys.argv[1]); st = os.path.join(home, "state")
+q = os.path.join(st, "outbox.jsonl"); sent = os.path.join(st, "outbox-sent.jsonl")
+lock = os.path.join(st, "outbox.lock")
+if not os.path.exists(q): print("[]"); raise SystemExit
+fh = open(lock, "a+"); fcntl.flock(fh, fcntl.LOCK_EX)
+try:
+    rows = [l for l in open(q, encoding="utf-8").read().splitlines() if l.strip()]
+    open(q, "w").close()                       # queue emptied only after we hold it
+    with open(sent, "a", encoding="utf-8") as out:
+        for l in rows:
+            try: m = json.loads(l)
+            except ValueError: continue
+            m["relayed_by"] = "principal"; out.write(json.dumps(m, ensure_ascii=False) + "\n")
+    print(json.dumps(rows))
+finally:
+    fcntl.flock(fh, fcntl.LOCK_UN); fh.close()
+"""
+
+
+def relay(only=None, min_age_minutes=None):
+    """Be the mouth for a classroom that cannot speak.
+
+    A sentinel whose iMessage send is blocked (no Automation permission, headless context) queues
+    alerts forever: the finding exists, nobody hears it. The Principal already reaches every
+    classroom to grade it, so it can carry those messages out on its own working mouth. Messages
+    are moved (not copied) under the classroom's own outbox lock and marked `relayed_by`, so the
+    classroom never re-sends them if its mouth comes back."""
+    cfg = load_config()
+    thresh = min_age_minutes if min_age_minutes is not None else int(cfg.get("relay_after_minutes", 30))
+    carried = 0
+    for room in cfg["classrooms"]:
+        if only and room["slug"] != only: continue
+        if room.get("transport") != "ssh" or room.get("relay") is False: continue
+        snap, err = gather(room)
+        if not snap: continue
+        queued = int(snap.get("outbox_queued") or 0)
+        if not queued: continue
+        drain = snap.get("outbox_last_drain") or {}
+        stuck = bool(drain.get("error") or drain.get("why") not in (None, "", "empty")) or queued > 0
+        age = None
+        try:
+            oldest = min(parse_ts(json.loads(l)["at"]) for l in (snap.get("outbox_tail") or []) if l.strip())
+            age = (datetime.now(timezone.utc) - oldest).total_seconds() / 60.0
+        except Exception:
+            pass
+        if age is not None and age < thresh: continue
+        if not stuck: continue
+        interp = room.get("python") or "python3"
+        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", room["host"],
+                "%s - %s" % (interp, shlex.quote(room["home"]))]
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=60, input=RELAY)
+            rows = json.loads((r.stdout or "[]").strip().splitlines()[-1])
+        except Exception as e:
+            print("[principal] relay %s failed: %s: %s" % (room["slug"], type(e).__name__, e)); continue
+        for raw in rows:
+            try: m = json.loads(raw)
+            except ValueError: continue
+            notify(cfg, "📨 relayed from %s (its own mouth is blocked):\n%s" % (room["name"], m.get("text", "")[:900]))
+            carried += 1
+        if rows:
+            print("[principal] relayed %d message(s) for %s" % (len(rows), room["slug"]))
+    if carried: 
+        try:
+            import outbox; outbox.drain()
+        except Exception as e:
+            print("[principal] local drain failed: %s" % e)
+    return carried
+
+
+def memo(day=None):
+    """Write the morning memo: what the night found, and what it wants you to decide.
+
+    The report card is a record; the memo is the ask. It names every classroom below a B, the
+    chronic findings (the same note on 3+ consecutive visits), and anything queued but unsaid."""
+    cfg = load_config(); card = load_card()
+    now = datetime.now(timezone.utc); stamp = day or now.strftime("%Y-%m-%d")
+    rooms = sorted((card.get("classrooms") or {}).items())
+    lines = ["# The Principal's memo — %s" % stamp, "",
+             "_Written at %s. Every line below is something a sentinel observed, not something inferred._" % now.strftime("%Y-%m-%d %H:%M UTC"), "",
+             "| classroom | grade | score | last seen | the one thing |", "|---|---|---|---|---|"]
+    failing, chronic = [], []
+    for slug, r in rooms:
+        o = r.get("latest") or {}
+        note = (o.get("notes") or ["—"])[0]
+        lines.append("| %s | **%s** | %s | %s | %s |" % (o.get("name", slug), o.get("grade", "?"), o.get("score", "—"), (o.get("utc") or "—")[:16], note[:110]))
+        if o.get("grade") in ("D", "F"): failing.append((slug, o))
+        hist = [h for h in (r.get("history") or [])][-3:]
+        if len(hist) >= 3:
+            common = set(hist[0].get("notes") or [])
+            for h in hist[1:]: common &= set(h.get("notes") or [])
+            for c in sorted(common): chronic.append((o.get("name", slug), c))
+    if failing:
+        lines += ["", "## Not teaching", ""]
+        for slug, o in failing:
+            lines.append("- **%s (%s)** — %s" % (o.get("name", slug), o.get("grade"), "; ".join((o.get("notes") or [])[:3])))
+    if chronic:
+        lines += ["", "## Chronic — the same finding three visits running", ""]
+        for name, c in chronic: lines.append("- **%s** — %s" % (name, c))
+    pending = [r for r in (cfg.get("classrooms") or []) if r.get("pending_hatch")]
+    if pending:
+        lines += ["", "## No classroom yet", ""]
+        for r in pending:
+            lines.append("- **%s** — %s" % (r.get("name") or r["slug"], r.get("pending_hatch_why") or "no sentinel hatched here"))
+    lines += ["", "## Decide today", "",
+              "- [ ] " + ("Fix or retire: %s" % ", ".join(o.get("name", s) for s, o in failing) if failing else "Nothing is failing — pick the next molt."),
+              "- [ ] Anything above marked chronic needs a change in the sentinel, not another alert.", ""]
+    path = STATE / ("memo-%s.md" % stamp)
+    path.write_text("\n".join(lines), encoding="utf-8")
+    head = "🏫 Principal's memo %s — %s" % (stamp, ", ".join("%s %s" % ((r.get("latest") or {}).get("name", s), (r.get("latest") or {}).get("grade", "?")) for s, r in rooms))
+    if failing: head += "\nNot teaching: " + "; ".join("%s (%s)" % (o.get("name", s), (o.get("notes") or ["?"])[0][:70]) for s, o in failing)
+    notify(cfg, head[:1200])
+    try:
+        import outbox; outbox.drain()
+    except Exception: pass
+    print("[principal] memo → %s" % path)
+    return path
+
+
+
+HEAL = r"""
+# Runs INSIDE a classroom's machine. Diagnoses the three ways a sentinel goes useless and fixes what it can:
+#   hung   — a tick still running long past its interval (a slow network read wedges the whole job)
+#   absent — no tick for 2+ intervals because launchd's StartInterval stopped firing (it does, after sleep)
+#   silent — handled by the Principal's relay, not here
+# Every action is reported; nothing is guessed. Read-only when there is nothing wrong.
+import glob, json, os, plistlib, re, subprocess, sys, time
+home = os.path.expanduser(sys.argv[1]); st = os.path.join(home, "state")
+grace = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+out = {"home": home, "label": None, "actions": [], "findings": []}
+
+def sh(*a):
+    try:
+        r = subprocess.run(a, capture_output=True, text=True, timeout=45); return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except Exception as e:
+        return 1, "%s: %s" % (type(e).__name__, e)
+
+label, plist_path, plist = None, None, None
+for f in glob.glob(os.path.expanduser("~/Library/LaunchAgents/*.plist")):
+    try: d = plistlib.load(open(f, "rb"))
+    except Exception: continue
+    env = d.get("EnvironmentVariables") or {}
+    args = " ".join(d.get("ProgramArguments") or [])
+    if os.path.realpath(env.get("SENTINEL_HOME", "")) == os.path.realpath(home) or home in args:
+        label, plist_path, plist = d.get("Label"), f, d; break
+out["label"] = label
+uid = os.getuid()
+
+# --- interval the sentinel says it runs at
+interval = 900
+try: interval = int((json.load(open(os.path.join(home, "config.json"))) or {}).get("interval_s") or 900)
+except Exception: pass
+if plist and plist.get("StartInterval"): interval = int(plist["StartInterval"])
+
+# --- 1. hung tick: a process whose argv mentions this home/code, alive far longer than one interval
+hung = []
+rc, ps = sh("ps", "-Ao", "pid,etimes,command")
+for line in ps.splitlines()[1:]:
+    m = re.match(r"\s*(\d+)\s+(\d+)\s+(.*)", line)
+    if not m: continue
+    pid, secs, cmd = int(m.group(1)), int(m.group(2)), m.group(3)
+    if pid == os.getpid() or "principal" in cmd or " - " in cmd[:40]: continue
+    code_hint = os.path.dirname(home.rstrip("/")) 
+    if ("sentinel.py" in cmd or "health.py" in cmd or "run.sh" in cmd) and (home in cmd or code_hint in cmd or True):
+        if secs > max(grace * 60, interval * 2):
+            hung.append((pid, secs, cmd[:80]))
+for pid, secs, cmd in hung:
+    out["findings"].append("hung %d min: %s" % (secs // 60, cmd))
+    rc, _ = sh("kill", "-TERM", str(pid))
+    time.sleep(2)
+    still = subprocess.run(["ps", "-p", str(pid)], capture_output=True, text=True).returncode == 0
+    if still: sh("kill", "-KILL", str(pid))
+    out["actions"].append("killed hung pid %d (%d min)" % (pid, secs // 60))
+
+# --- 2. absent: state has not moved for 2+ intervals
+def age_minutes(path):
+    try: return (time.time() - os.path.getmtime(path)) / 60.0
+    except OSError: return None
+age = age_minutes(os.path.join(st, "last_run.json"))
+stale = age is not None and age > (2 * interval / 60.0)
+if stale: out["findings"].append("stale record: %d min (interval %d min)" % (age, interval // 60))
+
+# --- 3. the durable fix: StartInterval does not survive sleep on these machines; a calendar schedule does
+if label and plist and plist.get("StartInterval") and stale:
+    every = max(5, min(30, int(plist["StartInterval"] // 60)))
+    plist.pop("StartInterval", None)
+    plist["StartCalendarInterval"] = [{"Minute": m} for m in range(0, 60, every)]
+    plist.setdefault("ThrottleInterval", 60)
+    plistlib.dump(plist, open(plist_path, "wb"))
+    sh("launchctl", "bootout", "gui/%d/%s" % (uid, label))
+    rc, o = sh("launchctl", "bootstrap", "gui/%d" % uid, plist_path)
+    out["actions"].append("StartInterval → StartCalendarInterval every %d min%s" % (every, "" if rc == 0 else " (bootstrap: %s)" % o.strip()[:80]))
+
+# --- 4. kick it now if it is late
+if label and (stale or hung):
+    rc, o = sh("launchctl", "kickstart", "-k", "gui/%d/%s" % (uid, label))
+    out["actions"].append("kickstarted %s%s" % (label, "" if rc == 0 else " (%s)" % o.strip()[:60]))
+elif label is None:
+    out["findings"].append("no launchd job found for this home — nothing schedules this sentinel")
+print(json.dumps(out))
+"""
+
+
+def heal(only=None, grace_minutes=20):
+    """Don't just grade the classroom — fix the ones that stopped teaching.
+
+    A sentinel is useless in exactly three ways: it hangs (a slow network read wedges the tick), it
+    goes absent (launchd's StartInterval quietly stops firing after the machine sleeps), or it goes
+    silent (its mouth is blocked). This heals the first two on the machine itself, hands the third to
+    relay(), and then RE-VISITS to prove the fix took — a heal that isn't verified is just a hope."""
+    cfg = load_config(); healed = []
+    for room in cfg["classrooms"]:
+        if only and room["slug"] != only: continue
+        if room.get("heal") is False: continue
+        interp = room.get("python") or "python3"
+        if room.get("transport") == "local":
+            argv = [sys.executable, "-", room["home"], str(grace_minutes)]
+        elif str(room.get("os", "")).lower().startswith("win"):
+            print("[principal] %s: windows classroom — heal not supported, reporting only" % room["slug"]); continue
+        else:
+            argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", room["host"],
+                    "%s - %s %d" % (interp, shlex.quote(room["home"]), grace_minutes)]
+        try:
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=180, input=HEAL)
+            lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
+            if not lines:
+                print("[principal] heal %s: no reply (%s)" % (room["slug"], ((r.stderr or "").strip().splitlines() or ["silent"])[-1][:90])); continue
+            res = json.loads(lines[-1])
+        except Exception as e:
+            print("[principal] heal %s failed: %s: %s" % (room["slug"], type(e).__name__, e)); continue
+        if res.get("actions"):
+            print("[principal] healed %s: %s" % (room["slug"], "; ".join(res["actions"])))
+            healed.append((room, res))
+        elif res.get("findings"):
+            print("[principal] %s: %s (no action taken)" % (room["slug"], "; ".join(res["findings"])))
+    carried = relay(only=only)
+    # prove it: re-visit every classroom we touched and report the grade it earns AFTER the fix
+    proved = []
+    for room, res in healed:
+        time.sleep(5)
+        snap, err = gather(room)
+        obs = evaluate(room, snap, (load_card().get("classrooms", {}).get(room["slug"]) or {}).get("latest")) if snap else unreachable_observation(room, err)
+        record(obs, cfg); proved.append((room, res, obs))
+        print("[principal] after heal, %s grades %s (%s)" % (room["slug"], obs["grade"], (obs["notes"] or ["—"])[0][:80]))
+    if proved:
+        write_dashboard()
+        notify(cfg, "🩺 The Principal healed %d classroom(s):\n%s" % (len(proved), "\n".join(
+            "%s — %s → now %s" % (r["name"], "; ".join(res["actions"])[:90], obs["grade"]) for r, res, obs in proved)))
+        try:
+            import outbox; outbox.drain()
+        except Exception: pass
+    if not proved and not carried:
+        print("[principal] nothing to heal — every classroom is teaching")
+    return proved
+
+
 if __name__ == "__main__":
     a = sys.argv[1:] or ["tick"]
     if a[0] == "tick":
         tick(only=(a[1] if len(a) > 1 else None))
     elif a[0] == "card":
         print(json.dumps(load_card(), indent=2))
+    elif a[0] == "heal":
+        heal(only=(a[1] if len(a) > 1 else None))
+    elif a[0] == "relay":
+        relay(only=(a[1] if len(a) > 1 else None))
+    elif a[0] == "memo":
+        memo(day=(a[1] if len(a) > 1 else None))
     elif a[0] == "gather":
         cfg = load_config(); room = next(r for r in cfg["classrooms"] if r["slug"] == a[1])
         snap, err = gather(room); print(json.dumps(snap if snap else {"error": err}, indent=1)[:4000])
