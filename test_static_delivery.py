@@ -101,6 +101,7 @@ class PortableReportTests(unittest.TestCase):
         script = (root / "install-launchd.sh").read_text(encoding="utf-8")
         self.assertIn('OLABEL="com.rapp.outbox-drain"', script)
         self.assertIn('$DIR/$OLABEL.plist.template', script)
+        self.assertIn('launchctl enable "gui/$(id -u)/$OLABEL"', script)
         self.assertIn('launchctl load "$OPLIST"', script)
 
     def test_install_script_reconciles_art_and_nightwatch_jobs(self):
