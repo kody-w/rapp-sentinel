@@ -110,6 +110,7 @@ OPLIST="$HOME/Library/LaunchAgents/$OLABEL.plist"
 sed "s|__DIR__|$DIR|g; s|__HOME__|$HOME|g" \
   "$DIR/$OLABEL.plist.template" > "$OPLIST"
 stamp_home "$OPLIST"
+launchctl enable "gui/$(id -u)/$OLABEL" 2>/dev/null || true
 launchctl unload "$OPLIST" 2>/dev/null || true
 launchctl load "$OPLIST"
 echo "loaded $OLABEL — drains queued iMessage reports every 5 min"
