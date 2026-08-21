@@ -218,9 +218,14 @@ The worker (`evolve_worker.py`, `com.rapp.evolve-worker`, every 30 min):
 | liveness | every pass writes a heartbeat, and `w_evolve_worker` reports enabled-but-never-loaded or stale |
 | bounded sub-sentinel fan-out | optional: 3-5 read-only children in separate processes with no repo, no token and no ability to spawn children, aggregated deterministically into exactly 10 finalists — see below |
 | deterministic gate | exactly **two root-level regular files** (`lstat`: no symlink, no hardlink, no fifo, not executable, nothing nested) in one new `submissions/<slug>/`, valid slug/schema/kind/extension/license, piece ≤ 50 KB, SVG parses with no script, no `on*` handler and no external reference (including CSS), and `_dada_cycle` proving 1-5 rounds of **exactly 10** scored candidates whose round one reproduces the finalist records by digest |
+| one repository, two names | the configured `repo` is normalised once: a validated transport URL for git, and `[HOST/]OWNER/REPO` for gh. `owner/name`, a full `https://` URL and a `.git` suffix all describe the same repository — before this, a URL config passed the auth preflight and then died at `gh pr create --repo https://…` |
+| one controller per pass | the pinned git and gh binaries, the sanitized git environment with its generated credential helper, the gh environment and both repository forms are resolved **once** and threaded through every call — preflight, clone, push, PR, merge, cleanup and reconciliation. No module-level cache, so a pass cannot inherit a choice made by an earlier one |
+| publish auth, checked first | before any child process, the controller asks GitHub whether this account may push to the configured repo and asks `git credential fill` whether credentials resolve — lengths logged, never values. Its credential helper is generated, not inherited: a fixed `gh auth git-credential` with the real HOME and validated gh config given to that process alone, never to git's environment and never to a model's |
+| child replies are typed | children run with `--output-format=json` and are read only from the final `assistant.message` event — never reasoning, which contains the same JSON. One unparseable reply earns exactly one format-repair process if the deadline and process cap allow (`format_repair_attempts` is 0 or 1 — anything else is a configuration error, not a clamp); it is debited as a spend, recorded, and every attempt's transcript is kept outside the disposable workspace |
 | controller-owned publish | the branch, commit, PR, PR **file scope as GitHub reports it**, squash merge, and the re-read of `origin/main` and the merge commit afterwards are all done by code |
+| dual public deployment | optional `rapp_vision` mirrors the exact gated bytes into a RAPP Vision channel after the canonical collective merge; success stays pending until both GitHub Pages experiences answer, and reconciliation retries without spending another model |
 | honest outcomes | only a re-read merge sends a 🎨; a timeout, failure, rejection or decline is recorded as what it was |
-| one text per merge | a verified merge sends exactly one iMessage: title, a tappable Pages URL for the piece itself, the GitHub source and PR URLs, and one sentence of concept — see below |
+| one text per deployment | a verified dual deployment sends exactly one iMessage: title, one sentence, the Public Art Collective Pages experience, and the RAPP Vision watch experience — no private report or LAN URL |
 
 `SENTINEL_RESULT: CONTRIBUTED` is a claim, not a receipt. The creative ledger,
 the cadence history, the chain frame and the notification move only after the
@@ -231,9 +236,9 @@ Honest limit: the deterministic gate encodes the submission protocol *as it
 was read* — a repo that changes its protocol needs the gate updated with it,
 on purpose, so a PR cannot relax the rules that judge it.
 
-#### The one text a merge earns
+#### The one text a dual deployment earns
 
-A verified merge — and *only* a verified merge — sends a single iMessage to
+A verified final deployment — and *only* that deployment — sends one iMessage to
 `report_number` (falling back to `notify_handle`):
 
 ```
@@ -241,21 +246,20 @@ A verified merge — and *only* a verified merge — sends a single iMessage to
 
 Nine consecutive attestations so identical that each one's prev equals its own payload_hash.
 
-View: https://kody-w.github.io/public-art-collective/submissions/nine-sworn-assurances/piece.svg
-Source: https://github.com/kody-w/public-art-collective/blob/main/submissions/nine-sworn-assurances/piece.svg
-PR: https://github.com/kody-w/public-art-collective/pull/12
+Public Art Collective: https://kody-w.github.io/public-art-collective/submissions/nine-sworn-assurances/piece.svg
+RAPP Vision: https://kody-w.github.io/rapp-vision/#/watch/nine-sworn-assurances
 ```
 
-- **View** is the GitHub Pages copy of the piece itself: one tap, the artwork,
-  no navigation. Derived deterministically from `commons_repo` (falling back to
-  `evolve_worker.repo`) plus the merged slug and extension — never guessed at
-  send time, and URL-encoded per path segment.
+- **Public Art Collective** is the GitHub Pages copy of the canonical piece.
+  **RAPP Vision** is its watch route in the actual player. Both are derived
+  deterministically and probed before the ledger can move.
 - **Concept** is one sentence taken from the piece's own record: `_concept`,
   else the first sentence of `_artist_statement`, else the premise of the
   candidate that actually won its cycle. Nothing is summarised on the piece's
   behalf, because a summary nobody wrote is a claim nobody made.
-- The static HTML report is **rebuilt before** the message is queued, so the
-  evidence links in it render the chain frames this cycle just wrote.
+- `notification_mode: "art-only"` suppresses nightwatch, health transitions,
+  diagnostics, and private static-report links while retaining this one final
+  deployment receipt.
 
 Nothing else sends it. `SENTINEL_RESULT: CONTRIBUTED` does not; a PR that was
 opened does not; an abort after the PR does not. The message is built inside
@@ -263,10 +267,11 @@ the same branch that already re-read the merge commit from `origin/main` and
 compared the merged bytes to the gated bytes — so if the text arrives, the art
 is live at the URL in it.
 
-The **View** link is probed after the merge before the message is queued:
-Pages publishes on its own schedule, so a bounded retry runs first, then the
-raw file URL as a fallback (labelled as such), and if neither answers the
-message says so. A triumphant 404 teaches the reader to ignore the next one.
+Both Pages deployments are probed after their merges and before the message is
+queued. Pages publishes on its own schedule, so a bounded retry runs first; if
+either experience is not ready, the transaction remains pending and the next
+worker pass retries deployment without spending another model. A triumphant
+404 teaches the reader to ignore the next one.
 
 It is queued through the ordinary outbox exactly once, like every other alert,
 and the delivery layer classifies it: sent, unverified, or dead-lettered after
@@ -278,8 +283,8 @@ alarm is broken is the exact silence this repo exists to refuse. Naming
 `alert_delivery` in `degraded_allowlist` does not help; it is one of two ids
 (with `health_runtime`) the gate refuses to silence.
 
-Set `commons_repo` to `owner/name` to get the links; without it the message
-still sends with the PR URL and says plainly that no public URL was derivable.
+Set `commons_repo` and `evolve_worker.rapp_vision` to enable the two-link final
+receipt. A dual deployment with either URL missing does not send.
 
 #### Sub-sentinels: a bounded fan-out before the maker
 

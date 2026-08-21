@@ -8,6 +8,7 @@ touches the live instance, GitHub, or a model.
 """
 
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -147,6 +148,8 @@ class ScratchCase(unittest.TestCase):
             "HISTORY_PATH": self.state / "evolve-worker-history.json",
             "TURN_PATH": self.state / "evolve-worker-turn.json",
             "ALERT_PATH": self.state / "evolve-worker-alerts.json",
+            "STATUS_PATH": self.state / "evolve-worker-status.json",
+            "TRANSACTION_PATH": self.state / "evolve-worker-transaction.json",
         }
         for name, value in patches.items():
             p = mock.patch.object(EW, name, value)
@@ -170,9 +173,10 @@ class ScratchCase(unittest.TestCase):
         self.notifications = []
         p = mock.patch.object(
             EW.sentinel, "notify",
-            side_effect=lambda cfg, text, to=None, rebuild=False:
+            side_effect=lambda cfg, text, to=None, rebuild=False, **options:
             self.notifications.append({"text": text, "to": to,
                                        "rebuild": rebuild,
+                                       **options,
                                        "history": _history_snapshot()}))
         p.start()
         self.addCleanup(p.stop)
@@ -772,7 +776,7 @@ class FakeGh:
         self.extra_file = None      # to fake a PR that touches more than it should
         self.merged = False
 
-    def __call__(self, *args, timeout=None):
+    def __call__(self, *args, timeout=None, wcfg=None, ctx=None):
         self.calls.append(args)
         if args[:2] == ("pr", "create"):
             self.branch = args[args.index("--head") + 1]
@@ -979,7 +983,7 @@ class WorkerRunTests(WorkerEnv):
         self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
 
     def test_a_failed_pr_creation_does_not_orphan_the_pushed_branch(self):
-        def failing_create(*args, timeout=None):
+        def failing_create(*args, timeout=None, **kw):
             self.gh.calls.append(args)
             if args[:2] == ("pr", "create"):
                 raise EW.CommandError("gh pr create exited 1: rate limited")
@@ -1335,9 +1339,11 @@ class ArtNotificationTests(WorkerEnv):
         text = note["text"]
         self.assertIn(EW.SUCCESS_PREFIX, text)
         self.assertIn("New Piece", text, "the title a human recognises")
-        self.assertIn(f"View: {self.VIEW}", text, "one tap to the artwork")
-        self.assertIn(f"Source: {self.SOURCE}", text)
-        self.assertIn(f"PR: {summary['receipts']['pr_url']}", text)
+        self.assertIn(f"Public Art Collective: {self.VIEW}", text,
+                      "one tap to the artwork")
+        self.assertNotIn("Static HTML report:", text)
+        self.assertEqual("art", note["kind"])
+        self.assertFalse(note["attach_report"])
         self.assertEqual("+15550000002", note["to"],
                          "art news goes to the configured report number")
 
@@ -1373,11 +1379,12 @@ class ArtNotificationTests(WorkerEnv):
         self.assertIn("premise 1.1", self.texts()[0],
                       "the premise that actually won its cycle")
 
-    def test_the_static_report_is_rebuilt_after_the_merge_is_recorded(self):
+    def test_the_message_is_built_after_the_merge_without_a_private_report(self):
         with mock.patch.object(EW, "run_model", self.model_that_submits()):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         note = self.notifications[0]
-        self.assertTrue(note["rebuild"], "linked evidence must be current")
+        self.assertFalse(note["attach_report"],
+                         "final art carries public platform links, not LAN reports")
         self.assertEqual([EW.OUTCOME_CONTRIBUTED],
                          [r["outcome"] for r in note["history"]],
                          "the ledger is written before the message is built")
@@ -1389,15 +1396,13 @@ class ArtNotificationTests(WorkerEnv):
         text = self.texts()[0]
         self.assertIn("https://someone-else.github.io/other-commons/"
                       "submissions/new-piece/piece.svg", text)
-        self.assertIn("https://github.com/someone-else/other-commons/blob/main/"
-                      "submissions/new-piece/piece.svg", text)
 
     def test_no_message_for_a_timeout(self):
         with mock.patch.object(EW, "run_model",
                                lambda ws, p, w, d=0, r=None: (EW.OUTCOME_TIMEOUT, "timed out")):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         self.assertEqual(1, len(self.notifications))
-        self.assertNotIn("View:", self.texts()[0])
+        self.assertNotIn("Public Art Collective:", self.texts()[0])
         self.assertNotIn(EW.SUCCESS_PREFIX, self.texts()[0])
 
     def test_no_message_for_a_declined_cycle(self):
@@ -1417,7 +1422,7 @@ class ArtNotificationTests(WorkerEnv):
                                   health=lambda phase: phases[phase])
         self.assertEqual(EW.OUTCOME_ABORTED, summary["outcome"])
         for text in self.texts():
-            self.assertNotIn("View:", text)
+            self.assertNotIn("Public Art Collective:", text)
             self.assertNotIn(EW.SUCCESS_PREFIX, text)
 
     def test_no_art_message_when_the_gate_rejects(self):
@@ -1425,7 +1430,7 @@ class ArtNotificationTests(WorkerEnv):
                 slug="second-piece", cycle=9)):
             summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"])
-        self.assertFalse(any("View:" in t for t in self.texts()))
+        self.assertFalse(any("Public Art Collective:" in t for t in self.texts()))
 
 
 class ArtUrlTests(unittest.TestCase):
@@ -1493,14 +1498,275 @@ class ArtUrlTests(unittest.TestCase):
             {"instance_name": "Dada"}, {"repo": "/local/path"},
             {"title": "Thing", "piece_path": "submissions/a/piece.svg",
              "meta": {"title": "Thing"}}, {"pr_url": "https://example/pr/1"})
-        self.assertIn("no public URL derivable", text)
-        self.assertIn("PR: https://example/pr/1", text)
+        self.assertIn("no Public Art Collective Pages URL", text)
 
     def test_the_recipient_prefers_the_report_number(self):
         self.assertEqual("+1555", EW.art_recipient(
             {"report_number": "+1555", "notify_handle": "+1999"}))
         self.assertEqual("+1999", EW.art_recipient({"notify_handle": "+1999"}))
         self.assertEqual("", EW.art_recipient({}))
+
+
+class VisionAdapterTests(ScratchCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.home / "vision"
+        self.repo.mkdir()
+        (self.repo / "channels.json").write_text(json.dumps({
+            "schema": EW.VISION_NETWORK_SCHEMA,
+            "revision": {"sequence": 1, "updated": "2026-08-01T00:00:00Z"},
+            "channels": [],
+        }), encoding="utf-8")
+        self.wcfg = EW.worker_config({"evolve_worker": {
+            "rapp_vision": {"enabled": True, "repo": str(self.repo)}}})
+        self.vcfg = EW.vision_config(self.wcfg)
+        meta = meta_for("new-piece")
+        self.submission = {
+            "slug": "new-piece",
+            "title": "New Piece",
+            "kind": "svg",
+            "meta": meta,
+            "piece_path": "submissions/new-piece/piece.svg",
+            "piece_sha256": hashlib.sha256(SVG.encode()).hexdigest(),
+        }
+
+    def test_one_artifact_becomes_one_registered_live_entry(self):
+        entry, changed = EW.write_vision_files(
+            self.repo, self.submission, SVG.encode(), self.vcfg)
+        self.assertEqual(
+            ["channels.json", "dada/channel.json",
+             "dada/media/new-piece.svg"],
+            changed)
+        self.assertEqual("media/new-piece.svg",
+                         entry["live"]["scenes"][1]["app"])
+        self.assertEqual("media/new-piece.svg", entry["thumb"])
+        self.assertEqual([], entry["sources"])
+        channel = json.loads((self.repo / "dada/channel.json").read_text())
+        self.assertEqual(["new-piece"], [v["id"] for v in channel["videos"]])
+        registry = json.loads((self.repo / "channels.json").read_text())
+        self.assertEqual("dada-collective", registry["channels"][-1]["id"])
+
+    def test_reapplying_the_same_art_is_idempotent(self):
+        EW.write_vision_files(
+            self.repo, self.submission, SVG.encode(), self.vcfg)
+        _, changed = EW.write_vision_files(
+            self.repo, self.submission, SVG.encode(), self.vcfg)
+        self.assertEqual([], changed)
+
+    def test_an_existing_id_with_different_bytes_fails_closed(self):
+        EW.write_vision_files(
+            self.repo, self.submission, SVG.encode(), self.vcfg)
+        with self.assertRaises(EW.GateError):
+            EW.write_vision_files(
+                self.repo, self.submission, b"<svg/>", self.vcfg)
+
+    def test_platform_urls_are_public_experience_links(self):
+        urls = EW.vision_urls(
+            {**self.vcfg, "repo": "kody-w/rapp-vision"},
+            self.submission)
+        self.assertEqual(
+            "https://kody-w.github.io/rapp-vision/#/watch/new-piece",
+            urls["watch_url"])
+        self.assertEqual(
+            "https://kody-w.github.io/rapp-vision/dada/media/new-piece.svg",
+            urls["media_url"])
+        self.assertEqual(urls["media_url"], urls["scene_url"])
+
+    def test_unsafe_channel_paths_are_refused(self):
+        bad = dict(self.wcfg, rapp_vision={
+            **self.wcfg["rapp_vision"], "channel_path": "../channel.json"})
+        with self.assertRaises(EW.GateError):
+            EW.vision_config(bad)
+
+
+class VisionPublisherTests(ScratchCase):
+    def setUp(self):
+        super().setUp()
+        self.origin = self.home / "vision-origin.git"
+        seed = self.home / "vision-seed"
+        seed.mkdir()
+        git(seed, "init", "-b", "main")
+        git(seed, "config", "user.email", "t@example.com")
+        git(seed, "config", "user.name", "t")
+        (seed / "channels.json").write_text(json.dumps({
+            "schema": EW.VISION_NETWORK_SCHEMA,
+            "revision": {"sequence": 1, "updated": "2026-08-01T00:00:00Z"},
+            "channels": [],
+        }), encoding="utf-8")
+        git(seed, "add", "-A")
+        git(seed, "commit", "-m", "seed")
+        git(self.home, "init", "--bare", "-b", "main", str(self.origin))
+        git(seed, "remote", "add", "origin", str(self.origin))
+        git(seed, "push", "-u", "origin", "main")
+        self.fake_gh = FakeGh(self.origin)
+        patch = mock.patch.object(EW, "_gh", self.fake_gh)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.wcfg = EW.worker_config({"evolve_worker": {
+            "repo": str(self.home / "collective.git"),
+            "git_author_name": "test",
+            "git_author_email": "t@example.com",
+            "rapp_vision": {"enabled": True, "repo": str(self.origin)},
+        }})
+        meta = meta_for("new-piece")
+        self.submission = {
+            "slug": "new-piece", "title": "New Piece", "kind": "svg",
+            "meta": meta, "piece_path": "submissions/new-piece/piece.svg",
+            "piece_sha256": hashlib.sha256(SVG.encode()).hexdigest(),
+        }
+
+    def test_publish_merges_and_re_reads_the_channel(self):
+        workspace = self.home / "workspace"
+        workspace.mkdir()
+        receipts = EW.publish_rapp_vision(
+            workspace, self.submission, SVG.encode(), self.wcfg,
+            lambda phase: healthy())
+        self.assertTrue(receipts["merge_commit"])
+        tree = git_bare(self.origin, "ls-tree", "-r", "--name-only", "main")
+        self.assertIn("dada/channel.json", tree)
+        self.assertIn("dada/media/new-piece.svg", tree)
+        self.assertTrue(self.fake_gh.called("pr", "merge"))
+
+        second_workspace = self.home / "workspace-2"
+        second_workspace.mkdir()
+        calls = len(self.fake_gh.calls)
+        repeated = EW.publish_rapp_vision(
+            second_workspace, self.submission, SVG.encode(), self.wcfg,
+            lambda phase: healthy())
+        self.assertEqual(receipts["media_url"], repeated["media_url"])
+        self.assertEqual(calls, len(self.fake_gh.calls),
+                         "an already deployed entry opens no second PR")
+
+
+class DualDeploymentFlowTests(WorkerEnv):
+    def config(self):
+        return worker_cfg(
+            notification_mode="art-only",
+            evolve_worker={
+                "repo": str(self.origin),
+                "git_author_name": "test",
+                "git_author_email": "t@example.com",
+                "rapp_vision": {
+                    "enabled": True,
+                    "repo": str(self.origin),
+                },
+            })
+
+    def deployed(self, collective):
+        return {
+            **collective,
+            "collective_url": (
+                "https://kody-w.github.io/public-art-collective/"
+                "submissions/new-piece/piece.svg"),
+            "vision_url": (
+                "https://kody-w.github.io/rapp-vision/#/watch/new-piece"),
+            "vision": {
+                "watch_url": (
+                    "https://kody-w.github.io/rapp-vision/#/watch/new-piece"),
+            },
+        }
+
+    def test_success_is_recorded_only_after_both_platforms(self):
+        def finish(cfg, wcfg, workspace, clone, submission, receipts, health,
+                   transaction=None):
+            return self.deployed(receipts)
+
+        with mock.patch.object(EW, "run_model", self.model_that_submits()), \
+             mock.patch.object(EW, "finish_platform_deployments", finish):
+            summary = EW.run_once(
+                cfg=self.config(), health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        self.assertEqual(1, len(self.notifications))
+        text = self.texts()[0]
+        self.assertIn("Public Art Collective:", text)
+        self.assertIn("RAPP Vision:", text)
+        self.assertNotIn("Static HTML report:", text)
+
+    def test_partial_deployment_stays_pending_and_silent(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()), \
+             mock.patch.object(
+                 EW, "finish_platform_deployments",
+                 side_effect=EW.DeploymentPending("Pages still building")):
+            summary = EW.run_once(
+                cfg=self.config(), health=lambda phase: healthy())
+        self.assertEqual("deployment-pending", summary["outcome"])
+        self.assertEqual([], self.notifications)
+        self.assertTrue(EW.TRANSACTION_PATH.exists())
+        history = json.loads(EW.HISTORY_PATH.read_text())
+        self.assertEqual("pending", history[0]["outcome"])
+
+    def test_next_pass_reconciles_without_spending_another_model(self):
+        with mock.patch.object(EW, "run_model", self.model_that_submits()), \
+             mock.patch.object(
+                 EW, "finish_platform_deployments",
+                 side_effect=EW.DeploymentPending("Pages still building")):
+            EW.run_once(cfg=self.config(), health=lambda phase: healthy())
+
+        def finish(cfg, wcfg, workspace, clone, submission, receipts, health,
+                   transaction=None):
+            return self.deployed(receipts)
+
+        with mock.patch.object(EW, "run_model") as maker, \
+             mock.patch.object(EW, "finish_platform_deployments", finish):
+            summary = EW.run_once(
+                cfg=self.config(), health=lambda phase: healthy())
+        self.assertEqual("reconciled-contributed", summary["outcome"], summary)
+        maker.assert_not_called()
+        self.assertEqual(1, len(self.notifications))
+        self.assertFalse(EW.TRANSACTION_PATH.exists())
+
+    def test_persistent_pending_becomes_a_visible_fail_closed_state(self):
+        cfg = self.config()
+        wcfg = EW.worker_config(cfg)
+        wcfg["rapp_vision"]["deployment_retry_limit"] = 2
+        row = {"id": "row", "at": NOW.isoformat(), "outcome": "pending",
+               "role": "openrappter", "cycle": 1}
+        history = [row]
+        EW.save_history(history)
+        note = EW.transaction_writer("row", {"phase": "collective-merged"})
+        note()
+        first = EW.deployment_pending(
+            history, row, EW.DeploymentPending("wait"),
+            transaction=note, wcfg=wcfg)
+        second = EW.deployment_pending(
+            history, row, EW.DeploymentPending("wait"),
+            transaction=note, wcfg=wcfg)
+        self.assertEqual("deployment-pending", first["outcome"])
+        self.assertEqual("fail-closed", second["outcome"])
+        status = json.loads(EW.STATUS_PATH.read_text())
+        self.assertEqual("fail-closed", status["outcome"])
+        self.assertEqual(2, status["deployment_attempts"])
+
+    def test_an_interrupted_vision_pr_is_closed_before_retry(self):
+        wcfg = EW.worker_config(self.config())
+        EW.clean_interrupted_vision_pr(
+            {"vision_pr_number": "7"}, wcfg)
+        self.assertTrue(self.gh.called("pr", "close"))
+
+    def test_retry_uses_the_channel_contract_captured_by_the_cycle(self):
+        original = self.config()
+        with mock.patch.object(EW, "run_model", self.model_that_submits()), \
+             mock.patch.object(
+                 EW, "finish_platform_deployments",
+                 side_effect=EW.DeploymentPending("Pages still building")):
+            EW.run_once(cfg=original, health=lambda phase: healthy())
+
+        changed = self.config()
+        changed["evolve_worker"]["rapp_vision"]["duration"] = 120
+        seen = {}
+
+        def finish(cfg, wcfg, workspace, clone, submission, receipts, health,
+                   transaction=None):
+            seen["duration"] = wcfg["rapp_vision"]["duration"]
+            return self.deployed(receipts)
+
+        with mock.patch.object(EW, "run_model") as maker, \
+             mock.patch.object(EW, "finish_platform_deployments", finish):
+            summary = EW.run_once(
+                cfg=changed, health=lambda phase: healthy())
+        self.assertEqual("reconciled-contributed", summary["outcome"])
+        self.assertEqual(60, seen["duration"])
+        maker.assert_not_called()
 
 
 class ArtDeliveryTests(WorkerEnv):
@@ -1540,11 +1806,11 @@ class ArtDeliveryTests(WorkerEnv):
         message = self.enqueued[0]
         self.assertEqual("+15550000002", message["to"])
         self.assertIn("New Piece", message["text"])
-        self.assertIn("View: https://kody-w.github.io/public-art-collective/"
+        self.assertIn("Public Art Collective: "
+                      "https://kody-w.github.io/public-art-collective/"
                       "submissions/new-piece/piece.svg", message["text"])
-        self.assertIn("Static HTML report:", message["text"],
-                      "the rebuilt report rides along as evidence")
-        self.assertTrue(self.snapshot.call_args.kwargs["rebuild"])
+        self.assertNotIn("Static HTML report:", message["text"])
+        self.snapshot.assert_not_called()
         self.assertEqual(1, self.drain.call_count,
                          "the delivery layer, not this worker, decides what "
                          "'sent' means")
@@ -1564,7 +1830,8 @@ class ArtDeliveryTests(WorkerEnv):
                                   health=lambda phase: phases[phase])
         self.assertEqual(EW.OUTCOME_ABORTED, summary["outcome"])
         self.assertEqual(1, len(self.enqueued), "the abort is reported…")
-        self.assertNotIn("View:", self.enqueued[0]["text"], "…but not as art")
+        self.assertNotIn("Public Art Collective:", self.enqueued[0]["text"],
+                         "…but not as art")
         self.assertNotIn(EW.SUCCESS_PREFIX, self.enqueued[0]["text"])
 
     def test_the_worker_never_claims_delivery_it_cannot_verify(self):
@@ -1862,7 +2129,7 @@ class CleanupIntegrityTests(WorkerEnv):
     def gh_that_fails_pr_create_after_injecting_a_pushurl(self, clone_holder):
         """The repro: the push succeeds, then a pushurl appears, then PR
         creation fails and the cleanup path runs."""
-        def fake(*args, timeout=None):
+        def fake(*args, timeout=None, **kw):
             self.gh.calls.append(args)
             if args[:2] == ("pr", "create"):
                 clone = clone_holder.get("clone")
@@ -1988,7 +2255,7 @@ class CleanupIntegrityTests(WorkerEnv):
         import ast
         path = Path(__file__).resolve().parent / "evolve_worker.py"
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        allowed = {"_git", "_git_bytes", "_credential_helper", "_gh"}
+        allowed = {"_git", "_git_bytes", "_gh", "assert_publish_auth"}
         found = {}
 
         def argv0_is_a_binary(call):
@@ -2001,9 +2268,13 @@ class CleanupIntegrityTests(WorkerEnv):
             first = call.args[0].elts[0]
             if isinstance(first, ast.Constant) and first.value in ("git", "gh"):
                 return True
-            return (isinstance(first, ast.Call)
+            if (isinstance(first, ast.Call)
                     and getattr(first.func, "id", "") in ("git_binary",
-                                                          "gh_binary"))
+                                                          "gh_binary")):
+                return True
+            # the pinned binary now arrives on the controller context
+            return (isinstance(first, ast.Attribute)
+                    and first.attr in ("git_path", "gh_path"))
 
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -2072,7 +2343,7 @@ class CloneIsolationTests(WorkerEnv):
         # …and that the controller's clone is immune to it.
         with mock.patch.dict(os.environ,
                              {"GIT_CONFIG_GLOBAL": str(self.gitconfig)}), \
-             mock.patch.object(EW, "_GIT_ENV", None):
+             mock.patch.object(EW, "_CTX_CACHE", {}):
             head = EW._clone_repo(self.wcfg, clone)
 
         self.assertEqual("CANONICAL", (clone / "MARKER").read_text().strip(),
@@ -2090,7 +2361,7 @@ class CloneIsolationTests(WorkerEnv):
             "GIT_CONFIG_VALUE_0": str(self.origin),
         }
         with mock.patch.dict(os.environ, hostile), \
-             mock.patch.object(EW, "_GIT_ENV", None):
+             mock.patch.object(EW, "_CTX_CACHE", {}):
             EW._clone_repo(self.wcfg, clone)
         self.assertEqual("CANONICAL", (clone / "MARKER").read_text().strip())
 
@@ -2098,7 +2369,7 @@ class CloneIsolationTests(WorkerEnv):
         with mock.patch.dict(os.environ, {"https_proxy": "http://evil:8080",
                                           "GIT_SSH_COMMAND": "ssh -o x=y",
                                           "GIT_CONFIG_PARAMETERS": "'a.b=c'"}), \
-             mock.patch.object(EW, "_GIT_ENV", None):
+             mock.patch.object(EW, "_CTX_CACHE", {}):
             env = EW.controller_git_env()
         for leaked in ("https_proxy", "GIT_SSH_COMMAND", "GIT_CONFIG_PARAMETERS",
                        "GIT_CONFIG_COUNT", "GIT_PROXY_COMMAND"):
@@ -2110,22 +2381,20 @@ class CloneIsolationTests(WorkerEnv):
         config = Path(env["GIT_CONFIG_GLOBAL"]).read_text(encoding="utf-8")
         directives = [line for line in config.splitlines()
                       if line.strip() and not line.lstrip().startswith("#")]
-        self.assertTrue(all(d.startswith(("[credential]", "\thelper"))
+        self.assertTrue(all(d.startswith(('[credential "https://github.com"]',
+                                          "\thelper"))
                             for d in directives),
                         f"the sanitized config holds more than a helper: "
                         f"{directives}")
 
-    def test_a_shell_credential_helper_is_never_carried_over(self):
-        with mock.patch.object(EW.subprocess, "run",
-                               return_value=subprocess.CompletedProcess(
-                                   [], 0, stdout="!evil --steal\n", stderr="")):
-            self.assertEqual("", EW._credential_helper())
-
-    def test_a_plain_credential_helper_is_carried_over(self):
-        with mock.patch.object(EW.subprocess, "run",
-                               return_value=subprocess.CompletedProcess(
-                                   [], 0, stdout="osxkeychain\n", stderr="")):
-            self.assertEqual("osxkeychain", EW._credential_helper())
+    def test_the_helper_is_generated_from_the_pinned_gh(self):
+        # nothing is inherited any more: the helper is a file this code
+        # writes, naming the validated gh binary and one fixed subcommand
+        helper = EW.credential_helper_path(None, self.home / "githome")
+        body = helper.read_text()
+        self.assertIn(EW.gh_binary(), body)
+        self.assertIn("auth git-credential", body)
+        self.assertNotIn("credential.helper", body)
 
     # ── url shapes ──
     def test_hostile_repo_urls_are_refused_before_git_sees_them(self):
@@ -2231,7 +2500,7 @@ class HostileEnvironmentTests(WorkerEnv):
         return f"/hostile/{name.lower()}"
 
     def fresh_env(self):
-        with mock.patch.object(EW, "_GIT_ENV", None):
+        with mock.patch.object(EW, "_CTX_CACHE", {}):
             return EW.controller_git_env()
 
     # ── the allowlist itself ──
@@ -2305,7 +2574,7 @@ class HostileEnvironmentTests(WorkerEnv):
     def test_the_initial_fetch_is_immune_to_a_hijacked_exec_path(self):
         clone = self.home / "clone"
         with mock.patch.dict(os.environ, self.hostile), \
-             mock.patch.object(EW, "_GIT_ENV", None):
+             mock.patch.object(EW, "_CTX_CACHE", {}):
             head = EW._clone_repo(self.wcfg, clone)
         self.assertFalse(self.marker.exists(),
                          "a hostile GIT_EXEC_PATH executed during the fetch")
@@ -2315,7 +2584,7 @@ class HostileEnvironmentTests(WorkerEnv):
 
     def test_the_sanitized_cleanup_is_immune_too(self):
         clone = self.home / "clone-cleanup"
-        with mock.patch.object(EW, "_GIT_ENV", None):
+        with mock.patch.object(EW, "_CTX_CACHE", {}):
             EW._clone_repo(self.wcfg, clone)
         git(clone, "config", "user.email", "t@example.com")
         git(clone, "config", "user.name", "t")
@@ -2328,7 +2597,7 @@ class HostileEnvironmentTests(WorkerEnv):
         git(clone, "config", "remote.origin.pushurl", str(self.home / "x.git"))
 
         with mock.patch.dict(os.environ, self.hostile), \
-             mock.patch.object(EW, "_GIT_ENV", None):
+             mock.patch.object(EW, "_CTX_CACHE", {}):
             self.assertTrue(EW._delete_remote_branch(clone, "art/doomed",
                                                      self.wcfg))
         self.assertFalse(self.marker.exists(),
@@ -2339,7 +2608,7 @@ class HostileEnvironmentTests(WorkerEnv):
 
     def test_a_full_cycle_survives_a_hostile_environment(self):
         with mock.patch.dict(os.environ, self.hostile), \
-             mock.patch.object(EW, "_GIT_ENV", None), \
+             mock.patch.object(EW, "_CTX_CACHE", {}), \
              mock.patch.object(EW, "run_model", self.model_that_submits()):
             summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
@@ -2383,7 +2652,7 @@ class FakeGitOnPathTests(WorkerEnv):
         self.wcfg = dict(EW.worker_config({}), repo=str(self.origin))
 
     def fresh(self):
-        return mock.patch.object(EW, "_GIT_ENV", None)
+        return mock.patch.object(EW, "_CTX_CACHE", {})
 
     # ── the vector, proved to work without the controller ──
     def test_the_fake_git_wins_for_a_naive_caller(self):
@@ -2395,11 +2664,13 @@ class FakeGitOnPathTests(WorkerEnv):
                         "the fake binary")
 
     # ── and cannot win anywhere in the controller ──
-    def test_credential_helper_discovery_uses_the_pinned_binary(self):
+    def test_building_the_credential_helper_uses_pinned_binaries(self):
         with mock.patch.dict(os.environ, self.hostile_path), self.fresh():
-            EW._credential_helper()
+            helper = EW.credential_helper_path(None, self.home / "githome")
+            EW.controller_git_env(home=self.home / "githome2")
         self.assertFalse(self.marker.exists(),
-                         "the credential helper read ran a fake git")
+                         "building the credential path ran a fake git")
+        self.assertNotIn(str(self.fakebin), helper.read_text())
 
     def test_initial_acquisition_uses_the_pinned_binary(self):
         clone = self.home / "clone"
@@ -2829,13 +3100,15 @@ class LiveRetryTests(WorkerEnv):
     def test_reconciliation_writes_the_migrated_shape(self):
         real_publish = EW.publish
 
-        def dying(clone, submission, wcfg, health, branch=None, transaction=None):
+        def dying(clone, submission, wcfg, health, branch=None,
+                  transaction=None, ctx=None):
             def note(**fields):
                 state = transaction(**fields) if transaction else {}
                 if fields.get("phase") == "merged":
                     raise KeyboardInterrupt("power cut")
                 return state
-            return real_publish(clone, submission, wcfg, health, branch, note)
+            return real_publish(clone, submission, wcfg, health, branch, note,
+                                ctx)
 
         def maker(staging, prompt, wcfg, depth=0, runtime=None):
             write_submission(Path(staging) / "out", "second-piece",
@@ -3049,6 +3322,181 @@ class StagingLeakageCycleTests(WorkerEnv):
         self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
 
 
+class PublishAuthTests(WorkerEnv):
+    """Three live cycles made art and then could not push (#B)."""
+
+    def setUp(self):
+        super().setUp()
+        self.wcfg = dict(EW.worker_config({}),
+                         repo="kody-w/public-art-collective")
+
+    def fake_fill(self, stdout, returncode=0):
+        real_run = subprocess.run
+
+        def run(argv, *a, **kw):
+            if len(argv) > 1 and argv[1] == "credential":
+                return subprocess.CompletedProcess(argv, returncode,
+                                                   stdout=stdout, stderr="")
+            return real_run(argv, *a, **kw)
+        return run
+
+    # ── the generated helper ──
+    def test_the_helper_is_generated_not_inherited(self):
+        home = self.home / "githome"
+        helper = EW.credential_helper_path(self.wcfg, home)
+        body = helper.read_text()
+        self.assertIn("auth git-credential", body)
+        self.assertIn(str(EW.REAL_HOME), body)
+        self.assertIn(str(EW.real_gh_config_dir()), body)
+        self.assertEqual(0o700, helper.stat().st_mode & 0o777)
+        self.assertTrue(body.startswith("#!/bin/sh"))
+
+    def test_a_malicious_global_helper_is_never_carried_over(self):
+        with mock.patch.object(EW, "_CTX_CACHE", {}):
+            env = EW.controller_git_env(home=self.home / "gh2")
+        config = Path(env["GIT_CONFIG_GLOBAL"]).read_text()
+        self.assertNotIn("!", config.split("helper =")[-1],
+                         "a shell helper string must never reach the config")
+        self.assertIn("gh-credential-helper", config)
+        self.assertIn('[credential "https://github.com"]', config)
+
+    def test_the_generated_config_holds_nothing_else(self):
+        with mock.patch.object(EW, "_CTX_CACHE", {}):
+            env = EW.controller_git_env(home=self.home / "gh3")
+        directives = [ln for ln in
+                      Path(env["GIT_CONFIG_GLOBAL"]).read_text().splitlines()
+                      if ln.strip() and not ln.lstrip().startswith("#")]
+        self.assertEqual(2, len(directives), directives)
+        self.assertTrue(directives[0].startswith('[credential "https://github.com"]'))
+        self.assertTrue(directives[1].strip().startswith("helper = /"))
+
+    # ── isolation of the credential material ──
+    def test_git_never_sees_the_gh_config_dir(self):
+        with mock.patch.object(EW, "_CTX_CACHE", {}):
+            env = EW.controller_git_env(home=self.home / "gh4")
+        self.assertNotIn("GH_CONFIG_DIR", env)
+        self.assertNotEqual(str(EW.REAL_HOME), env["HOME"])
+
+    def test_gh_gets_the_real_home_and_config_and_nothing_ambient(self):
+        with mock.patch.dict(os.environ, {"GIT_EXEC_PATH": "/hostile",
+                                          "https_proxy": "http://evil"}):
+            env = EW.controller_gh_env(self.wcfg)
+        self.assertEqual(str(EW.REAL_HOME), env["HOME"])
+        self.assertEqual(str(EW.real_gh_config_dir()), env["GH_CONFIG_DIR"])
+        self.assertNotIn("GIT_EXEC_PATH", env)
+        self.assertNotIn("https_proxy", env)
+
+    def test_no_model_process_can_see_the_gh_config_or_token(self):
+        ws = self.home / "modelws"
+        ws.mkdir()
+        env = SS.confined_env(SS.fanout_config({"fanout": {"isolated_home": False}}),
+                              ws, 0, env={"HOME": "/Users/x",
+                                          "GH_CONFIG_DIR": str(EW.real_gh_config_dir()),
+                                          "GITHUB_TOKEN": "secret"})
+        self.assertTrue(env["GH_CONFIG_DIR"].startswith(str(ws)),
+                        "the model's gh config must be an empty workspace dir")
+        self.assertNotIn("GITHUB_TOKEN", env)
+        self.assertNotEqual(str(EW.real_gh_config_dir()), env["GH_CONFIG_DIR"])
+
+    # ── the gh config directory itself ──
+    def test_a_gh_config_dir_outside_the_real_home_is_refused(self):
+        with self.assertRaises(EW.GateError) as cm:
+            EW.real_gh_config_dir({"gh_config_dir": "/etc"})
+        self.assertIn("not under", str(cm.exception))
+
+    def test_a_world_writable_gh_config_dir_is_refused(self):
+        loose = EW.REAL_HOME / f".rapp-test-gh-{uuid.uuid4().hex[:8]}"
+        loose.mkdir(mode=0o777)
+        self.addCleanup(loose.rmdir)
+        os.chmod(loose, 0o777)
+        with self.assertRaises(EW.GateError) as cm:
+            EW.real_gh_config_dir({"gh_config_dir": str(loose)})
+        self.assertIn("writable", str(cm.exception))
+
+    def test_a_missing_gh_config_dir_is_refused(self):
+        with self.assertRaises(EW.GateError):
+            EW.real_gh_config_dir({"gh_config_dir": str(EW.REAL_HOME / "nope-xyz")})
+
+    # ── the preflight ──
+    def test_the_preflight_passes_when_permission_and_credentials_exist(self):
+        credential = "fixture-" + "credential"
+        with mock.patch.object(EW, "_gh",
+                               return_value='{"viewerPermission": "ADMIN"}'), \
+             mock.patch.object(EW.subprocess, "run",
+                               self.fake_fill(
+                                   f"username=fixture-user\n"
+                                   f"password={credential}\n")):
+            detail = EW.assert_publish_auth(self.wcfg)
+        self.assertIn("ADMIN", detail)
+        self.assertNotIn(credential, detail, "no secret may reach a log line")
+        self.assertIn(f"password {len(credential)} chars", detail)
+
+    def test_read_only_permission_stops_the_cycle(self):
+        with mock.patch.object(EW, "_gh",
+                               return_value='{"viewerPermission": "READ"}'):
+            with self.assertRaises(EW.AbortError) as cm:
+                EW.assert_publish_auth(self.wcfg)
+        self.assertIn("READ", str(cm.exception))
+
+    def test_missing_credentials_stop_the_cycle(self):
+        with mock.patch.object(EW, "_gh",
+                               return_value='{"viewerPermission": "WRITE"}'), \
+             mock.patch.object(EW.subprocess, "run", self.fake_fill("")):
+            with self.assertRaises(EW.AbortError) as cm:
+                EW.assert_publish_auth(self.wcfg)
+        self.assertIn("no username, password", str(cm.exception))
+
+    def test_a_failing_credential_helper_stops_the_cycle(self):
+        with mock.patch.object(EW, "_gh",
+                               return_value='{"viewerPermission": "WRITE"}'), \
+             mock.patch.object(EW.subprocess, "run",
+                               self.fake_fill("", returncode=1)):
+            with self.assertRaises(EW.AbortError) as cm:
+                EW.assert_publish_auth(self.wcfg)
+        self.assertIn("credential fill failed", str(cm.exception))
+
+    def test_a_local_repo_needs_no_credentials(self):
+        detail = EW.assert_publish_auth(dict(self.wcfg, repo=str(self.origin)))
+        self.assertIn("needs no credentials", detail)
+
+    # ── ordering: before any spend ──
+    def test_the_preflight_runs_before_any_child_or_maker(self):
+        cfg = worker_cfg(evolve_worker={
+            "repo": "kody-w/public-art-collective",
+            "fanout": {"enabled": True, "children": 3}})
+        with mock.patch.object(EW, "assert_publish_auth",
+                               side_effect=EW.AbortError("no credentials")), \
+             mock.patch.object(EW.SS, "run_children") as children, \
+             mock.patch.object(EW, "run_model") as maker:
+            summary = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+        self.assertEqual("skipped", summary["outcome"])
+        self.assertIn("publish auth unavailable", summary["reason"])
+        children.assert_not_called()
+        maker.assert_not_called()
+        self.assertFalse(EW.HISTORY_PATH.exists(),
+                         "an unpublishable cycle spends nothing")
+
+    def test_a_healthy_preflight_lets_the_cycle_proceed(self):
+        with mock.patch.object(EW, "assert_publish_auth",
+                               return_value="push permission ADMIN"), \
+             mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+
+    def test_no_secret_reaches_the_worker_log(self):
+        log_text = []
+        credential = "fixture-" + "credential-secret"
+        with mock.patch.object(EW, "log", side_effect=log_text.append), \
+             mock.patch.object(EW, "_gh",
+                               return_value='{"viewerPermission": "ADMIN"}'), \
+             mock.patch.object(EW.subprocess, "run",
+                               self.fake_fill(
+                                   f"username=fixture-user\n"
+                                   f"password={credential}\n")):
+            EW.assert_publish_auth(self.wcfg)
+        self.assertFalse(any(credential in line for line in log_text))
+
+
 class LifecycleTests(WorkerEnv):
     """A stopped worker leaves nothing running (#4)."""
 
@@ -3170,13 +3618,15 @@ class ReconciliationTests(WorkerEnv):
         """A publish that dies right after `phase` was recorded."""
         real_publish = EW.publish
 
-        def dying(clone, submission, wcfg, health, branch=None, transaction=None):
+        def dying(clone, submission, wcfg, health, branch=None,
+                  transaction=None, ctx=None):
             def note(**fields):
                 state = transaction(**fields) if transaction else {}
                 if fields.get("phase") == phase:
                     raise KeyboardInterrupt("power cut")
                 return state
-            return real_publish(clone, submission, wcfg, health, branch, note)
+            return real_publish(clone, submission, wcfg, health, branch, note,
+                                ctx)
         return dying
 
     def test_a_merge_that_was_never_recorded_is_finished_on_the_next_pass(self):
@@ -3290,7 +3740,7 @@ class ViewProbeTests(WorkerEnv):
         with mock.patch.object(EW, "run_model", self.model_that_submits()):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         text = self.texts()[0]
-        self.assertIn("View: https://kody-w.github.io/", text)
+        self.assertIn("Public Art Collective: https://kody-w.github.io/", text)
         self.assertTrue(self.probes, "the url was probed before it was sent")
 
     def test_pages_lagging_falls_back_to_the_verified_raw_url(self):
@@ -3298,9 +3748,10 @@ class ViewProbeTests(WorkerEnv):
         with mock.patch.object(EW, "run_model", self.model_that_submits()):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         text = self.texts()[0]
-        self.assertIn("View: https://raw.githubusercontent.com/", text)
+        self.assertIn("Public Art Collective: https://raw.githubusercontent.com/",
+                      text)
         self.assertIn("Pages has not published it yet", text)
-        self.assertNotIn("View: https://kody-w.github.io/", text)
+        self.assertNotIn("Public Art Collective: https://kody-w.github.io/", text)
 
     def test_nothing_answering_says_so_instead_of_linking_a_404(self):
         self.probe_answer = lambda url: False
@@ -3308,9 +3759,8 @@ class ViewProbeTests(WorkerEnv):
             summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"])
         text = self.texts()[0]
-        self.assertNotIn("View:", text)
+        self.assertNotIn("Public Art Collective:", text)
         self.assertIn("no public URL answered yet", text)
-        self.assertIn("Source:", text, "the evidence links still go out")
 
     def test_the_probe_retries_before_giving_up(self):
         answers = iter([False, False, True])
@@ -3319,7 +3769,8 @@ class ViewProbeTests(WorkerEnv):
         with mock.patch.object(EW, "run_model", self.model_that_submits()):
             EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
         self.assertGreater(len(self.probes), 2, "it retried")
-        self.assertIn("View: https://kody-w.github.io/", self.texts()[0])
+        self.assertIn("Public Art Collective: https://kody-w.github.io/",
+                      self.texts()[0])
 
     def test_the_probed_url_is_recorded_in_the_ledger(self):
         with mock.patch.object(EW, "run_model", self.model_that_submits()):
@@ -3440,6 +3891,60 @@ class ChildDebitTests(WorkerEnv):
 
 
 # ── the tick keeps ticking ──────────────────────────────────────────────────
+class WorkerSupervisionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = scratch_dir("supervision")
+        self.plist = self.temp / "com.rapp.evolve-worker.plist"
+        self.plist.write_text("<plist/>", encoding="utf-8")
+        self.addCleanup(shutil.rmtree, self.temp, True)
+        self.cfg = {"evolve_worker": {"enabled": True}}
+
+    @staticmethod
+    def result(code=0, stdout="", stderr=""):
+        return subprocess.CompletedProcess([], code, stdout, stderr)
+
+    def test_a_missing_enabled_job_is_enabled_loaded_and_started(self):
+        answers = [
+            self.result(1, stderr="not found"),
+            self.result(),
+            self.result(),
+            self.result(),
+        ]
+        with mock.patch.object(sentinel.subprocess, "run",
+                               side_effect=answers) as run:
+            self.assertTrue(sentinel.ensure_evolution_worker_loaded(
+                self.cfg, plist=self.plist, platform="darwin", uid=501))
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(["/bin/launchctl", "enable",
+                          "gui/501/com.rapp.evolve-worker"], commands[1])
+        self.assertEqual(["/bin/launchctl", "bootstrap", "gui/501",
+                          str(self.plist)], commands[2])
+        self.assertEqual(["/bin/launchctl", "kickstart",
+                          "gui/501/com.rapp.evolve-worker"], commands[3])
+
+    def test_an_already_loaded_job_is_left_alone(self):
+        with mock.patch.object(
+                sentinel.subprocess, "run",
+                return_value=self.result()) as run:
+            self.assertTrue(sentinel.ensure_evolution_worker_loaded(
+                self.cfg, plist=self.plist, platform="darwin", uid=501))
+        self.assertEqual(1, run.call_count)
+
+    def test_a_disabled_worker_is_never_started(self):
+        with mock.patch.object(sentinel.subprocess, "run") as run:
+            self.assertFalse(sentinel.ensure_evolution_worker_loaded(
+                {"evolve_worker": {"enabled": False}},
+                plist=self.plist, platform="darwin", uid=501))
+        run.assert_not_called()
+
+    def test_a_wedged_launchctl_cannot_wedge_the_health_tick(self):
+        with mock.patch.object(
+                sentinel.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired("launchctl", 30)):
+            self.assertFalse(sentinel.ensure_evolution_worker_loaded(
+                self.cfg, plist=self.plist, platform="darwin", uid=501))
+
+
 class TickDelegationTests(unittest.TestCase):
     """Requirement 1: a delegated tick spends no model on art, and still
     diagnoses a critical platform failure."""
@@ -3454,7 +3959,8 @@ class TickDelegationTests(unittest.TestCase):
             p = mock.patch.object(sentinel, name, value)
             p.start()
             self.addCleanup(p.stop)
-        for name in ("notify", "refresh_dashboard", "publish_head_hook"):
+        for name in ("notify", "refresh_dashboard", "publish_head_hook",
+                     "ensure_evolution_worker_loaded"):
             if hasattr(sentinel, name):
                 p = mock.patch.object(sentinel, name, mock.Mock())
                 p.start()
@@ -3505,6 +4011,185 @@ class TickDelegationTests(unittest.TestCase):
         esc.assert_called_once()
         self.assertEqual("diagnose", esc.call_args.args[3],
                          "repair_enabled=false must still be honored")
+
+
+class RepoNormalizationTests(unittest.TestCase):
+    """git wants a transport, gh wants OWNER/REPO, and they are not the same
+    string. A configured https url passed the auth preflight and then died at
+    `gh pr create --repo https://...` (#1)."""
+
+    def norm(self, repo):
+        return EW.normalize_repo(repo, {})
+
+    def test_owner_name_is_already_the_gh_form(self):
+        r = self.norm("kody-w/public-art-collective")
+        self.assertEqual("kody-w/public-art-collective", r.gh)
+        self.assertEqual("https://github.com/kody-w/public-art-collective.git",
+                         r.transport)
+        self.assertEqual(("kody-w", "public-art-collective", "github.com"),
+                         (r.owner, r.name, r.host))
+        self.assertFalse(r.is_local)
+
+    def test_an_https_url_becomes_the_gh_form(self):
+        r = self.norm("https://github.com/kody-w/public-art-collective")
+        self.assertEqual("kody-w/public-art-collective", r.gh)
+        self.assertEqual("https://github.com/kody-w/public-art-collective",
+                         r.transport)
+
+    def test_a_dot_git_suffix_is_dropped_for_gh_but_kept_for_git(self):
+        r = self.norm("https://github.com/kody-w/public-art-collective.git")
+        self.assertEqual("kody-w/public-art-collective", r.gh,
+                         "gh rejects a name ending in .git")
+        self.assertTrue(r.transport.endswith(".git"),
+                        "the transport url is left exactly as configured")
+
+    def test_a_non_github_host_keeps_the_host_in_the_gh_name(self):
+        r = EW.normalize_repo("https://ghe.example.com/team/art",
+                              {"allowed_repo_hosts": ["ghe.example.com"]})
+        self.assertEqual("ghe.example.com/team/art", r.gh)
+
+    def test_a_local_path_has_no_gh_name(self):
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        d = SCRATCH / f"norm-{uuid.uuid4().hex[:8]}"
+        d.mkdir()
+        self.addCleanup(shutil.rmtree, d, True)
+        origin = d / "origin.git"
+        git(d, "init", "--bare", "-b", "main", str(origin))
+        r = self.norm(str(origin))
+        self.assertTrue(r.is_local)
+        self.assertIsNone(r.gh)
+
+    def test_invalid_forms_are_refused(self):
+        for bad in ("ssh://evil/x", "git@github.com:kody-w/art.git",
+                    "https://github.com/onlyowner", "ext::sh -c id",
+                    "https://evil.example.com/a/b", "", "   ", "a/b/c/d"):
+            with self.assertRaises((EW.GateError, EW.CommandError), msg=bad):
+                self.norm(bad)
+
+
+class ControllerContextTests(ScratchCase):
+    """One validated set of choices for the whole pass. A preflight that
+    validates one gh and a merge that resolves another is two decisions
+    wearing one name (#2)."""
+
+    def setUp(self):
+        super().setUp()
+        self.fakebin = self.home / "bin"
+        self.fakebin.mkdir()
+        self.log = self.home / "calls.log"
+        for name in ("git", "gh"):
+            b = self.fakebin / name
+            b.write_text(f'#!/bin/sh\necho "{name} $*" >> "{self.log}"\n'
+                         f'exit 0\n', encoding="utf-8")
+            b.chmod(0o755)
+        self.ghconfig = self.home / "ghconfig"
+        self.ghconfig.mkdir(mode=0o700)
+        (self.ghconfig / "hosts.yml").write_text("github.com:\n", encoding="utf-8")
+        self.wcfg = dict(EW.worker_config({}),
+                         repo="kody-w/public-art-collective",
+                         git_binary=str(self.fakebin / "git"),
+                         gh_binary=str(self.fakebin / "gh"),
+                         gh_config_dir=str(self.ghconfig),
+                         trusted_bin_roots=[str(self.fakebin)])
+
+    def fresh(self):
+        return mock.patch.object(EW, "_CTX_CACHE", {})
+
+    def test_the_context_pins_the_configured_binaries_once(self):
+        with self.fresh():
+            ctx = EW.controller_for(self.wcfg)
+        self.assertEqual(str(self.fakebin / "git"), ctx.git_path)
+        self.assertEqual(str(self.fakebin / "gh"), ctx.gh_path)
+        self.assertEqual("kody-w/public-art-collective", ctx.gh_repo())
+        self.assertEqual(str(self.ghconfig), ctx.gh_env["GH_CONFIG_DIR"])
+
+    def test_a_context_is_not_reused_across_a_changed_environment(self):
+        with self.fresh():
+            first = EW.controller_for(self.wcfg)
+            with mock.patch.dict(os.environ, {"PATH": "/nowhere"}):
+                second = EW.controller_for(self.wcfg)
+        self.assertIsNot(first, second,
+                         "a cached context must not survive a changed PATH")
+
+    def test_the_same_context_serves_preflight_push_pr_and_cleanup(self):
+        """Every subprocess in a pass must reach the same chosen binaries."""
+        argvs = []
+        real_run = subprocess.run
+
+        def record(argv, *a, **kw):
+            argvs.append((list(argv), (kw.get("env") or {}).get("GH_CONFIG_DIR")))
+            if argv[0].endswith("/gh"):
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout='{"viewerPermission": "ADMIN"}', stderr="")
+            if len(argv) > 1 and argv[1] == "credential":
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout="username=u\npassword=p\n", stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+        with self.fresh():
+            ctx = EW.controller_for(self.wcfg)
+            with mock.patch.object(EW.subprocess, "run", record):
+                EW.assert_publish_auth(self.wcfg, ctx=ctx)
+                EW._git(self.home, "push", "origin", "art/x", ctx=ctx)
+                EW._gh("pr", "create", "--repo", ctx.gh_repo(), ctx=ctx)
+                EW._gh("pr", "merge", "1", "--repo", ctx.gh_repo(), ctx=ctx)
+                EW._git(self.home, "push", "origin", "--delete", "art/x",
+                        ctx=ctx)
+        binaries = {argv[0] for argv, _ in argvs}
+        self.assertEqual({str(self.fakebin / "git"), str(self.fakebin / "gh")},
+                         binaries,
+                         "a call escaped the context and resolved its own "
+                         "binary")
+        gh_calls = [(argv, cfg) for argv, cfg in argvs
+                    if argv[0].endswith("/gh")]
+        self.assertTrue(gh_calls)
+        for argv, cfg in gh_calls:
+            self.assertEqual(str(self.ghconfig), cfg,
+                             f"{argv} did not use the validated gh config")
+
+
+class NormalizedRepoCycleTests(WorkerEnv):
+    """What gh and git are actually handed during a whole pass (#1, #2)."""
+
+    def test_every_gh_call_uses_the_normalized_name(self):
+        seen = []
+        gh = self.gh
+        origin = str(self.origin)
+
+        def recording_gh(*args, timeout=None, wcfg=None, ctx=None):
+            if "--repo" in args:
+                seen.append(args[args.index("--repo") + 1])
+            return gh(*args, timeout=timeout, ctx=ctx)
+
+        # configured as a url, which is what broke the live cycle
+        self.cfg["evolve_worker"]["repo"] = origin
+        with mock.patch.object(EW, "_gh", recording_gh), \
+             mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        self.assertTrue(seen, "no gh --repo call was made")
+        self.assertEqual(1, len(set(seen)),
+                         f"gh was handed more than one repository name: "
+                         f"{sorted(set(seen))}")
+
+    def test_a_pass_builds_one_controller_and_threads_it(self):
+        """Every call site after the first must accept the context it is
+        given rather than resolving its own."""
+        built = []
+        real = EW.controller_for
+
+        def counting(wcfg=None, git_home=None):
+            ctx = real(wcfg, git_home)
+            built.append(ctx)
+            return ctx
+
+        with mock.patch.object(EW, "controller_for", counting), \
+             mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        self.assertEqual(1, len(built),
+                         f"the pass built {len(built)} controllers; a call "
+                         f"site dropped the threaded context")
 
 
 if __name__ == "__main__":

@@ -50,6 +50,19 @@ sys.exit(0 if isinstance(block, dict) and block.get("enabled") else 1)
 PY
 }
 
+config_allows_nightwatch() {
+  /usr/bin/python3 - "$INSTANCE_HOME/config.json" <<'PY' 2>/dev/null
+import json, sys
+try:
+    cfg = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    sys.exit(1)
+mode = str(cfg.get("notification_mode") or "all").strip().lower()
+destination = cfg.get("report_number") or cfg.get("notify_handle")
+sys.exit(0 if mode == "all" and destination else 1)
+PY
+}
+
 LABEL="com.rapp.neighborhood-watch"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 
@@ -78,9 +91,16 @@ NLABEL="com.rapp.nightwatch"
 NPLIST="$HOME/Library/LaunchAgents/$NLABEL.plist"
 sed "s|__DIR__|$DIR|g; s|__HOME__|$HOME|g" "$DIR/$NLABEL.plist.template" > "$NPLIST"
 stamp_home "$NPLIST"
-launchctl unload "$NPLIST" 2>/dev/null || true
-launchctl load "$NPLIST"
-echo "loaded $NLABEL — texts a play-by-play every 90 min"
+if config_allows_nightwatch; then
+  launchctl enable "gui/$(id -u)/$NLABEL" 2>/dev/null || true
+  launchctl unload "$NPLIST" 2>/dev/null || true
+  launchctl load "$NPLIST"
+  echo "loaded $NLABEL — texts a play-by-play every 90 min"
+else
+  launchctl unload "$NPLIST" 2>/dev/null || true
+  launchctl disable "gui/$(id -u)/$NLABEL" 2>/dev/null || true
+  echo "disabled $NLABEL — notification_mode is not all"
+fi
 
 # Messages automation is safe from the logged-in Aqua session, but nightwatch
 # itself stays queue-only so a hidden TCC prompt can never wedge report
@@ -105,6 +125,7 @@ if [ "$WITH_EVOLVE_WORKER" -eq 1 ] || config_enables_evolve_worker; then
   sed "s|__DIR__|$DIR|g; s|__HOME__|$HOME|g" \
     "$DIR/$ELABEL.plist.template" > "$EPLIST"
   stamp_home "$EPLIST"
+  launchctl enable "gui/$(id -u)/$ELABEL" 2>/dev/null || true
   launchctl unload "$EPLIST" 2>/dev/null || true
   launchctl load "$EPLIST"
   echo "loaded $ELABEL — proactive art every 30 min, gated by its own cadence"

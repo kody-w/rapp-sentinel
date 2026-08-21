@@ -51,6 +51,9 @@ DEFAULTS = {
     "notify": True,
     "notify_handle": "",   # set in config.json; empty disables notify
     "notify_queue_only": False,
+    # all: existing operational alerts + reports; art-only: only a fully
+    # deployed art receipt; off: no outbound messages.
+    "notification_mode": "all",
     "copilot_model": "claude-sonnet-4.6",
     "copilot_timeout_s": 900,
     # Outsider smoke (#5 ask 2): a smoke test is a WRITE (it files a real
@@ -123,7 +126,18 @@ def log(msg):
         fh.write(line + "\n")
 
 
-def notify(cfg, text, to=None, rebuild=False):
+def notification_allowed(cfg, kind="operational"):
+    mode = str(cfg.get("notification_mode") or "all").strip().lower()
+    if mode not in ("all", "art-only", "off"):
+        log(f"invalid notification_mode={mode!r}; failing closed to off")
+        return False
+    if mode == "off":
+        return False
+    return mode == "all" or kind == "art"
+
+
+def notify(cfg, text, to=None, rebuild=False, kind="operational",
+           attach_report=True):
     """Queue the alert, then try to deliver it.
 
     Direct osascript hangs under launchd (TCC prompt, background context), so a
@@ -136,23 +150,26 @@ def notify(cfg, text, to=None, rebuild=False):
     record the report renders — a link to yesterday's evidence attached to
     today's news is worse than no link.
     """
-    if not cfg.get("notify"):
+    if not cfg.get("notify") or not notification_allowed(cfg, kind):
         return
     to = to or cfg.get("notify_handle")
     if not to:
         return
     try:
         import outbox
-        urls = []
-        try:
-            import standup
-            snapshot = standup.portable_snapshot(rebuild=rebuild)
-            urls = standup.publish_snapshot(snapshot)
-        except Exception as e:
-            log(f"static report generation failed: {type(e).__name__}: {e}")
-        suffix = ("\n\nStatic HTML report:\n" + "\n".join(urls) if urls
-                  else "\n\nStatic HTML report generation failed; alert preserved.")
-        outbox.enqueue(text + suffix, to)
+        payload = text
+        if attach_report:
+            urls = []
+            try:
+                import standup
+                snapshot = standup.portable_snapshot(rebuild=rebuild)
+                urls = standup.publish_snapshot(snapshot)
+            except Exception as e:
+                log(f"static report generation failed: {type(e).__name__}: {e}")
+            suffix = ("\n\nStatic HTML report:\n" + "\n".join(urls) if urls
+                      else "\n\nStatic HTML report generation failed; alert preserved.")
+            payload += suffix
+        outbox.enqueue(payload, to)
         if not cfg.get("notify_queue_only"):
             outbox.drain()
     except Exception as e:
@@ -320,6 +337,61 @@ def evolution_worker_enabled(cfg):
     """
     block = cfg.get("evolve_worker")
     return bool(isinstance(block, dict) and block.get("enabled"))
+
+
+def ensure_evolution_worker_loaded(cfg, launchctl="/bin/launchctl", plist=None,
+                                   platform=None, uid=None):
+    """Reconcile an enabled art arm with launchd.
+
+    A disabled launchd override survives plist rewrites and reboots. Merely
+    reporting w_evolve_worker every 15 minutes leaves the collective silent
+    forever, so the already-running health tick repairs this one local
+    supervision invariant deterministically. It never touches watched repos
+    and never runs when the worker is disabled in config.
+    """
+    platform = platform or sys.platform
+    if not evolution_worker_enabled(cfg) or platform != "darwin":
+        return False
+    label = "com.rapp.evolve-worker"
+    domain = f"gui/{os.getuid() if uid is None else uid}"
+    service = f"{domain}/{label}"
+    def call(*args):
+        try:
+            return subprocess.run(
+                [launchctl, *args], capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            log(f"launchctl {' '.join(args)} timed out while restoring {label}")
+            return None
+
+    present = call("print", service)
+    if present is None:
+        return False
+    if present.returncode == 0:
+        return True
+    plist = Path(plist) if plist else (
+        Path.home() / "Library" / "LaunchAgents" / f"{label}.plist")
+    if not plist.is_file():
+        log(f"{label} is enabled but {plist} is missing; rerun install-launchd.sh")
+        return False
+    if call("enable", service) is None:
+        return False
+    loaded = call("bootstrap", domain, str(plist))
+    if loaded is None:
+        return False
+    if loaded.returncode != 0 and "service already loaded" not in (
+            (loaded.stderr or "") + (loaded.stdout or "")).lower():
+        log(f"could not bootstrap {label}: "
+            f"{(loaded.stderr or loaded.stdout or '').strip()[:240]}")
+        return False
+    started = call("kickstart", service)
+    if started is None:
+        return False
+    if started.returncode != 0:
+        log(f"could not kickstart {label}: "
+            f"{(started.stderr or started.stdout or '').strip()[:240]}")
+        return False
+    log(f"restored missing launchd job {label}")
+    return True
 
 
 def evolution_status_allowed(cfg, verdict):
@@ -810,6 +882,8 @@ def main():
     if STOP.exists():
         log("STOP file present — standing down, no checks, no spend.")
         return 0
+
+    ensure_evolution_worker_loaded(cfg)
 
     def refresh_dashboard():
         """Rebuild the shift report every tick. It only ever reads the chains,

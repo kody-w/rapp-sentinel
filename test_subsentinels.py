@@ -33,6 +33,20 @@ def scratch_dir(name):
     return path
 
 
+def jsonl(doc, extra_noise=True):
+    """A CLI transcript that says the right thing in the wrong places too."""
+    lines = []
+    if extra_noise:
+        lines.append(json.dumps({"type": "assistant.reasoning", "data": {
+            "content": json.dumps({"schema": "REASONING-NOT-THE-ANSWER"})}}))
+        lines.append(json.dumps({"type": "model.message", "data": {
+            "response": {"content": "also not the answer"}}}))
+    lines.append(json.dumps({"type": "assistant.message",
+                             "data": {"content": json.dumps(doc)}}))
+    lines.append(json.dumps({"type": "result", "exitCode": 0}))
+    return "\n".join(lines)
+
+
 def report(role, cycle=1, n=6, evidence=1, critique=(), **overrides):
     doc = {
         "schema": SS.CHILD_SCHEMA,
@@ -430,25 +444,29 @@ class ProcessTests(unittest.TestCase):
         self.spec = {"name": "execution-designer", "wave": 1, "brief": "x",
                      "verifier": False}
 
-    def run_child(self, argv, cfg=None, deadline=None):
+    def run_child(self, argv, cfg=None, deadline=None, transcripts=None,
+                  spare=None):
         cfg = cfg or self.cfg
         live = []
         with mock.patch.object(SS, "confined_argv", return_value=argv):
             return SS._run_child(
                 self.spec, cfg, self.ws, 1, "Test Collective", "copilot",
-                [], [], 0, deadline or (time.monotonic() + 20), live), live
+                [], [], 0, deadline or (time.monotonic() + 20), live, None, "",
+                transcripts, spare), live
 
     def test_a_child_that_answers_with_json_is_healthy(self):
-        doc = json.dumps(report("execution-designer"))
-        argv = [sys.executable, "-c", f"print({doc!r})"]
+        argv = [sys.executable, "-c",
+                f"print({jsonl(report('execution-designer'))!r})"]
         res, _ = self.run_child(argv)
         self.assertTrue(res["ok"], res["error"])
         self.assertEqual(6, len(res["report"]["candidates"]))
+        self.assertEqual(1, res["processes"])
+        self.assertFalse(res["repaired"])
 
     def test_a_child_that_says_nothing_fails_by_name(self):
         res, _ = self.run_child([sys.executable, "-c", "pass"])
         self.assertFalse(res["ok"])
-        self.assertIn("no output", res["error"])
+        self.assertIn("no assistant.message", res["error"])
 
     def test_a_child_that_crashes_fails_by_name(self):
         res, _ = self.run_child([sys.executable, "-c", "raise SystemExit(3)"])
@@ -467,14 +485,18 @@ class ProcessTests(unittest.TestCase):
                 "p = subprocess.Popen([sys.executable, '-c', 'import time;"
                 " time.sleep(120)']);"
                 "print(p.pid, flush=True); time.sleep(120)")
-        res, live = self.run_child([sys.executable, "-c", code])
+        transcripts = self.ws / "transcripts"
+        res, live = self.run_child([sys.executable, "-c", code],
+                                   transcripts=transcripts)
 
         self.assertFalse(res["ok"])
         self.assertTrue(res["timed_out"])
         self.assertIn("timed out", res["error"])
         self.assertEqual([], live, "the process registry must be emptied")
 
-        log = (self.ws / "children" / self.spec["name"] / "child.log").read_text()
+        self.assertTrue(res["transcripts"], "a failed child keeps its evidence")
+        log = Path(res["transcripts"][0]).read_text()
+        self.assertTrue(str(transcripts) in res["transcripts"][0])
         grandchild = int(log.split()[0])
         self.assertTrue(_reaped(grandchild),
                         "a grandchild outliving the pass is an invisible cost")
@@ -502,7 +524,7 @@ class ProcessTests(unittest.TestCase):
 
         def fake_child(spec, fcfg, workspace, cycle, collective, parent_role,
                        prior, pool, depth, deadline, live, logger=None,
-                       situation=""):
+                       situation="", transcript_dir=None, spare_processes=None):
             seen[spec["name"]] = list(pool)
             return result(spec["name"], wave=spec["wave"],
                           verifier=spec.get("verifier"))
@@ -524,7 +546,7 @@ class ProcessTests(unittest.TestCase):
 
         def exploding(spec, fcfg, workspace, cycle, collective, parent_role,
                       prior, pool, depth, deadline, live, logger=None,
-                      situation=""):
+                      situation="", transcript_dir=None, spare_processes=None):
             live.append(proc)
             raise RuntimeError("wave failure")
 
@@ -731,6 +753,204 @@ class RecordBindingTests(unittest.TestCase):
             self.assertEqual(row["digest"], SS.record_digest(row))
 
 
+class TranscriptExtractionTests(unittest.TestCase):
+    """Only the final assistant.message counts as the child's answer (A1)."""
+
+    def test_the_assistant_message_wins_over_reasoning(self):
+        doc = report("execution-designer")
+        content = SS.extract_assistant_message(jsonl(doc))
+        self.assertEqual(doc, json.loads(content))
+
+    def test_reasoning_that_contains_json_is_ignored(self):
+        stream = "\n".join([
+            json.dumps({"type": "assistant.reasoning",
+                        "data": {"content": '{"schema": "FROM-REASONING"}'}}),
+            json.dumps({"type": "assistant.message",
+                        "data": {"content": '{"schema": "FROM-MESSAGE"}'}}),
+        ])
+        self.assertIn("FROM-MESSAGE", SS.extract_assistant_message(stream))
+        self.assertNotIn("FROM-REASONING", SS.extract_assistant_message(stream))
+
+    def test_stats_tool_and_snapshot_events_are_ignored(self):
+        stream = "\n".join([
+            json.dumps({"type": "model.response", "data": {
+                "response": {"content": '{"schema": "FROM-MODEL-RESPONSE"}'}}}),
+            json.dumps({"type": "model.messages_snapshot", "data": {
+                "messages": [{"role": "assistant",
+                              "content": '{"schema": "FROM-SNAPSHOT"}'}]}}),
+            json.dumps({"type": "assistant.message",
+                        "data": {"content": '{"schema": "REAL"}'}}),
+            json.dumps({"type": "session.usage_checkpoint",
+                        "data": {"totalNanoAiu": 1}}),
+            json.dumps({"type": "result", "exitCode": 0}),
+        ])
+        self.assertIn("REAL", SS.extract_assistant_message(stream))
+
+    def test_the_last_assistant_message_wins(self):
+        stream = "\n".join([
+            json.dumps({"type": "assistant.message", "data": {"content": "first"}}),
+            json.dumps({"type": "assistant.message", "data": {"content": "second"}}),
+        ])
+        self.assertEqual("second", SS.extract_assistant_message(stream))
+
+    def test_a_transcript_without_an_assistant_message_is_named(self):
+        stream = json.dumps({"type": "result", "exitCode": 0})
+        with self.assertRaises(SS.ChildError) as cm:
+            SS.extract_assistant_message(stream)
+        self.assertIn("no assistant.message", str(cm.exception))
+
+    def test_garbage_lines_do_not_derail_extraction(self):
+        stream = ("not json\n{broken\n"
+                  + json.dumps({"type": "assistant.message",
+                                "data": {"content": "ok"}}))
+        self.assertEqual("ok", SS.extract_assistant_message(stream))
+
+    def test_bytes_are_bounded(self):
+        stream = json.dumps({"type": "assistant.message",
+                             "data": {"content": "x" * 100}})
+        with self.assertRaises(SS.ChildError) as cm:
+            SS.extract_assistant_message(stream, max_bytes=10)
+        self.assertIn("over the", str(cm.exception))
+
+    def test_events_are_bounded(self):
+        stream = "\n".join(json.dumps({"type": "noise", "data": {}})
+                           for _ in range(50))
+        with self.assertRaises(SS.ChildError) as cm:
+            SS.extract_assistant_message(stream, max_events=10)
+        self.assertIn("more than 10 events", str(cm.exception))
+
+    def test_the_argv_asks_for_json_events(self):
+        argv = SS.confined_argv("p", "m", "/tmp/x", json_output=True)
+        self.assertIn("--output-format", argv)
+        self.assertEqual("json", argv[argv.index("--output-format") + 1])
+        self.assertNotIn("--silent", argv)
+
+
+class FormatRepairTests(unittest.TestCase):
+    """Exactly one retry, for formatting only, counted as a spend (A2)."""
+
+    def setUp(self):
+        self.ws = scratch_dir("repair")
+        self.addCleanup(shutil.rmtree, self.ws, True)
+        self.transcripts = self.ws / "transcripts"
+        self.cfg = SS.fanout_config({"fanout": {
+            "enabled": True, "child_timeout_s": 10, "total_timeout_s": 60,
+            "isolated_home": False}})
+        self.spec = {"name": "execution-designer", "wave": 1, "brief": "x",
+                     "verifier": False}
+
+    def script(self, *replies):
+        """A fake CLI that answers differently on each successive call."""
+        state = self.ws / "calls"
+        state.write_text("0", encoding="utf-8")
+        payloads = json.dumps(list(replies))
+        return [sys.executable, "-c",
+                f"import json,pathlib;"
+                f"p=pathlib.Path({str(state)!r});"
+                f"n=int(p.read_text());p.write_text(str(n+1));"
+                f"print(json.loads({payloads!r})[min(n, len(json.loads({payloads!r}))-1)])"]
+
+    def run_child(self, argv, spare=None, cfg=None):
+        live = []
+        with mock.patch.object(SS, "confined_argv", return_value=argv):
+            return SS._run_child(self.spec, cfg or self.cfg, self.ws, 7,
+                                 "C", "copilot", [], [], 0,
+                                 time.monotonic() + 60, live, None, "",
+                                 self.transcripts, spare)
+
+    def test_malformed_then_valid_succeeds_and_is_recorded(self):
+        good = jsonl(report("execution-designer", cycle=7), extra_noise=False)
+        res = self.run_child(self.script("I refuse to use JSON.", good),
+                             SS.SpareProcesses(1))
+        self.assertTrue(res["ok"], res["error"])
+        self.assertTrue(res["repaired"])
+        self.assertEqual(2, res["attempts"])
+        self.assertEqual(2, res["processes"], "the retry is a real spend")
+        self.assertEqual(2, len(res["transcripts"]))
+
+    def test_malformed_twice_fails(self):
+        res = self.run_child(self.script("nope", "still nope"),
+                             SS.SpareProcesses(1))
+        self.assertFalse(res["ok"])
+        self.assertEqual(2, res["processes"])
+        self.assertIn("no assistant.message", res["error"])
+
+    def test_schema_violations_also_earn_the_one_repair(self):
+        bad = jsonl({"schema": "wrong"}, extra_noise=False)
+        good = jsonl(report("execution-designer", cycle=7), extra_noise=False)
+        res = self.run_child(self.script(bad, good), SS.SpareProcesses(1))
+        self.assertTrue(res["ok"], res["error"])
+        self.assertEqual(2, res["processes"])
+
+    def test_no_spare_process_means_no_repair(self):
+        res = self.run_child(self.script("nope", "would have been fine"),
+                             SS.SpareProcesses(0))
+        self.assertFalse(res["ok"])
+        self.assertEqual(1, res["processes"], "the cap held")
+        self.assertIn("no process left", res["error"])
+
+    def test_repairs_are_capped_at_one_by_config(self):
+        cfg = SS.fanout_config({"fanout": {"format_repair_attempts": 0,
+                                           "isolated_home": False,
+                                           "child_timeout_s": 10}})
+        res = self.run_child(self.script("nope", "fine"), SS.SpareProcesses(5),
+                             cfg=cfg)
+        self.assertEqual(1, res["processes"])
+
+    def test_a_spent_deadline_stops_the_repair(self):
+        live = []
+        argv = self.script("nope", "fine")
+        with mock.patch.object(SS, "confined_argv", return_value=argv):
+            res = SS._run_child(self.spec, self.cfg, self.ws, 7, "C", "copilot",
+                                [], [], 0, time.monotonic() + 0.5, live, None,
+                                "", self.transcripts, SS.SpareProcesses(3))
+        self.assertLessEqual(res["processes"], 1)
+
+    def test_transcripts_land_outside_the_workspace_and_are_named(self):
+        res = self.run_child(self.script("nope", "nope"), SS.SpareProcesses(1))
+        names = sorted(Path(p).name for p in res["transcripts"])
+        self.assertEqual(["7-execution-designer-1.log",
+                          "7-execution-designer-2.log"], names)
+        for path in res["transcripts"]:
+            self.assertTrue(Path(path).is_file())
+
+    def test_transcripts_are_bounded_and_redact_the_auth_value(self):
+        secret = "gho_" + "z" * 36
+        cfg = SS.fanout_config({"fanout": {"isolated_home": False,
+                                           "max_transcript_bytes": 200,
+                                           "child_timeout_s": 10}})
+        with mock.patch.dict(os.environ, {"COPILOT_GITHUB_TOKEN": secret}):
+            path = SS._write_transcript(self.transcripts, 3, "role", 1,
+                                        f"before {secret} after " + "x" * 500,
+                                        "", cfg)
+        body = Path(path).read_text()
+        self.assertNotIn(secret, body)
+        self.assertIn("<redacted>", body)
+        self.assertLess(len(body), 400)
+
+    def test_a_verifier_gets_the_same_one_repair(self):
+        spec = dict(self.spec, name="adversarial-verifier", wave=2,
+                    verifier=True)
+        good = jsonl(report("adversarial-verifier", cycle=7), extra_noise=False)
+        live = []
+        with mock.patch.object(SS, "confined_argv",
+                               return_value=self.script("nope", good)):
+            res = SS._run_child(spec, self.cfg, self.ws, 7, "C", "copilot",
+                                [], [], 0, time.monotonic() + 60, live, None,
+                                "", self.transcripts, SS.SpareProcesses(1))
+        self.assertTrue(res["ok"], res["error"])
+        self.assertTrue(res["verifier"])
+        self.assertEqual(2, res["processes"])
+
+    def test_a_verifier_that_fails_both_replies_still_fails_the_cycle(self):
+        results = [result("a"), result("b"),
+                   result("adversarial-verifier", wave=2, ok=False,
+                          error="the transcript holds no assistant.message")]
+        with self.assertRaises(SS.FanoutError) as cm:
+            SS.aggregate(results, self.cfg)
+        self.assertIn("adversarial verifier failed", str(cm.exception))
+
+
 def _now_iso():
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -758,6 +978,50 @@ def _reap(proc):
         proc.wait(timeout=5)
     except Exception:
         pass
+
+
+class RepairAttemptConfigTests(unittest.TestCase):
+    """One repair, or none (#3).
+
+    A config asking for five retries is quietly buying five more processes and
+    five more chances for a wrong answer to arrive dressed as a right one, so
+    the number is validated where it is read rather than clamped where it is
+    used.
+    """
+
+    def cfg(self, value):
+        return SS.fanout_config({"fanout": {"format_repair_attempts": value}})
+
+    def test_the_default_is_one(self):
+        self.assertEqual(1, SS.fanout_config({})["format_repair_attempts"])
+        self.assertEqual(1, SS.MAX_FORMAT_REPAIRS)
+
+    def test_zero_and_one_are_accepted(self):
+        self.assertEqual(0, self.cfg(0)["format_repair_attempts"])
+        self.assertEqual(1, self.cfg(1)["format_repair_attempts"])
+
+    def test_more_than_one_is_refused_not_clamped(self):
+        for value in (2, 3, 99):
+            with self.assertRaises(SS.ConfigError) as cm:
+                self.cfg(value)
+            self.assertIn("0..1", str(cm.exception))
+
+    def test_a_negative_count_is_refused(self):
+        with self.assertRaises(SS.ConfigError):
+            self.cfg(-1)
+
+    def test_a_non_integer_is_refused(self):
+        for value in ("1", 1.0, None, True, [1]):
+            with self.assertRaises(SS.ConfigError, msg=repr(value)) as cm:
+                self.cfg(value)
+            self.assertIn("must be an integer", str(cm.exception))
+
+    def test_the_runner_reads_the_validated_number(self):
+        """_run_child validates too, so a hand-built cfg cannot smuggle a
+        larger budget past the config layer."""
+        with self.assertRaises(SS.ConfigError):
+            SS.validate_repair_attempts(5)
+        self.assertEqual(0, SS.validate_repair_attempts(0))
 
 
 if __name__ == "__main__":
