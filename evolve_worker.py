@@ -117,6 +117,7 @@ WORKER_DEFAULTS = {
         "branch_prefix": "art/dada-vision",
         "player_url": "https://kody-w.github.io/rapp-vision",
         "duration": 60,
+        "deployment_retry_limit": 12,
     },
     # Bounded sub-sentinel fan-out (subsentinels.py). Off by default; see
     # FANOUT_DEFAULTS there for the caps every key inherits.
@@ -352,8 +353,11 @@ def vision_video(submission, vcfg):
     channel_parent = PurePosixPath(vcfg["channel_path"]).parent.as_posix()
     thumb = posixpath.relpath(media, channel_parent if channel_parent != "." else "")
     submitted = str(submission["meta"].get("submitted_at") or "")
-    published = submitted[:10] if re.fullmatch(
-        r"\d{4}-\d{2}-\d{2}", submitted[:10]) else f"{sentinel.now():%Y-%m-%d}"
+    try:
+        published = datetime.fromisoformat(
+            submitted.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except ValueError as e:
+        raise GateError(f"submitted_at is not ISO-8601: {e}")
     concept = concept_sentence(submission["meta"])
     duration = int(vcfg["duration"])
     return {
@@ -383,7 +387,10 @@ def vision_video(submission, vcfg):
                 {
                     "t": 6,
                     "dur": duration - 6,
-                    "app": media,
+                    # Live-scene app paths resolve against channel.json, just
+                    # like thumbs. A repo-root path here becomes dada/dada/...
+                    # when the channel itself lives under dada/.
+                    "app": thumb,
                     "lower": {
                         "title": submission["title"],
                         "bench": "Public Art Collective",
@@ -2745,7 +2752,7 @@ def vision_urls(vcfg, submission):
     repo = normalize_repo(vcfg["repo"], vcfg)
     if not repo.owner or not repo.name:
         return {"watch_url": "", "channel_url": "", "media_url": "",
-                "source_url": ""}
+                "scene_url": "", "source_url": ""}
     root = f"https://{repo.owner.lower()}.github.io/{repo.name}"
     media_path = "/".join(
         quote(part, safe="") for part in vision_media_path(
@@ -2757,6 +2764,7 @@ def vision_urls(vcfg, submission):
                       f"{quote(submission['slug'], safe='')}"),
         "channel_url": f"{root}/{channel_path}",
         "media_url": f"{root}/{media_path}",
+        "scene_url": f"{root}/{media_path}",
         "source_url": (f"https://github.com/{repo.owner}/{repo.name}/blob/"
                        f"{quote(str(vcfg.get('base_branch', 'main')), safe='')}/"
                        f"{media_path}"),
@@ -2953,6 +2961,7 @@ def verify_dual_pages(cfg, wcfg, submission, vision_receipts, probe=None,
         ("Public Art Collective", collective_url),
         ("RAPP Vision channel", vision.get("channel_url", "")),
         ("RAPP Vision media", vision.get("media_url", "")),
+        ("RAPP Vision scene", vision.get("scene_url", "")),
         ("RAPP Vision player", vcfg["player_url"]),
     ]
     timeout = int(wcfg.get("view_probe_timeout_s", 10))
@@ -3305,14 +3314,58 @@ def finish_platform_deployments(cfg, wcfg, workspace, collective_clone,
     return receipts
 
 
-def deployment_pending(history, row, error):
+def clean_interrupted_vision_pr(state, wcfg):
+    pr_number = str(state.get("vision_pr_number") or "")
+    if not pr_number:
+        return
+    vcfg = vision_config(wcfg)
+    if not vcfg["enabled"]:
+        return
+    vwcfg = vision_worker_config(wcfg, vcfg)
+    vctx = controller_for(
+        vwcfg, git_home=STATE / "git-home-rapp-vision")
+    repo = vctx.gh_repo()
+    gh_t = int(vwcfg.get("gh_timeout_s", 300))
+    try:
+        view = json.loads(_gh(
+            "pr", "view", pr_number, "--repo", repo,
+            "--json", "state,merged", timeout=gh_t, ctx=vctx))
+    except (CommandError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
+        raise DeploymentPending(
+            f"cannot inspect interrupted RAPP Vision PR {pr_number}: {e}")
+    if view.get("merged") or str(view.get("state")).upper() == "MERGED":
+        return
+    _close_pr(repo, pr_number, gh_t, vctx)
+    log(f"closed interrupted RAPP Vision PR {pr_number} before retrying")
+
+
+def deployment_pending(history, row, error, transaction=None, wcfg=None):
     detail = f"dual publication pending: {type(error).__name__}: {error}"
+    try:
+        state = strict_load(TRANSACTION_PATH, {}, expect=dict)
+    except LedgerError:
+        state = {}
+    attempts = int(state.get("deployment_attempts") or 0) + 1
+    first = state.get("first_pending_at") or sentinel.now().isoformat(
+        timespec="seconds")
+    if transaction:
+        transaction(phase="deployment-pending",
+                    deployment_attempts=attempts,
+                    first_pending_at=first,
+                    last_deployment_error=detail[:400])
+    limit = max(1, int((wcfg or {}).get("deployment_retry_limit") or
+                       vision_config(wcfg or {}).get(
+                           "deployment_retry_limit", 12)))
+    outcome = "fail-closed" if attempts >= limit else "deployment-pending"
     row["detail"] = detail[:400]
+    row["deployment_attempts"] = attempts
+    row["first_pending_at"] = first
     save_history(history)
-    write_status("deployment-pending", detail, role=row.get("role", ""),
-                 cycle=row.get("cycle"), slug=row.get("slug", ""))
-    log(detail)
-    return {"outcome": "deployment-pending", "reason": detail,
+    write_status(outcome, detail, role=row.get("role", ""),
+                 cycle=row.get("cycle"), slug=row.get("slug", ""),
+                 deployment_attempts=attempts, first_pending_at=first)
+    log(f"{detail} (attempt {attempts}/{limit})")
+    return {"outcome": outcome, "reason": detail,
             "detail": detail}
 
 
@@ -3383,14 +3436,19 @@ def reconcile(cfg, wcfg, history, ctx=None, health=None):
                          "pr_number": pr_number,
                          "branch": state.get("branch", "")})
         note = transaction_writer(row["id"], state)
+        deployment_wcfg = dict(wcfg)
+        if isinstance(state.get("rapp_vision"), dict):
+            deployment_wcfg["rapp_vision"] = dict(state["rapp_vision"])
         try:
+            clean_interrupted_vision_pr(state, deployment_wcfg)
             receipts = finish_platform_deployments(
-                cfg, wcfg, workspace, clone, submission, receipts,
+                cfg, deployment_wcfg, workspace, clone, submission, receipts,
                 health=health, transaction=note)
         except (DeploymentPending, AbortError, GateError, CommandError,
                 subprocess.TimeoutExpired, json.JSONDecodeError, OSError,
                 ValueError, KeyError) as e:
-            return deployment_pending(history, row, e)
+            return deployment_pending(
+                history, row, e, transaction=note, wcfg=deployment_wcfg)
         finalize_success(cfg, wcfg, history, row, submission, receipts,
                          state.get("next_state") or {},
                          int(state.get("cycle") or row.get("cycle") or 1))
@@ -3666,6 +3724,9 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             # (bytes are deliberately not persisted: the digests are the
             # contract, and reconciliation re-reads the merged file anyway)
             "next_state": next_state,
+            # A retry must deploy the entry that was gated in this cycle even
+            # if the operator changes channel metadata before Pages finishes.
+            "rapp_vision": vision_config(wcfg),
         })
         row["slug"] = submission["slug"]
         save_history(history)
@@ -3696,7 +3757,8 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             # The Public Art merge is already real. Keep the row and
             # transaction pending so the next pass retries only deployment;
             # never spend another model or announce a partial release.
-            return deployment_pending(history, row, e)
+            return deployment_pending(
+                history, row, e, transaction=note, wcfg=wcfg)
 
         # Only here — both merged, re-read, byte-checked and live on Pages —
         # does the ledger move or a message leave the machine.

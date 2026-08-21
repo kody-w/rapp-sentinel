@@ -2066,6 +2066,25 @@ def evolve_worker_is_alive():
                     f"last pass {age_m:.0f}m ago ended {outcome}: "
                     f"{str(status.get('reason'))[:120]}",
                     critical=False)
+    if outcome == "deployment-pending":
+        attempts = int(status.get("deployment_attempts") or 1)
+        pending_age = 0.0
+        try:
+            pending_age = (datetime.now(timezone.utc)
+                           - datetime.fromisoformat(
+                               status["first_pending_at"])).total_seconds() / 60
+        except Exception:
+            pass
+        if attempts >= 3 or pending_age > stale_after:
+            return fail(
+                "w_evolve_worker",
+                f"dual deployment still pending after {attempts} attempt(s) "
+                f"and {pending_age:.0f}m: "
+                f"{str(status.get('reason'))[:120]}",
+                critical=False)
+        return ok("w_evolve_worker",
+                  f"dual deployment pending, attempt {attempts} "
+                  f"({pending_age:.0f}m)")
     return ok("w_evolve_worker",
               f"{outcome} {age_m:.0f}m ago"
               + (f" (cycle {status['cycle']})" if status.get("cycle") else ""))

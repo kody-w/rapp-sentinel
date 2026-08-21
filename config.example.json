@@ -43,7 +43,8 @@
       "registry_path": "channels.json",
       "branch_prefix": "art/dada-vision",
       "player_url": "https://kody-w.github.io/rapp-vision",
-      "duration": 60
+      "duration": 60,
+      "deployment_retry_limit": 12
     },
     "base_branch": "main",
     "roles": [],

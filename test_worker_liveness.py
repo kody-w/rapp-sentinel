@@ -103,6 +103,28 @@ class WorkerLivenessCheckTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertIn("fail-closed", result["detail"])
 
+    def test_a_fresh_first_deployment_retry_is_alive(self):
+        self.config(enabled=True)
+        self.heartbeat(
+            minutes_ago=2, outcome="deployment-pending",
+            deployment_attempts=1,
+            first_pending_at=(datetime.now(timezone.utc)
+                              - timedelta(minutes=2)).isoformat())
+        result = checks.evolve_worker_is_alive()
+        self.assertTrue(result["ok"], result["detail"])
+        self.assertIn("attempt 1", result["detail"])
+
+    def test_repeated_deployment_pending_fails_liveness(self):
+        self.config(enabled=True)
+        self.heartbeat(
+            minutes_ago=2, outcome="deployment-pending",
+            deployment_attempts=3,
+            first_pending_at=(datetime.now(timezone.utc)
+                              - timedelta(minutes=62)).isoformat())
+        result = checks.evolve_worker_is_alive()
+        self.assertFalse(result["ok"])
+        self.assertIn("still pending", result["detail"])
+
     def test_an_unreadable_heartbeat_is_a_failure_not_a_pass(self):
         self.config(enabled=True)
         (self.home / "state" / "evolve-worker-status.json").write_text(

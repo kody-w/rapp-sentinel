@@ -355,8 +355,17 @@ def ensure_evolution_worker_loaded(cfg, launchctl="/bin/launchctl", plist=None,
     label = "com.rapp.evolve-worker"
     domain = f"gui/{os.getuid() if uid is None else uid}"
     service = f"{domain}/{label}"
-    present = subprocess.run(
-        [launchctl, "print", service], capture_output=True, text=True)
+    def call(*args):
+        try:
+            return subprocess.run(
+                [launchctl, *args], capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            log(f"launchctl {' '.join(args)} timed out while restoring {label}")
+            return None
+
+    present = call("print", service)
+    if present is None:
+        return False
     if present.returncode == 0:
         return True
     plist = Path(plist) if plist else (
@@ -364,17 +373,19 @@ def ensure_evolution_worker_loaded(cfg, launchctl="/bin/launchctl", plist=None,
     if not plist.is_file():
         log(f"{label} is enabled but {plist} is missing; rerun install-launchd.sh")
         return False
-    subprocess.run([launchctl, "enable", service], capture_output=True, text=True)
-    loaded = subprocess.run(
-        [launchctl, "bootstrap", domain, str(plist)],
-        capture_output=True, text=True)
+    if call("enable", service) is None:
+        return False
+    loaded = call("bootstrap", domain, str(plist))
+    if loaded is None:
+        return False
     if loaded.returncode != 0 and "service already loaded" not in (
             (loaded.stderr or "") + (loaded.stdout or "")).lower():
         log(f"could not bootstrap {label}: "
             f"{(loaded.stderr or loaded.stdout or '').strip()[:240]}")
         return False
-    started = subprocess.run(
-        [launchctl, "kickstart", service], capture_output=True, text=True)
+    started = call("kickstart", service)
+    if started is None:
+        return False
     if started.returncode != 0:
         log(f"could not kickstart {label}: "
             f"{(started.stderr or started.stdout or '').strip()[:240]}")

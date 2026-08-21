@@ -1537,7 +1537,7 @@ class VisionAdapterTests(ScratchCase):
             ["channels.json", "dada/channel.json",
              "dada/media/new-piece.svg"],
             changed)
-        self.assertEqual("dada/media/new-piece.svg",
+        self.assertEqual("media/new-piece.svg",
                          entry["live"]["scenes"][1]["app"])
         self.assertEqual("media/new-piece.svg", entry["thumb"])
         self.assertEqual([], entry["sources"])
@@ -1570,6 +1570,7 @@ class VisionAdapterTests(ScratchCase):
         self.assertEqual(
             "https://kody-w.github.io/rapp-vision/dada/media/new-piece.svg",
             urls["media_url"])
+        self.assertEqual(urls["media_url"], urls["scene_url"])
 
     def test_unsafe_channel_paths_are_refused(self):
         bad = dict(self.wcfg, rapp_vision={
@@ -1713,6 +1714,59 @@ class DualDeploymentFlowTests(WorkerEnv):
         maker.assert_not_called()
         self.assertEqual(1, len(self.notifications))
         self.assertFalse(EW.TRANSACTION_PATH.exists())
+
+    def test_persistent_pending_becomes_a_visible_fail_closed_state(self):
+        cfg = self.config()
+        wcfg = EW.worker_config(cfg)
+        wcfg["rapp_vision"]["deployment_retry_limit"] = 2
+        row = {"id": "row", "at": NOW.isoformat(), "outcome": "pending",
+               "role": "openrappter", "cycle": 1}
+        history = [row]
+        EW.save_history(history)
+        note = EW.transaction_writer("row", {"phase": "collective-merged"})
+        note()
+        first = EW.deployment_pending(
+            history, row, EW.DeploymentPending("wait"),
+            transaction=note, wcfg=wcfg)
+        second = EW.deployment_pending(
+            history, row, EW.DeploymentPending("wait"),
+            transaction=note, wcfg=wcfg)
+        self.assertEqual("deployment-pending", first["outcome"])
+        self.assertEqual("fail-closed", second["outcome"])
+        status = json.loads(EW.STATUS_PATH.read_text())
+        self.assertEqual("fail-closed", status["outcome"])
+        self.assertEqual(2, status["deployment_attempts"])
+
+    def test_an_interrupted_vision_pr_is_closed_before_retry(self):
+        wcfg = EW.worker_config(self.config())
+        EW.clean_interrupted_vision_pr(
+            {"vision_pr_number": "7"}, wcfg)
+        self.assertTrue(self.gh.called("pr", "close"))
+
+    def test_retry_uses_the_channel_contract_captured_by_the_cycle(self):
+        original = self.config()
+        with mock.patch.object(EW, "run_model", self.model_that_submits()), \
+             mock.patch.object(
+                 EW, "finish_platform_deployments",
+                 side_effect=EW.DeploymentPending("Pages still building")):
+            EW.run_once(cfg=original, health=lambda phase: healthy())
+
+        changed = self.config()
+        changed["evolve_worker"]["rapp_vision"]["duration"] = 120
+        seen = {}
+
+        def finish(cfg, wcfg, workspace, clone, submission, receipts, health,
+                   transaction=None):
+            seen["duration"] = wcfg["rapp_vision"]["duration"]
+            return self.deployed(receipts)
+
+        with mock.patch.object(EW, "run_model") as maker, \
+             mock.patch.object(EW, "finish_platform_deployments", finish):
+            summary = EW.run_once(
+                cfg=changed, health=lambda phase: healthy())
+        self.assertEqual("reconciled-contributed", summary["outcome"])
+        self.assertEqual(60, seen["duration"])
+        maker.assert_not_called()
 
 
 class ArtDeliveryTests(WorkerEnv):
@@ -3876,6 +3930,13 @@ class WorkerSupervisionTests(unittest.TestCase):
                 {"evolve_worker": {"enabled": False}},
                 plist=self.plist, platform="darwin", uid=501))
         run.assert_not_called()
+
+    def test_a_wedged_launchctl_cannot_wedge_the_health_tick(self):
+        with mock.patch.object(
+                sentinel.subprocess, "run",
+                side_effect=subprocess.TimeoutExpired("launchctl", 30)):
+            self.assertFalse(sentinel.ensure_evolution_worker_loaded(
+                self.cfg, plist=self.plist, platform="darwin", uid=501))
 
 
 class TickDelegationTests(unittest.TestCase):
