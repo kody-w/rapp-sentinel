@@ -27,6 +27,7 @@ disk, remote ones over ssh with the operator's keys. Visits are random but every
 classroom is seen at least once per `visit_everyone_within_hours`.
 """
 
+import base64
 import hashlib
 import json
 import os
@@ -375,13 +376,17 @@ def critique(room, snap, obs, cfg, timeout=300):
 
 
 FEEDBACK_WRITE = r"""
-# Runs inside the classroom. Reads one JSON feedback document on stdin and files it where the
+# Runs inside the classroom. The document arrives as base64 in argv[2], NOT on stdin, because
+# stdin carries this program itself — and base64 is the one payload encoding that survives both a
+# POSIX shell and PowerShell untouched (a shlex-quoted multi-line program does not: PowerShell
+# hands python a truncated string and the write silently never happens).
+# Files the feedback where the
 # sentinel itself can read it: state/principal-feedback.json (latest) + .jsonl (every visit).
 # A reorientation is written NEXT TO direction.json as a proposal — never over it — unless the
 # document says apply, in which case boundaries are still left exactly as the owner wrote them.
-import json, os, sys
+import base64, json, os, sys
 home = os.path.expanduser(sys.argv[1]); st = os.path.join(home, "state"); os.makedirs(st, exist_ok=True)
-doc = json.load(sys.stdin)
+doc = json.loads(base64.b64decode(sys.argv[2]).decode("utf-8"))
 open(os.path.join(st, "principal-feedback.json"), "w").write(json.dumps(doc, indent=2) + "\n")
 with open(os.path.join(st, "principal-feedback.jsonl"), "a") as fh: fh.write(json.dumps(doc) + "\n")
 res = {"filed": True, "reoriented": False}
@@ -428,13 +433,13 @@ def deliver_feedback(room, obs, crit, cfg):
     interp = room.get("python") or "python3"
     payload = json.dumps(doc)
     try:
-        prog = FEEDBACK_WRITE.replace("sys.argv[1]", repr(room["home"]))
+        b64 = base64.b64encode(payload.encode("utf-8")).decode("ascii")
         if room.get("transport") == "local":
-            r = subprocess.run([sys.executable, "-c", prog], capture_output=True, text=True, timeout=30, input=payload)
+            argv = [sys.executable, "-", room["home"], b64]
         else:
-            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", room["host"],
-                                "%s -c %s" % (interp, shlex.quote(prog))],
-                               capture_output=True, text=True, timeout=45, input=payload)
+            argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", room["host"],
+                    "%s - %s %s" % (interp, room["home"], b64)]
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=60, input=FEEDBACK_WRITE)
         out = json.loads((r.stdout or "{}").strip().splitlines()[-1])
     except Exception as e:
         print("[principal] feedback to %s failed: %s: %s" % (room["slug"], type(e).__name__, e)); return None
@@ -718,15 +723,27 @@ def sh(*a):
     except Exception as e:
         return 1, "%s: %s" % (type(e).__name__, e)
 
-label, plist_path, plist = None, None, None
+# Several jobs can share one home — the tick AND its outbox-drain. Healing the drain instead of
+# the tick would "fix" a sentinel that is still not ticking, so candidates are SCORED: the job that
+# runs the tick wins, a job whose name or arguments say drain/outbox is never chosen.
+cands = []
 for f in glob.glob(os.path.expanduser("~/Library/LaunchAgents/*.plist")):
     try: d = plistlib.load(open(f, "rb"))
     except Exception: continue
     env = d.get("EnvironmentVariables") or {}
     args = " ".join(d.get("ProgramArguments") or [])
-    if os.path.realpath(env.get("SENTINEL_HOME", "")) == os.path.realpath(home) or home in args:
-        label, plist_path, plist = d.get("Label"), f, d; break
+    lbl = d.get("Label") or ""
+    if not (os.path.realpath(env.get("SENTINEL_HOME", "")) == os.path.realpath(home) or home in args):
+        continue
+    if any(w in (lbl + " " + args).lower() for w in ("drain", "outbox", "library", "relay")):
+        continue
+    score = 3 if ("sentinel.py" in args or "run.sh" in args) else 1
+    cands.append((score, lbl, f, d))
+label, plist_path, plist = (None, None, None)
+if cands:
+    cands.sort(key=lambda c: -c[0]); _, label, plist_path, plist = cands[0]
 out["label"] = label
+out["considered"] = [c[1] for c in cands]
 uid = os.getuid()
 
 # --- interval the sentinel says it runs at
@@ -784,6 +801,49 @@ print(json.dumps(out))
 """
 
 
+
+WIN_HEAL = r"""
+# The same healing, in this machine's own idiom: Task Scheduler is Windows' launchd. A sentinel
+# here has no mouth (no osascript), so it queues and the Principal relays — which means an absent
+# tick is the ONLY failure that can hide, and it is the one this fixes.
+import json, os, subprocess, sys, time
+home = os.path.expanduser(sys.argv[1]); st = os.path.join(home, "state")
+grace = int(sys.argv[2]) if len(sys.argv) > 2 else 20
+task = os.environ.get("RAPP_TASK", "RAPPSentinel")
+out = {"home": home, "label": task, "actions": [], "findings": []}
+
+def sh(*a):
+    try:
+        r = subprocess.run(list(a), capture_output=True, text=True, timeout=60)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except Exception as e:
+        return 1, "%s: %s" % (type(e).__name__, e)
+
+rc, q = sh("schtasks", "/query", "/tn", task, "/fo", "list")
+if rc != 0:
+    out["findings"].append("no scheduled task %r — nothing runs this sentinel" % task)
+    print(json.dumps(out)); raise SystemExit
+
+interval = 900
+try: interval = int((json.load(open(os.path.join(home, "config.json"))) or {}).get("interval_s") or 900)
+except Exception: pass
+try: age = (time.time() - os.path.getmtime(os.path.join(st, "last_run.json"))) / 60.0
+except OSError: age = None
+running = "Running" in q
+stale = age is not None and age > (2 * interval / 60.0)
+if age is None: out["findings"].append("no last_run.json — this sentinel has never completed a tick")
+if stale: out["findings"].append("stale record: %d min (interval %d min)" % (age, interval // 60))
+if running and stale:
+    out["findings"].append("the task is Running but the record is not moving — the tick is wedged")
+    rc, o = sh("schtasks", "/end", "/tn", task)
+    out["actions"].append("ended the wedged task" + ("" if rc == 0 else " (%s)" % o.strip()[:60]))
+if stale or age is None:
+    rc, o = sh("schtasks", "/run", "/tn", task)
+    out["actions"].append("ran %s now" % task if rc == 0 else "could not run %s: %s" % (task, o.strip()[:80]))
+print(json.dumps(out))
+"""
+
+
 def heal(only=None, grace_minutes=20):
     """Don't just grade the classroom — fix the ones that stopped teaching.
 
@@ -798,13 +858,12 @@ def heal(only=None, grace_minutes=20):
         interp = room.get("python") or "python3"
         if room.get("transport") == "local":
             argv = [sys.executable, "-", room["home"], str(grace_minutes)]
-        elif str(room.get("os", "")).lower().startswith("win"):
-            print("[principal] %s: windows classroom — heal not supported, reporting only" % room["slug"]); continue
         else:
             argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", room["host"],
-                    "%s - %s %d" % (interp, shlex.quote(room["home"]), grace_minutes)]
+                    "%s - %s %d" % (interp, room["home"], grace_minutes)]
+        program = WIN_HEAL if str(room.get("os", "")).lower().startswith("win") else HEAL
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=180, input=HEAL)
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=180, input=program)
             lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
             if not lines:
                 print("[principal] heal %s: no reply (%s)" % (room["slug"], ((r.stderr or "").strip().splitlines() or ["silent"])[-1][:90])); continue

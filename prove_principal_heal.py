@@ -11,7 +11,7 @@ useful rather than decorative, each proved against a real temporary sentinel hom
   5. when apply is set, the reorientation lands AND the owner's boundaries survive it untouched
   6. lost points name the dimension, never the generic all-good note
 """
-import json, os, subprocess, sys, tempfile, time
+import base64, json, os, subprocess, sys, tempfile, time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -23,9 +23,12 @@ def check(label, cond, detail=""):
     print(("  ok   " if cond else "  FAIL ") + label + (("  — " + str(detail)) if detail and not cond else ""))
     if not cond: fails.append(label)
 
-def run(prog, home, stdin="", extra=()):
-    r = subprocess.run([sys.executable, "-c", prog.replace("sys.argv[1]", repr(str(home)))],
-                       capture_output=True, text=True, input=stdin, timeout=60)
+def run(prog, home, stdin="", extra=(), doc=None):
+    """Programs take (home[, extra]) as argv and arrive on stdin — the shape that survives PowerShell."""
+    argv = [sys.executable, "-", str(home)] + list(extra)
+    if doc is not None:
+        argv.append(base64.b64encode(json.dumps(doc).encode()).decode())
+    r = subprocess.run(argv, capture_output=True, text=True, input=prog, timeout=60)
     lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
     return (json.loads(lines[-1]) if lines else {}), r
 
@@ -51,7 +54,7 @@ with tempfile.TemporaryDirectory() as td:
            "reorientation": {"needed": True, "add_cares": ["kody-w/new"], "drop_cares": ["kody-w/gone"],
                              "situation_note": "the old repo is archived", "freedom": 2, "why": "evidence"},
            "apply": False}
-    res, r = run(P.FEEDBACK_WRITE, home, stdin=json.dumps(doc))
+    res, r = run(P.FEEDBACK_WRITE, home, doc=doc)
     fb = home / "state" / "principal-feedback.json"
     check("3. feedback filed where the sentinel reads it", fb.exists() and (home / "state" / "principal-feedback.jsonl").exists())
     check("   feedback carries the reasons, not just the letter", json.loads(fb.read_text()).get("lost") == ["job 5/25"])
@@ -60,12 +63,28 @@ with tempfile.TemporaryDirectory() as td:
     check("   the proposal is readable", (home / "state" / "principal-reorientation.json").exists())
 
     doc["apply"] = True
-    res, r = run(P.FEEDBACK_WRITE, home, stdin=json.dumps(doc))
+    res, r = run(P.FEEDBACK_WRITE, home, doc=doc)
     after = json.loads((home / "direction.json").read_text())
     check("5. apply lands the reorientation", "kody-w/new" in after["cares_about"] and "kody-w/gone" not in after["cares_about"], after)
     check("   the owner's boundaries survive it", after["boundaries"] == direction["boundaries"], after.get("boundaries"))
     check("   the previous direction is kept", (Path(str(home / "direction.json")) .with_suffix(".json.bak")).exists()
           or (home / "direction.json.bak").exists())
+
+# 7. a home is shared by the tick AND its outbox-drain; healing the drain would "fix" a sentinel
+#    that is still not ticking, so the tick must win the label race.
+with tempfile.TemporaryDirectory() as td2:
+    home2 = Path(td2) / "home"; (home2 / "state").mkdir(parents=True)
+    agents = Path(td2) / "LaunchAgents"; agents.mkdir()
+    import plistlib
+    for label, args in (("com.rapp.x.outbox-drain", ["/usr/bin/python3", "outbox.py", "drain"]),
+                        ("com.rapp.x", ["/bin/bash", str(home2.parent / "code" / "run.sh")])):
+        plistlib.dump({"Label": label, "ProgramArguments": args, "StartInterval": 900,
+                       "EnvironmentVariables": {"SENTINEL_HOME": str(home2)}},
+                      open(agents / (label + ".plist"), "wb"))
+    prog = P.HEAL.replace('os.path.expanduser("~/Library/LaunchAgents/*.plist")', repr(str(agents / "*.plist")))
+    res, _ = run(prog, home2, extra=("20",))
+    check("7. heal targets the tick job, never the outbox-drain", res.get("label") == "com.rapp.x", res.get("label"))
+    check("   and the drain is not even considered", "com.rapp.x.outbox-drain" not in (res.get("considered") or []), res.get("considered"))
 
 obs = {"grade": "B", "score": 80, "points": {"attendance": 25, "record": 20, "job": 5, "honesty": 15, "discipline": 15},
        "notes": ["present, on time, record intact, doing the declared job", "principal's note grades C vs rubric B: x"]}
