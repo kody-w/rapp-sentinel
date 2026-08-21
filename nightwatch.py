@@ -149,6 +149,10 @@ def build(since):
 
 def main():
     c = cfg()
+    mode = str(c.get("notification_mode") or "all").strip().lower()
+    if mode != "all":
+        print(f"nightwatch suppressed by notification_mode={mode}")
+        return 0
     to = None
     for a in sys.argv[1:]:
         if a.startswith("--to="):
