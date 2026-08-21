@@ -31,7 +31,7 @@ import time
 import subprocess
 import sys
 import zipfile
-import fcntl
+import filelock
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -98,11 +98,11 @@ def _prepare_attachment(raw):
 def _locked(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a+", encoding="utf-8") as fh:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        filelock.lock_exclusive(fh)
         try:
             yield
         finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            filelock.unlock(fh)
 
 
 def _queue_lines_unlocked():

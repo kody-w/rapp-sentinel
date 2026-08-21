@@ -2,7 +2,7 @@
 """Verify uncertain iMessage sends against Messages' delivered-message ledger."""
 
 import argparse
-import fcntl
+import filelock
 import json
 import os
 import sqlite3
@@ -189,7 +189,8 @@ def run_loop(interval):
     VERIFY_LOCK.parent.mkdir(parents=True, exist_ok=True)
     with open(VERIFY_LOCK, "a+", encoding="utf-8") as lock:
         try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if not filelock.lock_nb(lock):
+                raise BlockingIOError("another verify holds the lock")
         except BlockingIOError:
             print("outbox verifier already running", file=sys.stderr)
             return 0
