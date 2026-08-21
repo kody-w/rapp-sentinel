@@ -651,7 +651,8 @@ def memo(day=None):
     chronic findings (the same note on 3+ consecutive visits), and anything queued but unsaid."""
     cfg = load_config(); card = load_card()
     now = datetime.now(timezone.utc); stamp = day or now.strftime("%Y-%m-%d")
-    rooms = sorted((card.get("classrooms") or {}).items())
+    pending_slugs = {r["slug"] for r in (cfg.get("classrooms") or []) if r.get("pending_hatch")}
+    rooms = sorted((slug, r) for slug, r in (card.get("classrooms") or {}).items() if slug not in pending_slugs)
     lines = ["# The Principal's memo — %s" % stamp, "",
              "_Written at %s. Every line below is something a sentinel observed, not something inferred._" % now.strftime("%Y-%m-%d %H:%M UTC"), "",
              "| classroom | grade | score | last seen | the one thing |", "|---|---|---|---|---|"]
