@@ -560,3 +560,18 @@ diff against `direction.json` and is *never applied* unless the principal's conf
 `"reorient": "apply"` — and even then the owner's `boundaries` are copied through untouched. A
 machine with no sentinel is marked `pending_hatch`: an empty room is a decision to make, not a
 teacher to fail every twenty minutes. Proof: `prove_principal_heal.py`.
+
+**Hatching on a Windows machine.** A neighbourhood only one OS can join is smaller than it claims.
+The sentinel now runs on Windows: `filelock.py` replaces the `fcntl` import that made
+`import outbox` fail outright, `paths.app_support()` stops building a macOS-shaped path inside a
+Windows profile, and the world-writable guard is skipped where NTFS has no mode bits (it still
+catches `/tmp` on POSIX). Schedule the tick with Task Scheduler instead of launchd:
+
+```bat
+schtasks /create /tn RAPPSentinel /tr "%USERPROFILE%\.rapp-sentinel\run-sentinel.cmd" /sc minute /mo 15 /f
+```
+
+Such a sentinel has **no mouth** — there is no `osascript` — so it queues its alerts and the
+Principal carries them out over the tailnet on its next `relay`. That is not a degraded mode: a
+finding delivered by a neighbour is delivered. Mac-only checks (auditing launchd jobs) report that
+they *cannot* audit rather than passing, because a check that cannot run is not a pass.
