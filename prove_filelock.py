@@ -58,5 +58,23 @@ import outbox
 outbox.enqueue("a message that must survive the lock change", "+15555550123")
 check("5. the outbox queues through the shim", len(outbox._pending()) == 1, outbox._pending())
 
-print(("\nFAILED: " + ", ".join(fails)) if fails else "\nall proved")
+
+# ── where state lives when the machine is not a Mac ──────────────────────────
+import paths
+mac = str(Path.home() / "Library" / "Application Support" / "rapp-sentinel")
+if sys.platform == "darwin":
+    check("6. macOS app-support path is unchanged (the ledger key must not move)",
+          str(paths.app_support()) == mac, paths.app_support())
+else:
+    check("6. off macOS, state does NOT go to a macOS-shaped path",
+          "Library/Application Support" not in str(paths.app_support()), paths.app_support())
+check("7. app_support joins parts", str(paths.app_support("baselines")).endswith("baselines"))
+import baseline
+if os.name == "nt":
+    check("8. the world-writable guard is skipped where the filesystem has no mode bits",
+          baseline.world_writable_ancestor(Path(tempfile.mkdtemp())) is None)
+else:
+    check("8. the world-writable guard still catches /tmp on POSIX",
+          baseline.world_writable_ancestor(Path("/tmp")) is not None)
+print(("\nFAILED: " + ", ".join(fails)) if fails else "\nall proved (lock + platform paths)")
 sys.exit(1 if fails else 0)

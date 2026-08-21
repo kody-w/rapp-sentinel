@@ -573,12 +573,17 @@ def write_dashboard():
 
 
 RELAY = r"""
-import fcntl, json, os, sys
+import json, os, sys
+try:                      # the classroom may be Windows, where flock does not exist
+    import fcntl
+except ImportError:
+    fcntl = None
 home = os.path.expanduser(sys.argv[1]); st = os.path.join(home, "state")
 q = os.path.join(st, "outbox.jsonl"); sent = os.path.join(st, "outbox-sent.jsonl")
 lock = os.path.join(st, "outbox.lock")
 if not os.path.exists(q): print("[]"); raise SystemExit
-fh = open(lock, "a+"); fcntl.flock(fh, fcntl.LOCK_EX)
+fh = open(lock, "a+")
+if fcntl: fcntl.flock(fh, fcntl.LOCK_EX)
 try:
     rows = [l for l in open(q, encoding="utf-8").read().splitlines() if l.strip()]
     open(q, "w").close()                       # queue emptied only after we hold it
@@ -589,7 +594,8 @@ try:
             m["relayed_by"] = "principal"; out.write(json.dumps(m, ensure_ascii=False) + "\n")
     print(json.dumps(rows))
 finally:
-    fcntl.flock(fh, fcntl.LOCK_UN); fh.close()
+    if fcntl: fcntl.flock(fh, fcntl.LOCK_UN)
+    fh.close()
 """
 
 

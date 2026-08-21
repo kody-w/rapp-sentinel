@@ -41,10 +41,10 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from paths import HOME
+from paths import HOME, app_support
 
 SCHEMA = "rapp-test-baseline/1.0"
-CLONES = Path.home() / "Library" / "Application Support" / "rapp-sentinel" / "baselines"
+CLONES = app_support("baselines")
 
 # The landing enrollment is this repo alone — known-runnable, no deps to
 # sort. Enrolling rappterbook/rappterverse is a config decision for whoever
@@ -90,6 +90,11 @@ def world_writable_ancestor(path):
     trap: a test asserting its output parent is not world-writable refuses
     there, correctly, for reasons unrelated to the code under test."""
     p = Path(path).resolve()
+    if os.name == "nt":
+        # NTFS has no POSIX mode bits: os.stat reports 0o666/0o777 for ordinary files and
+        # directories, so this test would refuse EVERY measurement on Windows for a permission
+        # the filesystem does not model. The /tmp trap this guards against is a POSIX shape.
+        return None
     for candidate in [p] + list(p.parents):
         try:
             if candidate.stat().st_mode & 0o002:

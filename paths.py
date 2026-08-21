@@ -29,9 +29,29 @@ the code tree.
 """
 
 import os
+import sys
 from pathlib import Path
 
 CODE = Path(__file__).resolve().parent
+
+
+def app_support(*parts):
+    """The per-user directory for state that must OUTLIVE any one checkout.
+
+    Two things live here: the anchor ledger (an instance's chain anchors, which must survive the
+    code being re-cloned) and the baseline clones. The location was hardcoded to macOS's
+    ~/Library/Application Support, so a Windows sentinel built a nonexistent macOS-shaped path
+    inside its profile and then measured against it.
+
+    macOS keeps EXACTLY the path it always had — a running organism's ledger key must not move
+    when it pulls this change; a moved ledger reads as 'this instance's streams vanished'."""
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "rapp-sentinel"
+    elif os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or (Path.home() / "AppData" / "Local")) / "rapp-sentinel"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")) / "rapp-sentinel"
+    return base.joinpath(*parts) if parts else base
 
 
 def _home():

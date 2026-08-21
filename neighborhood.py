@@ -61,7 +61,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import rapp
-from paths import HOME
+from paths import HOME, app_support
 
 # A neighbor slug becomes a §7 kind segment ("<slug>.tick"), so it must be a
 # lowercase-hyphen segment: this is what a config-declared AI's name has to
@@ -393,8 +393,7 @@ def anchor_heads():
 # With SENTINEL_HOME set, each instance gets its own key, which is exactly
 # the isolation the key exists for.
 _INSTALL_KEY = rapp.H("rapp/1:install", {"path": str(HOME)})[:16]
-EXTERNAL_LEDGER = Path.home() / "Library" / "Application Support" / \
-    "rapp-sentinel" / f"anchor-ledger-{_INSTALL_KEY}.json"
+EXTERNAL_LEDGER = app_support(f"anchor-ledger-{_INSTALL_KEY}.json")
 
 
 def _update_external_ledger(rec):
