@@ -778,6 +778,10 @@ class FakeGh:
 
     def __call__(self, *args, timeout=None, wcfg=None, ctx=None):
         self.calls.append(args)
+        if args[:2] == ("pr", "view") and "--json" in args:
+            fields = args[args.index("--json") + 1].split(",")
+            if "merged" in fields:
+                raise AssertionError("gh pr view has no `merged` JSON field")
         if args[:2] == ("pr", "create"):
             self.branch = args[args.index("--head") + 1]
             return "https://github.com/kody-w/public-art-collective/pull/7\n"

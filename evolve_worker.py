@@ -2623,9 +2623,9 @@ def confirm_merge(clone, submission, wcfg, pr_number, paths, ctx=None):
     gh_t = int(wcfg.get("gh_timeout_s", 300))
 
     merged = json.loads(_gh("pr", "view", str(pr_number), "--repo", repo,
-                            "--json", "state,merged,mergeCommit",
+                            "--json", "state,mergeCommit",
                             timeout=gh_t, ctx=ctx))
-    if not merged.get("merged") or str(merged.get("state")).upper() != "MERGED":
+    if str(merged.get("state")).upper() != "MERGED":
         raise CommandError(f"PR {pr_number} is not merged: "
                            f"{merged.get('state')!r}")
     merge_sha = ((merged.get("mergeCommit") or {}).get("oid") or "").strip()
@@ -2922,8 +2922,8 @@ def publish_rapp_vision(workspace, submission, piece_bytes, wcfg, health,
 
     merged = json.loads(_gh(
         "pr", "view", pr_number, "--repo", repo, "--json",
-        "state,merged,mergeCommit", timeout=gh_t, ctx=ctx))
-    if not merged.get("merged") or str(merged.get("state")).upper() != "MERGED":
+        "state,mergeCommit", timeout=gh_t, ctx=ctx))
+    if str(merged.get("state")).upper() != "MERGED":
         raise CommandError(f"RAPP Vision PR {pr_number} is not merged")
     merge_sha = ((merged.get("mergeCommit") or {}).get("oid") or "").strip()
     _git_remote(clone, vwcfg, "fetch", "--no-tags", "origin", base,
@@ -3329,11 +3329,11 @@ def clean_interrupted_vision_pr(state, wcfg):
     try:
         view = json.loads(_gh(
             "pr", "view", pr_number, "--repo", repo,
-            "--json", "state,merged", timeout=gh_t, ctx=vctx))
+            "--json", "state", timeout=gh_t, ctx=vctx))
     except (CommandError, subprocess.TimeoutExpired, json.JSONDecodeError) as e:
         raise DeploymentPending(
             f"cannot inspect interrupted RAPP Vision PR {pr_number}: {e}")
-    if view.get("merged") or str(view.get("state")).upper() == "MERGED":
+    if str(view.get("state")).upper() == "MERGED":
         return
     _close_pr(repo, pr_number, gh_t, vctx)
     log(f"closed interrupted RAPP Vision PR {pr_number} before retrying")
