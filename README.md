@@ -561,6 +561,25 @@ diff against `direction.json` and is *never applied* unless the principal's conf
 machine with no sentinel is marked `pending_hatch`: an empty room is a decision to make, not a
 teacher to fail every twenty minutes. Proof: `prove_principal_heal.py`.
 
+**The hub runs only what it agreed to run.** `hub.py` imports and executes every file in `HOME/hub/`
+on every tick; the only gate was a well-formed `__manifest__` — a check of *shape*, never of identity.
+Nothing recorded which bytes were accepted, so a hub sentinel could be rewritten in place and the next
+tick would execute the new code under the old name, silently. `w_hub_integrity` compares every installed
+file against an explicit acceptance ledger (`state/hub-integrity.json`):
+
+```bash
+python3 hub.py integrity          # what is installed vs what was accepted
+python3 hub.py accept <slug>      # record the bytes now on disk, after reading them
+python3 hub.py forget <slug>      # drop the record of an uninstalled sentinel
+```
+
+Changed bytes under an accepted name is **critical** — that is the case that must never pass quietly.
+An installed-but-never-accepted file is a **warn**, because that is the ordinary state between
+installing and accepting and the loop should say so rather than break. Acceptance is never automatic:
+an organism that accepts whatever it finds has recorded a habit, not a decision. The digest is taken
+*before* the manifest is parsed, so a file rewritten into something that no longer even loads is still
+reported as changed rather than downgraded to a load warning. Proof: `prove_hub_integrity.py`.
+
 **Hatching on a Windows machine.** A neighbourhood only one OS can join is smaller than it claims.
 The sentinel now runs on Windows: `filelock.py` replaces the `fcntl` import that made
 `import outbox` fail outright, `paths.app_support()` stops building a macOS-shaped path inside a

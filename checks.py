@@ -2604,3 +2604,57 @@ def outsider_smoke_exercised():
     return ok("w_outsider_smoke",
               f"{len(platforms)} platform(s) smoked from outside within "
               f"{bar:.0f}h")
+
+
+@check
+def hub_runs_only_what_was_accepted():
+    """The code this organism executes is the code it agreed to execute.
+
+    hub.py imports and runs every file in HOME/hub/ on every tick, forever. The gate was a
+    well-formed `__manifest__` — a check of SHAPE, never of identity. Nothing recorded which bytes
+    had been accepted, so a hub sentinel could be rewritten in place (an update, a stray script,
+    anyone who can write that directory) and the next tick would execute the new code under the old
+    name, silently. Every other check in this file is a claim about the world; this one is the claim
+    that makes the others worth anything, because a witness that cannot say what it is running is
+    not a witness.
+
+    CHANGED is critical: bytes moved under an accepted name is the case that must never pass
+    quietly. UNACCEPTED is a warn — it is the normal state between installing and accepting, and
+    the loop should say so rather than break. Accept with: python3 hub.py accept <slug>
+    """
+    import hub
+    try:
+        state = hub.integrity()
+    except Exception as e:                     # blind is not broken (R1): say so, never pass
+        return fail("w_hub_integrity", f"cannot read the hub ledger: {type(e).__name__}: {e}",
+                    critical=False)
+    changed, unaccepted = state["changed"], state["unaccepted"]
+    if changed:
+        names = "; ".join(
+            f"{c['slug']} accepted {str(c['accepted'])[:12]} but running {c['found'][:12]}"
+            + (" " + c["also"] if c.get("also") else "")
+            for c in changed)
+        return fail("w_hub_integrity",
+                    f"{len(changed)} hub sentinel(s) changed since acceptance and are EXECUTING: "
+                    f"{names}; re-read the file, then `python3 hub.py accept <slug>`")
+    if unaccepted:
+        names = ", ".join(f"{u['slug']} ({u['name']})" for u in unaccepted)
+        return fail("w_hub_integrity",
+                    f"{len(unaccepted)} hub sentinel(s) execute every tick but were never "
+                    f"accepted: {names}; `python3 hub.py accept <slug>` after reading them",
+                    critical=False)
+    matched, missing, malformed = state["matched"], state["missing"], state["malformed"]
+    if malformed:
+        # Never accepted and will not load. run_all reports the load failure; this check reports
+        # that something is sitting in the execute-every-tick directory that nobody vouched for.
+        names = ", ".join(f"{m['slug']} ({str(m['error'])[:60]})" for m in malformed)
+        return fail("w_hub_integrity",
+                    f"{len(malformed)} unaccepted file(s) in the hub directory will not load: "
+                    f"{names}; remove them or fix and accept them", critical=False)
+    if not matched and not missing:
+        return ok("w_hub_integrity", "no hub sentinels installed")
+    detail = f"{len(matched)} hub sentinel(s) match the bytes accepted"
+    if missing:
+        detail += (f"; {len(missing)} accepted but no longer installed "
+                   f"({', '.join(m['slug'] for m in missing)}) - `python3 hub.py forget <slug>`")
+    return ok("w_hub_integrity", detail)

@@ -39,6 +39,7 @@ GROWTH PATH
 """
 
 import ast
+import hashlib
 import importlib.util
 import json
 import re
@@ -54,6 +55,7 @@ SCHEMA = "rapp-sentinel/1.0"
 HUB_DIR = HOME / "hub"
 STATE_DIR = HOME / "state" / "hub"
 NAME_RE = re.compile(r"^@([A-Za-z0-9][A-Za-z0-9-]{0,38})/([a-z][a-z0-9_]{1,60}_sentinel)$")
+LEDGER = HOME / "state" / "hub-integrity.json"   # what this organism has agreed to execute
 ID_RE = re.compile(r"^[a-z][a-z0-9_]{2,40}$")
 KINDS = ("reachability", "output-freshness", "run-status", "consistency", "watcher")
 
@@ -241,3 +243,148 @@ def run_all(hub_dir=None, cfg=None, ctx=None):
             rr["produced_by"] = f"hub:{name}"
             results.append(rr)
     return results
+
+
+# ── integrity: the code this organism executes is the code it agreed to execute ──
+#
+# run_all() imports every file in HOME/hub/ and executes it, every tick, forever. Until now the
+# only gate was a well-formed __manifest__ literal — a shape check, not an identity check. Nothing
+# recorded WHICH BYTES were accepted, so a hub sentinel could be edited in place (by an update, a
+# stray script, or anyone who can write that directory) and the next tick would execute the new
+# code silently, with the same name and the same manifest. A watchdog that cannot say what it is
+# running cannot be a witness to anything else.
+#
+# So: an explicit, human-scale acceptance ledger. `hub.py accept <slug>` records the sha256 of the
+# bytes on disk; the w_hub_integrity check compares every installed file against that record and
+# says, out loud, when they differ. Acceptance is never automatic — an organism that accepts
+# whatever it finds has recorded a habit, not a decision.
+
+
+def file_sha256(path):
+    """The digest of the bytes as they are, with no normalization — this is an identity, not a diff."""
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(65536), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def read_ledger():
+    try:
+        doc = json.loads(LEDGER.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {"schema": "rapp-sentinel-hub-integrity/1.0", "accepted": {}}
+    if not isinstance(doc, dict) or not isinstance(doc.get("accepted"), dict):
+        return {"schema": "rapp-sentinel-hub-integrity/1.0", "accepted": {}}
+    return doc
+
+
+def _write_ledger(doc):
+    LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    tmp = LEDGER.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(doc, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(LEDGER)
+
+
+def accept(slug, hub_dir=None):
+    """Record the bytes currently on disk for `slug` as accepted. Returns (ok, message)."""
+    hub_dir = Path(hub_dir) if hub_dir else HUB_DIR
+    path = hub_dir / (slug if slug.endswith(".py") else slug + ".py")
+    if not path.is_file():
+        return False, "no such hub sentinel: %s" % path
+    try:
+        m = _read_manifest(path)
+        err = _manifest_errors(m)
+    except Exception as e:
+        m, err = None, "%s: %s" % (type(e).__name__, str(e)[:80])
+    if err:
+        return False, "refusing to accept a malformed sentinel (%s)" % err
+    digest = file_sha256(path)
+    doc = read_ledger()
+    prev = doc["accepted"].get(path.stem)
+    doc["accepted"][path.stem] = {
+        "name": m["name"], "sha256": digest,
+        "accepted_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "previous_sha256": (prev or {}).get("sha256"),
+        "checks": sorted(m["checks"]),
+    }
+    _write_ledger(doc)
+    return True, "accepted %s (%s) sha256 %s" % (path.stem, m["name"], digest[:12])
+
+
+def forget(slug):
+    """Drop an acceptance — for a sentinel that has been uninstalled."""
+    doc = read_ledger()
+    if doc["accepted"].pop(slug, None) is None:
+        return False, "%s was not in the ledger" % slug
+    _write_ledger(doc)
+    return True, "forgot %s" % slug
+
+
+def integrity(hub_dir=None):
+    """Compare what is installed against what was accepted. Pure: reads, never writes.
+
+    Returns {"unaccepted": [...], "changed": [...], "missing": [...], "matched": [...], "malformed": [...]}
+    - unaccepted: installed and EXECUTING, never accepted by anyone
+    - changed:    accepted once, but the bytes on disk are different now
+    - missing:    accepted, no longer installed (informational — an uninstall leaves a record)
+    - malformed:  present, never accepted, and will not load
+
+    The digest is taken BEFORE the manifest is parsed, and that order is the point. An earlier
+    version asked "is this a valid sentinel?" first, so a file that was rewritten into something
+    unparseable fell into `malformed` and the fact that ACCEPTED BYTES HAD MOVED was lost — the
+    loudest possible signal, silently downgraded to a load warning. Identity does not depend on
+    the file still being valid: a changed file is changed whether or not it still parses.
+    """
+    doc = read_ledger()
+    accepted = doc["accepted"]
+    out = {"unaccepted": [], "changed": [], "missing": [], "matched": [], "malformed": []}
+    seen = set()
+    for path, m, err in installed(hub_dir):
+        seen.add(path.stem)
+        try:
+            digest = file_sha256(path)
+        except OSError as e:
+            out["malformed"].append({"slug": path.stem, "error": "unreadable: %s" % e})
+            continue
+        rec = accepted.get(path.stem)
+        name = (m or {}).get("name") or (rec or {}).get("name") or path.stem
+        if rec:                                     # identity first — validity is a separate question
+            if rec.get("sha256") != digest:
+                row = {"slug": path.stem, "name": name,
+                       "accepted": rec.get("sha256"), "found": digest}
+                if err or not m:
+                    row["also"] = "and no longer loads (%s)" % err
+                out["changed"].append(row)
+            else:
+                out["matched"].append({"slug": path.stem, "name": name})
+            continue
+        if err or not m:
+            out["malformed"].append({"slug": path.stem, "error": err})
+        else:
+            out["unaccepted"].append({"slug": path.stem, "name": name, "sha256": digest})
+    for slug in sorted(set(accepted) - seen):
+        out["missing"].append({"slug": slug, "name": (accepted[slug] or {}).get("name")})
+    return out
+
+
+if __name__ == "__main__":
+    import sys
+    a = sys.argv[1:]
+    if a and a[0] == "accept":
+        if len(a) < 2:
+            print("usage: hub.py accept <slug>|--all"); sys.exit(2)
+        targets = [p.stem for p, m, e in installed() if m] if a[1] == "--all" else a[1:]
+        bad = 0
+        for t in targets:
+            good, msg = accept(t)
+            print(("  " if good else "  REFUSED: ") + msg)
+            bad += 0 if good else 1
+        sys.exit(1 if bad else 0)
+    elif a and a[0] == "forget" and len(a) > 1:
+        good, msg = forget(a[1]); print(msg); sys.exit(0 if good else 1)
+    elif a and a[0] == "integrity":
+        print(json.dumps(integrity(), indent=2)); sys.exit(0)
+    else:
+        print(__doc__)
+        print("commands: accept <slug>|--all | forget <slug> | integrity")
