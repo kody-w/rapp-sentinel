@@ -86,9 +86,85 @@ with tempfile.TemporaryDirectory() as td2:
     check("7. heal targets the tick job, never the outbox-drain", res.get("label") == "com.rapp.x", res.get("label"))
     check("   and the drain is not even considered", "com.rapp.x.outbox-drain" not in (res.get("considered") or []), res.get("considered"))
 
+# ── the two-phase relay: a finding must never be destroyed in transit ────────
+#
+# The first relay truncated the classroom's queue and wrote its sent-ledger in one step, then
+# printed the rows. Anything failing after that truncation — the remote raising, ssh dying, stdout
+# lost — destroyed the messages while the classroom's own ledger claimed delivery. A blocked mouth
+# at least still HOLDS the finding.
+def relay_home(td, rows):
+    home = Path(td) / "rhome"; (home / "state").mkdir(parents=True)
+    (home / "state" / "outbox.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return home
+
+with tempfile.TemporaryDirectory() as td:
+    msg = {"at": "2026-01-01T00:00:00Z", "to": "+15555550123", "text": "the roof is on fire"}
+    home = relay_home(td, [msg])
+    q = home / "state" / "outbox.jsonl"
+    relaying = home / "state" / "outbox.relaying.jsonl"
+
+    took, _ = run(P.RELAY_TAKE, home)
+    check("10. take returns the queued rows", [json.loads(r)["text"] for r in took["rows"]] == ["the roof is on fire"], took)
+    check("    and the queue is cleared only aside, never away", not q.exists() and relaying.exists(), list((home / "state").iterdir()))
+    check("    nothing is marked sent yet", not (home / "state" / "outbox-sent.jsonl").exists())
+
+    # the Principal dies here — the classroom must still hold the finding
+    took2, _ = run(P.RELAY_TAKE, home)
+    check("11. a crashed relay loses nothing — the next take recovers it",
+          [json.loads(r)["text"] for r in took2["rows"]] == ["the roof is on fire"], took2)
+
+    # a message queued while we were carrying is picked up too, not stranded
+    with open(q, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"at": "2026-01-01T00:05:00Z", "to": "+15555550123", "text": "and the cellar"}) + "\n")
+    took3, _ = run(P.RELAY_TAKE, home)
+    check("12. a message queued mid-relay is taken too, not stranded", len(took3["rows"]) == 2, took3)
+
+    done, _ = run(P.RELAY_COMMIT, home)
+    check("13. commit marks exactly what was carried", done.get("committed") == 2, done)
+    sent = [json.loads(l) for l in (home / "state" / "outbox-sent.jsonl").read_text().splitlines() if l.strip()]
+    check("    and the sent ledger says who carried them", all(m.get("relayed_by") == "principal" for m in sent), sent)
+    check("    and the classroom is finally empty", not relaying.exists() and not q.exists())
+    took4, _ = run(P.RELAY_TAKE, home)
+    check("14. a committed classroom offers nothing further", took4["rows"] == [], took4)
+
+# ── heal must not kill a healthy tick, nor a neighbour's ─────────────────────
+src = Path(P.__file__).read_text()
+check("15. heal no longer matches processes by argv substring", "or True" not in src.split("WIN_HEAL")[0], "the `or True` scope hole is back")
+check("    it asks launchd which pid is this job's", 'launchctl", "print"' in src or '"launchctl", "print"' in src)
+check("16. the hung bar never falls below the tick's own ceiling",
+      "ceiling + 300" in src and "SENTINEL_TICK_LIMIT" in src, "bar must respect run.sh's LIMIT")
+check("17. a kill is verified, not assumed", "FAILED to kill" in src)
+
+# ── relay must not empty a classroom it cannot speak for ─────────────────────
+check("18. relay refuses to move messages when this principal has no mouth",
+      "no working mouth" in src and 'cfg.get("notify_handle")' in src)
+check("19. relay checks the remote exit code", "ssh exit %d" in src)
+code_lines = [l for l in src.splitlines() if not l.lstrip().startswith("#")]
+check("20. the always-true 'stuck' probe is gone from the CODE (a comment about it is fine)",
+      not any("or queued > 0" in l for l in code_lines),
+      [l.strip() for l in code_lines if "or queued > 0" in l])
+
 obs = {"grade": "B", "score": 80, "points": {"attendance": 25, "record": 20, "job": 5, "honesty": 15, "discipline": 15},
        "notes": ["present, on time, record intact, doing the declared job", "principal's note grades C vs rubric B: x"]}
 lost = P.lost_points(obs)
+# ── chronic detection must read where the notes actually are ────────────────
+with tempfile.TemporaryDirectory() as td:
+    obs_path = Path(td) / "observations.jsonl"
+    rows = ([{"slug": "x", "notes": ["present, on time, record intact, doing the declared job"]}] * 3 +
+            [{"slug": "y", "notes": ["alert_delivery: queued and undelivered", "one-off blip"]},
+             {"slug": "y", "notes": ["alert_delivery: queued and undelivered", "different blip"]},
+             {"slug": "y", "notes": ["alert_delivery: queued and undelivered"]}])
+    obs_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    real_obs = P.OBS
+    P.OBS = obs_path
+    try:
+        check("21. a finding on three straight visits is chronic", P.chronic_notes("y") == ["alert_delivery: queued and undelivered"], P.chronic_notes("y"))
+        check("    a one-off is not", "one-off blip" not in P.chronic_notes("y"))
+        check("22. the benign all-good note is never called chronic", P.chronic_notes("x") == [], P.chronic_notes("x"))
+        check("23. fewer than three visits is not a pattern", P.chronic_notes("y", visits=9) == [], P.chronic_notes("y", visits=9))
+    finally:
+        P.OBS = real_obs
+
 check("6. lost points name the dimension", any(l.startswith("job 5/25") for l in lost), lost)
 check("   and never quote the all-good note", not any("present, on time" in l for l in lost), lost)
 

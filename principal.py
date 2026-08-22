@@ -577,30 +577,99 @@ def write_dashboard():
 
 
 
-RELAY = r"""
+RELAY_TAKE = r"""
+# Phase 1 of a two-phase hand-off. Take the classroom's queued alerts WITHOUT destroying them.
+#
+# The first version truncated the queue and wrote the sent-log in one step, then printed the rows.
+# Anything that went wrong after the truncation — the remote raising, ssh timing out, the link
+# dropping, stdout never arriving — destroyed the messages while the classroom's own ledger claimed
+# they had been delivered. A relay that can lose the finding is worse than a blocked mouth, because
+# a blocked mouth still HOLDS the finding.
+#
+# So: rename the queue aside (rename is atomic; the bytes are never in flight), and stop. If this
+# process dies here, outbox.relaying.jsonl still holds every message and the next relay recovers it.
+# Nothing is marked sent until the Principal says it has the rows durably (phase 2).
 import json, os, sys
-try:                      # the classroom may be Windows, where flock does not exist
+try:
     import fcntl
 except ImportError:
     fcntl = None
-home = os.path.expanduser(sys.argv[1]); st = os.path.join(home, "state")
-q = os.path.join(st, "outbox.jsonl"); sent = os.path.join(st, "outbox-sent.jsonl")
-lock = os.path.join(st, "outbox.lock")
-if not os.path.exists(q): print("[]"); raise SystemExit
-fh = open(lock, "a+")
-if fcntl: fcntl.flock(fh, fcntl.LOCK_EX)
 try:
-    rows = [l for l in open(q, encoding="utf-8").read().splitlines() if l.strip()]
-    open(q, "w").close()                       # queue emptied only after we hold it
+    import msvcrt
+except ImportError:
+    msvcrt = None
+home = os.path.expanduser(sys.argv[1]); st = os.path.join(home, "state")
+q = os.path.join(st, "outbox.jsonl")
+relaying = os.path.join(st, "outbox.relaying.jsonl")
+lock = os.path.join(st, "outbox.lock")
+
+def take_lock(fh):
+    # The same guarantee on both kinds of machine. A Windows classroom used to get NO lock at all,
+    # which is exactly where a lock matters — its own drain may be running.
+    if fcntl:
+        fcntl.flock(fh, fcntl.LOCK_EX); return True
+    if msvcrt:
+        import time as _t
+        for _ in range(100):
+            try:
+                fh.seek(0); msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1); return True
+            except OSError:
+                _t.sleep(0.05)
+        return False
+    return False
+
+def drop_lock(fh):
+    try:
+        if fcntl: fcntl.flock(fh, fcntl.LOCK_UN)
+        elif msvcrt: fh.seek(0); msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        pass
+
+os.makedirs(st, exist_ok=True)
+fh = open(lock, "a+")
+locked = take_lock(fh)
+try:
+    if not locked:
+        print(json.dumps({"error": "could not take the outbox lock", "rows": []})); raise SystemExit
+    rows = []
+    # Recover anything a previous relay took but never committed — at-least-once, never at-most-once.
+    if os.path.exists(relaying):
+        rows += [l for l in open(relaying, encoding="utf-8").read().splitlines() if l.strip()]
+    if os.path.exists(q):
+        fresh = [l for l in open(q, encoding="utf-8").read().splitlines() if l.strip()]
+        if fresh:
+            rows += fresh
+            if os.path.exists(relaying):
+                with open(relaying, "a", encoding="utf-8") as out:
+                    for l in fresh: out.write(l + "\n")
+                os.remove(q)
+            else:
+                os.replace(q, relaying)          # atomic: the bytes are never nowhere
+    print(json.dumps({"error": None, "rows": rows}))
+finally:
+    drop_lock(fh); fh.close()
+"""
+
+
+RELAY_COMMIT = r"""
+# Phase 2. The Principal has the rows in its OWN durable, locked outbox, so the classroom may now
+# forget them. Only now is the sent-ledger written — a message is marked delivered when someone
+# else is holding it, never before.
+import json, os, sys
+home = os.path.expanduser(sys.argv[1]); st = os.path.join(home, "state")
+relaying = os.path.join(st, "outbox.relaying.jsonl")
+sent = os.path.join(st, "outbox-sent.jsonl")
+n = 0
+if os.path.exists(relaying):
+    rows = [l for l in open(relaying, encoding="utf-8").read().splitlines() if l.strip()]
     with open(sent, "a", encoding="utf-8") as out:
         for l in rows:
             try: m = json.loads(l)
             except ValueError: continue
-            m["relayed_by"] = "principal"; out.write(json.dumps(m, ensure_ascii=False) + "\n")
-    print(json.dumps(rows))
-finally:
-    if fcntl: fcntl.flock(fh, fcntl.LOCK_UN)
-    fh.close()
+            m["relayed_by"] = "principal"
+            out.write(json.dumps(m, ensure_ascii=False) + "\n"); n += 1
+    os.remove(relaying)
+print(json.dumps({"committed": n}))
 """
 
 
@@ -615,44 +684,123 @@ def relay(only=None, min_age_minutes=None):
     cfg = load_config()
     thresh = min_age_minutes if min_age_minutes is not None else int(cfg.get("relay_after_minutes", 30))
     carried = 0
+    # Never empty someone else's queue unless THIS mouth works. Carrying a message out of a
+    # classroom and then dropping it into a silent local outbox is not a relay, it is a deletion
+    # with extra steps.
+    if not cfg.get("notify") or not cfg.get("notify_handle"):
+        print("[principal] relay skipped: this principal has no working mouth "
+              "(notify/notify_handle unset) — a classroom's queue is safer where it is")
+        return 0
     for room in cfg["classrooms"]:
         if only and room["slug"] != only: continue
         if room.get("transport") != "ssh" or room.get("relay") is False: continue
         snap, err = gather(room)
         if not snap: continue
         queued = int(snap.get("outbox_queued") or 0)
-        if not queued: continue
         drain = snap.get("outbox_last_drain") or {}
-        stuck = bool(drain.get("error") or drain.get("why") not in (None, "", "empty")) or queued > 0
+        # Is this classroom's own mouth actually blocked? The old expression ended in `or queued > 0`,
+        # which is always true here — so it never probed, and every relayed message went out under the
+        # claim "its own mouth is blocked" even when the machine was merely asleep between drains.
+        blocked = bool(drain.get("error")) or str(drain.get("why") or "") not in ("", "empty")
         age = None
         try:
             oldest = min(parse_ts(json.loads(l)["at"]) for l in (snap.get("outbox_tail") or []) if l.strip())
             age = (datetime.now(timezone.utc) - oldest).total_seconds() / 60.0
         except Exception:
             pass
-        if age is not None and age < thresh: continue
-        if not stuck: continue
+        stranded = age is not None and age >= thresh      # older than a classroom should ever hold a finding
+        if not queued: continue
+        if not (blocked or stranded): continue
         interp = room.get("python") or "python3"
-        argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", room["host"],
-                "%s - %s" % (interp, shlex.quote(room["home"]))]
+
+        def run_phase(program, timeout=60):
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", room["host"],
+                                "%s - %s" % (interp, room["home"])],
+                               capture_output=True, text=True, timeout=timeout, input=program)
+            if r.returncode != 0:                         # never inferred from stdout alone
+                raise RuntimeError("ssh exit %d: %s" % (r.returncode, (r.stderr or "").strip()[:120]))
+            lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
+            if not lines:
+                raise RuntimeError("no reply from the classroom")
+            return json.loads(lines[-1])
+
         try:
-            r = subprocess.run(argv, capture_output=True, text=True, timeout=60, input=RELAY)
-            rows = json.loads((r.stdout or "[]").strip().splitlines()[-1])
+            took = run_phase(RELAY_TAKE)
         except Exception as e:
-            print("[principal] relay %s failed: %s: %s" % (room["slug"], type(e).__name__, e)); continue
-        for raw in rows:
-            try: m = json.loads(raw)
-            except ValueError: continue
-            notify(cfg, "📨 relayed from %s (its own mouth is blocked):\n%s" % (room["name"], m.get("text", "")[:900]))
-            carried += 1
-        if rows:
-            print("[principal] relayed %d message(s) for %s" % (len(rows), room["slug"]))
-    if carried: 
+            print("[principal] relay %s: take failed, nothing moved: %s: %s"
+                  % (room["slug"], type(e).__name__, e)); continue
+        if took.get("error"):
+            print("[principal] relay %s: %s" % (room["slug"], took["error"])); continue
+        rows = took.get("rows") or []
+        if not rows: continue
+
+        # Durable hand-off: every row lands in the Principal's own locked outbox BEFORE the
+        # classroom is told to forget it. If this raises, the rows are still in the classroom's
+        # outbox.relaying.jsonl and the next relay takes them again.
+        why = "its own mouth is blocked" if blocked else "it has held this for %d min" % (age or 0)
+        held = 0
+        try:
+            for raw in rows:
+                try: m = json.loads(raw)
+                except ValueError: continue
+                notify(cfg, "📨 relayed from %s (%s):\n%s" % (room["name"], why, m.get("text", "")[:900]))
+                held += 1
+        except Exception as e:
+            print("[principal] relay %s: could not hold the messages (%s) — left with the classroom"
+                  % (room["slug"], e)); continue
+        if not held:
+            print("[principal] relay %s: nothing readable in %d row(s) — left with the classroom"
+                  % (room["slug"], len(rows))); continue
+        try:
+            done = run_phase(RELAY_COMMIT)
+            print("[principal] relayed %d message(s) for %s (%s)" % (held, room["slug"], why))
+        except Exception as e:
+            # We hold them; the classroom still holds a copy. A duplicate is a survivable sin.
+            print("[principal] relay %s: held %d message(s) but could not clear the classroom "
+                  "(%s) — it may re-offer them" % (room["slug"], held, e))
+        carried += held
+    if carried:
         try:
             import outbox; outbox.drain()
         except Exception as e:
             print("[principal] local drain failed: %s" % e)
     return carried
+
+
+
+BENIGN_NOTE = "present, on time, record intact"
+
+
+def chronic_notes(slug, visits=3):
+    """A finding the last `visits` visits all agree on — read from the observations, not the card.
+
+    The card's history rows carry only utc/grade/score (record() writes exactly those), so the first
+    version intersected `notes` keys that are never present: `common` began empty and the memo's
+    Chronic section was unreachable code. The memo still printed its action item about chronic
+    findings, so an empty section read as "nothing is chronic" when the truth was "never measured" —
+    R2 with a straight face. The full notes are in observations.jsonl, where record() has been
+    appending them all along.
+
+    Only FAILURE notes count. "present, on time, record intact, doing the declared job" repeats on
+    every healthy visit; reporting that as chronic would bury the real ones."""
+    seen = []
+    try:
+        with open(OBS, encoding="utf-8") as fh:
+            for line in fh:
+                if not line.strip(): continue
+                try: o = json.loads(line)
+                except ValueError: continue
+                if o.get("slug") == slug: seen.append(o)
+    except OSError:
+        return []
+    last = seen[-visits:]
+    if len(last) < visits: return []
+    common = None
+    for o in last:
+        notes = {n for n in (o.get("notes") or [])
+                 if not n.startswith(BENIGN_NOTE) and not n.startswith("principal's note grades")}
+        common = notes if common is None else (common & notes)
+    return sorted(common or [])
 
 
 def memo(day=None):
@@ -673,11 +821,7 @@ def memo(day=None):
         note = (o.get("notes") or ["—"])[0]
         lines.append("| %s | **%s** | %s | %s | %s |" % (o.get("name", slug), o.get("grade", "?"), o.get("score", "—"), (o.get("utc") or "—")[:16], note[:110]))
         if o.get("grade") in ("D", "F"): failing.append((slug, o))
-        hist = [h for h in (r.get("history") or [])][-3:]
-        if len(hist) >= 3:
-            common = set(hist[0].get("notes") or [])
-            for h in hist[1:]: common &= set(h.get("notes") or [])
-            for c in sorted(common): chronic.append((o.get("name", slug), c))
+        for c in chronic_notes(slug): chronic.append((o.get("name", slug), c))
     if failing:
         lines += ["", "## Not teaching", ""]
         for slug, o in failing:
@@ -752,25 +896,51 @@ try: interval = int((json.load(open(os.path.join(home, "config.json"))) or {}).g
 except Exception: pass
 if plist and plist.get("StartInterval"): interval = int(plist["StartInterval"])
 
-# --- 1. hung tick: a process whose argv mentions this home/code, alive far longer than one interval
+# --- 1. hung tick — identified by OWNERSHIP, not by a name in someone's argv.
+#
+# The first version matched any process whose argv contained sentinel.py/health.py/run.sh. These
+# machines run TWO sentinels each (a dada-collective and a storykeeper share one mini), so that
+# matcher would reach across homes and TERM/KILL a healthy neighbour's tick. launchd already knows
+# which process belongs to this job; ask it, and touch nothing else.
+#
+# The threshold comes from the tick's OWN ceiling. run.sh enforces SENTINEL_TICK_LIMIT (3000s by
+# default), sized against the worst legitimate tick (health 600 + dashboard 180 + evolve 1800 +
+# overhead). Killing at 2x the interval — 30 min — would execute a HEALTHY evolve tick twenty
+# minutes inside its sanctioned window and then report a successful heal: the Principal
+# manufacturing the hang it claims to have cured. So the backstop sits ABOVE that ceiling, and only
+# catches the case run.sh's own reaper failed to.
 hung = []
-rc, ps = sh("ps", "-Ao", "pid,etimes,command")
-for line in ps.splitlines()[1:]:
-    m = re.match(r"\s*(\d+)\s+(\d+)\s+(.*)", line)
-    if not m: continue
-    pid, secs, cmd = int(m.group(1)), int(m.group(2)), m.group(3)
-    if pid == os.getpid() or "principal" in cmd or " - " in cmd[:40]: continue
-    code_hint = os.path.dirname(home.rstrip("/")) 
-    if ("sentinel.py" in cmd or "health.py" in cmd or "run.sh" in cmd) and (home in cmd or code_hint in cmd or True):
-        if secs > max(grace * 60, interval * 2):
-            hung.append((pid, secs, cmd[:80]))
-for pid, secs, cmd in hung:
-    out["findings"].append("hung %d min: %s" % (secs // 60, cmd))
-    rc, _ = sh("kill", "-TERM", str(pid))
-    time.sleep(2)
-    still = subprocess.run(["ps", "-p", str(pid)], capture_output=True, text=True).returncode == 0
-    if still: sh("kill", "-KILL", str(pid))
-    out["actions"].append("killed hung pid %d (%d min)" % (pid, secs // 60))
+job_pid = None
+if label:
+    rc, pr = sh("launchctl", "print", "gui/%d/%s" % (uid, label))
+    m = re.search(r"^\s*pid\s*=\s*(\d+)", pr, re.M)
+    if m: job_pid = int(m.group(1))
+ceiling = 3000
+try:
+    ceiling = int(((plist or {}).get("EnvironmentVariables") or {}).get("SENTINEL_TICK_LIMIT") or 3000)
+except (TypeError, ValueError):
+    ceiling = 3000
+bar = max(grace * 60, interval * 2, ceiling + 300)     # never below the tick's own sanctioned ceiling
+if job_pid:
+    rc, ps = sh("ps", "-o", "etimes=", "-p", str(job_pid))
+    try: secs = int((ps or "0").strip().split()[0])
+    except (ValueError, IndexError): secs = 0
+    if secs > bar:
+        hung.append((job_pid, secs))
+    elif secs:
+        out["findings"].append("running %d min (ceiling %d min) — working, not hung" % (secs // 60, bar // 60))
+for pid, secs in hung:
+    out["findings"].append("hung %d min, past its own %d min ceiling (launchd job %s)" % (secs // 60, bar // 60, label))
+    sh("kill", "-TERM", str(pid))
+    time.sleep(3)
+    gone = subprocess.run(["ps", "-p", str(pid)], capture_output=True, text=True).returncode != 0
+    if not gone:
+        sh("kill", "-KILL", str(pid))
+        time.sleep(1)
+        gone = subprocess.run(["ps", "-p", str(pid)], capture_output=True, text=True).returncode != 0
+    # R2: "ran" is not "worked" — a kill that did not kill must not be reported as one.
+    out["actions"].append("killed hung pid %d (%d min)" % (pid, secs // 60) if gone
+                          else "FAILED to kill pid %d (%d min) — it is still running" % (pid, secs // 60))
 
 # --- 2. absent: state has not moved for 2+ intervals
 def age_minutes(path):

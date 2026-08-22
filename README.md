@@ -559,7 +559,20 @@ pointed at the right thing. The proposal is written to `state/principal-reorient
 diff against `direction.json` and is *never applied* unless the principal's config says
 `"reorient": "apply"` — and even then the owner's `boundaries` are copied through untouched. A
 machine with no sentinel is marked `pending_hatch`: an empty room is a decision to make, not a
-teacher to fail every twenty minutes. Proof: `prove_principal_heal.py`.
+teacher to fail every twenty minutes. The relay is a **two-phase hand-off**: it takes a classroom's queued alerts by renaming the queue
+aside (atomic — the bytes are never in flight), holds them in its own locked outbox, and only then
+tells the classroom to forget them. If anything fails in between, the messages are still in that
+classroom's `outbox.relaying.jsonl` and the next relay recovers them. At-least-once, never
+at-most-once: a duplicate alert is survivable, a destroyed finding is not. It also refuses to empty
+a queue at all when the Principal's own mouth is unconfigured — carrying a message out of a
+classroom and dropping it into a silent outbox is a deletion with extra steps.
+
+Healing identifies a hung tick by **ownership, not by a name in someone's argv**: it asks launchd
+which pid belongs to this job. These machines run two sentinels each, and matching on `sentinel.py`
+would reach across homes and kill a healthy neighbour's tick. The bar for "hung" never falls below
+the tick's own sanctioned ceiling (`SENTINEL_TICK_LIMIT`, 3000s), because killing a legitimate
+evolve tick and reporting a successful heal is the Principal manufacturing the hang it claims to
+have cured. Proof: `prove_principal_heal.py`.
 
 **The hub runs only what it agreed to run.** `hub.py` imports and executes every file in `HOME/hub/`
 on every tick; the only gate was a well-formed `__manifest__` — a check of *shape*, never of identity.
