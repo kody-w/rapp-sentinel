@@ -115,6 +115,9 @@ WORKER_DEFAULTS = {
     "azure_image": {
         "enabled": False,
         "endpoint": "",
+        "auth_mode": "entra",
+        "api_key_env_var": "AZURE_OPENAI_API_KEY",
+        "api_key_file": "",
         "deployment": "gpt-image-2",
         "fallback_deployment": "gpt-image",
         "api_version": "2025-04-01-preview",
@@ -534,7 +537,8 @@ def assert_visual_pipeline_ready(wcfg):
         return "Azure visual generation disabled"
     if "png" not in allowed_kinds(wcfg):
         raise AbortError("azure_image is enabled but png is not allowed")
-    if not shutil.which("az"):
+    auth_mode = str(cfg.get("auth_mode") or "entra").strip().lower()
+    if auth_mode == "entra" and not shutil.which("az"):
         raise AbortError("Azure CLI is not installed")
     if not shutil.which("copilot"):
         raise AbortError("Copilot CLI is not installed for visual review")
@@ -544,12 +548,11 @@ def assert_visual_pipeline_ready(wcfg):
         raise AbortError(
             f"{auth_var} is not available to the multimodal reviewer")
     try:
-        token = azure_art._access_token(
-            str(cfg.get("az_binary") or "az"),
-            int(cfg.get("auth_timeout_s") or 60))
+        _, auth_mode = azure_art.auth_headers(cfg)
     except azure_art.AzureArtError as exc:
         raise AbortError(str(exc)) from exc
-    return f"Azure image auth ready ({len(token)} token chars); visual reviewer ready"
+    auth_name = "API key" if auth_mode == "api_key" else "Entra"
+    return f"Azure image {auth_name} auth ready; visual reviewer ready"
 
 
 def _visual_review_prompt(brief, minimum):

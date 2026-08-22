@@ -8,6 +8,7 @@ maker never receives the Azure token or endpoint.
 import base64
 import os
 import subprocess
+from pathlib import Path
 from urllib.parse import quote, urlencode, urlparse
 
 import requests
@@ -20,6 +21,38 @@ DEFAULT_API_VERSION = "2025-04-01-preview"
 
 class AzureArtError(RuntimeError):
     pass
+
+
+def _api_key(config):
+    env_var = str(
+        config.get("api_key_env_var") or "AZURE_OPENAI_API_KEY").strip()
+    key = os.environ.get(env_var, "").strip() if env_var else ""
+    if key:
+        return key
+
+    configured = str(config.get("api_key_file") or "").strip()
+    if not configured:
+        raise AzureArtError(
+            f"Azure API key is unavailable: set {env_var} or api_key_file")
+    path = Path(configured).expanduser()
+    if not path.is_absolute():
+        raise AzureArtError("azure_image.api_key_file must be an absolute path")
+    try:
+        info = path.stat()
+        if not path.is_file():
+            raise AzureArtError("azure_image.api_key_file is not a regular file")
+        if info.st_mode & 0o077:
+            raise AzureArtError(
+                "azure_image.api_key_file must not be accessible by group or others")
+        key = path.read_text(encoding="utf-8").strip()
+    except AzureArtError:
+        raise
+    except OSError as exc:
+        raise AzureArtError(
+            f"Azure API key file is unreadable: {type(exc).__name__}") from exc
+    if not key:
+        raise AzureArtError("Azure API key file is empty")
+    return key
 
 
 def _access_token(az_binary="az", timeout=60):
@@ -38,6 +71,19 @@ def _access_token(az_binary="az", timeout=60):
     return token
 
 
+def auth_headers(config, token=None):
+    mode = str(config.get("auth_mode") or "entra").strip().lower()
+    if mode == "api_key":
+        return {"api-key": _api_key(config)}, mode
+    if mode != "entra":
+        raise AzureArtError(
+            "azure_image.auth_mode must be 'entra' or 'api_key'")
+    token = token or _access_token(
+        str(config.get("az_binary") or "az"),
+        int(config.get("auth_timeout_s") or 60))
+    return {"Authorization": "{} {}".format("Bearer", token)}, mode
+
+
 def _error_message(response):
     try:
         payload = response.json()
@@ -49,7 +95,7 @@ def _error_message(response):
     return str(error)[:500]
 
 
-def _request(endpoint, deployment, api_version, token, prompt, size, quality,
+def _request(endpoint, deployment, api_version, headers, prompt, size, quality,
              timeout):
     url = (
         f"{endpoint}/openai/deployments/{quote(deployment, safe='')}"
@@ -59,8 +105,8 @@ def _request(endpoint, deployment, api_version, token, prompt, size, quality,
         response = requests.post(
             url,
             headers={
-                "Authorization": "{} {}".format("Bearer", token),
                 "Content-Type": "application/json",
+                **headers,
             },
             json={
                 "prompt": prompt,
@@ -104,9 +150,7 @@ def generate(prompt, config, token=None):
     deployments = list(dict.fromkeys(item for item in deployments if item))
     if not deployments:
         raise AzureArtError("azure_image has no configured deployment")
-    token = token or _access_token(
-        str(config.get("az_binary") or "az"),
-        int(config.get("auth_timeout_s") or 60))
+    headers, _ = auth_headers(config, token=token)
     failures = []
     for deployment in deployments:
         try:
@@ -114,7 +158,7 @@ def generate(prompt, config, token=None):
                 _request(
                     endpoint, deployment,
                     str(config.get("api_version") or DEFAULT_API_VERSION),
-                    token, prompt,
+                    headers, prompt,
                     str(config.get("size") or "1536x1024"),
                     str(config.get("quality") or "high"),
                     int(config.get("request_timeout_s") or 240),
