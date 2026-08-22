@@ -2644,6 +2644,7 @@ def hub_runs_only_what_was_accepted():
                     f"accepted: {names}; `python3 hub.py accept <slug>` after reading them",
                     critical=False)
     matched, missing, malformed = state["matched"], state["missing"], state["malformed"]
+    off = [d for d in state.get("disabled", []) if d.get("changed")]
     if malformed:
         # Never accepted and will not load. run_all reports the load failure; this check reports
         # that something is sitting in the execute-every-tick directory that nobody vouched for.
@@ -2651,9 +2652,12 @@ def hub_runs_only_what_was_accepted():
         return fail("w_hub_integrity",
                     f"{len(malformed)} unaccepted file(s) in the hub directory will not load: "
                     f"{names}; remove them or fix and accept them", critical=False)
-    if not matched and not missing:
+    if not matched and not missing and not state.get("disabled"):
         return ok("w_hub_integrity", "no hub sentinels installed")
     detail = f"{len(matched)} hub sentinel(s) match the bytes accepted"
+    if state.get("disabled"):
+        detail += (f"; {len(state['disabled'])} disabled and not executing"
+                   + (f" ({', '.join(d['slug'] for d in off)} changed since acceptance)" if off else ""))
     if missing:
         detail += (f"; {len(missing)} accepted but no longer installed "
                    f"({', '.join(m['slug'] for m in missing)}) - `python3 hub.py forget <slug>`")

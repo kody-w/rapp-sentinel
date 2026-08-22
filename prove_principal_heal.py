@@ -12,6 +12,9 @@ useful rather than decorative, each proved against a real temporary sentinel hom
   6. lost points name the dimension, never the generic all-good note
 """
 import base64, json, os, subprocess, sys, tempfile, time
+from datetime import datetime, timezone
+
+def utcnow_iso(): return datetime.now(timezone.utc).isoformat()
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -127,6 +130,54 @@ with tempfile.TemporaryDirectory() as td:
     took4, _ = run(P.RELAY_TAKE, home)
     check("14. a committed classroom offers nothing further", took4["rows"] == [], took4)
 
+# ── the GATE: relay() must actually go back for what it took ────────────────
+#
+# The previous harness drove RELAY_TAKE directly and never asked whether relay() would ever issue
+# that second take. It would not: the gate counted only outbox.jsonl, so a taken-but-uncommitted
+# outbox.relaying.jsonl was invisible and stranded forever while the classroom graded clean.
+OLD = "2020-01-01T00:00:00Z"
+check("24. a stranded relaying file is recovered even with an empty queue",
+      P.should_relay({"outbox_queued": 0, "outbox_relaying": 2}, 30)[0] is True,
+      P.should_relay({"outbox_queued": 0, "outbox_relaying": 2}, 30))
+check("25. an empty classroom is left alone",
+      P.should_relay({"outbox_queued": 0, "outbox_relaying": 0}, 30)[0] is False)
+check("26. a blocked mouth is carried immediately",
+      P.should_relay({"outbox_queued": 1, "outbox_last_drain": {"error": "osascript timed out"},
+                      "outbox_tail": [json.dumps({"at": OLD})]}, 30)[0] is True)
+check("27. a recent message on a working mouth is NOT taken",
+      P.should_relay({"outbox_queued": 1, "outbox_last_drain": {"why": "empty"},
+                      "outbox_tail": [json.dumps({"at": utcnow_iso()})]}, 30)[0] is False,
+      P.should_relay({"outbox_queued": 1, "outbox_last_drain": {"why": "empty"},
+                      "outbox_tail": [json.dumps({"at": utcnow_iso()})]}, 30))
+check("28. a message held past the threshold is taken even if the mouth works",
+      P.should_relay({"outbox_queued": 1, "outbox_last_drain": {"why": "empty"},
+                      "outbox_tail": [json.dumps({"at": OLD})]}, 30)[0] is True)
+
+# ── notify must report, not swallow ─────────────────────────────────────────
+check("29. notify returns False when there is no mouth configured", P.notify({}, "x") is False)
+
+# the honesty rubric must count what a relay took but never delivered — otherwise a classroom
+# holding findings nobody has read scores full marks for delivery.
+room_ = {"slug": "z", "name": "Z", "interval_s": 900}
+snap_ = {"last_run": {"at": utcnow_iso()}, "last_verdict": {"status": "ok", "failed": [], "critical": []},
+         "roll_call": {}, "config": {}, "outbox_queued": 0, "outbox_relaying": 3}
+check("29b. undelivered-but-taken rows count against honesty",
+      P.evaluate(room_, snap_)["evidence"]["outbox_queued"] == 3,
+      P.evaluate(room_, snap_)["evidence"]["outbox_queued"])
+
+# ── elapsed time must be readable on THIS machine ───────────────────────────
+me = P.__dict__  # etime_seconds lives inside the HEAL program; prove the parser the same way heal runs it
+import subprocess as _sp
+_probe = P.HEAL.split("if job_pid:")[0] + "print(json.dumps({'secs': etime_seconds(%d)}))" % os.getpid()
+_r = _sp.run([sys.executable, "-c", _probe.replace("sys.argv[1]", repr(str(Path(td if False else "/tmp"))))],
+             capture_output=True, text=True, input="")
+try:
+    _secs = json.loads([l for l in _r.stdout.strip().splitlines() if l.strip()][-1])["secs"]
+except Exception:
+    _secs = None
+check("30. elapsed seconds are READABLE on this platform (macOS ps has no `etimes`)",
+      isinstance(_secs, int), (_r.stdout[-200:], _r.stderr[-200:]))
+
 # ── heal must not kill a healthy tick, nor a neighbour's ─────────────────────
 src = Path(P.__file__).read_text()
 check("15. heal no longer matches processes by argv substring", "or True" not in src.split("WIN_HEAL")[0], "the `or True` scope hole is back")
@@ -134,6 +185,10 @@ check("    it asks launchd which pid is this job's", 'launchctl", "print"' in sr
 check("16. the hung bar never falls below the tick's own ceiling",
       "ceiling + 300" in src and "SENTINEL_TICK_LIMIT" in src, "bar must respect run.sh's LIMIT")
 check("17. a kill is verified, not assumed", "FAILED to kill" in src)
+check("31. heal kills the whole process tree, not just the launchd wrapper", "process_tree" in src)
+check("32. a surviving process cancels the kickstart", "leaving it alone" in src and "hung = []" in src)
+check("33. relay holds a row only when it is actually on disk", "if notify(cfg," in src)
+check("34. a partial hold commits nothing", "committing nothing" in src)
 
 # ── relay must not empty a classroom it cannot speak for ─────────────────────
 check("18. relay refuses to move messages when this principal has no mouth",

@@ -70,7 +70,11 @@ out = {
   "escalations": rj(st / "escalations.json"),
   "outbox_last_drain": rj(st / "outbox-last-drain.json"),
   "outbox_queued": len([l for l in tail(st / "outbox.jsonl", 10000) if l.strip()]),
-  "outbox_tail": [l for l in tail(st / "outbox.jsonl", 10000) if l.strip()][:5],
+  # Rows a previous relay took but never committed. Without this they are invisible: the queue reads
+  # empty, the classroom grades clean, and nothing ever goes back for them.
+  "outbox_relaying": len([l for l in tail(st / "outbox.relaying.jsonl", 10000) if l.strip()]),
+  "outbox_tail": ([l for l in tail(st / "outbox.relaying.jsonl", 10000) if l.strip()]
+                  + [l for l in tail(st / "outbox.jsonl", 10000) if l.strip()])[:5],
   "direction": rj(home / "direction.json"),
   "config": {k: v for k, v in (rj(home / "config.json") or {}).items()
              if k in ("instance_name","instance_slug","level","notify","daily_escalation_budget","daily_evolve_budget",
@@ -226,7 +230,11 @@ def evaluate(room, snap, previous=None, now=None):
     if status == "ok" and failed:
         hon = 0; notes.append("claims ok while %d check(s) fail — that is the lie this whole thing exists to catch" % len(failed))
     drain = (snap or {}).get("outbox_last_drain") or {}
-    queued = int((snap or {}).get("outbox_queued") or 0)
+    # Undelivered is undelivered: rows a relay TOOK but never committed sit in outbox.relaying.jsonl
+    # and are not in the queue count. Grading on the queue alone let a classroom holding findings
+    # nobody has read score full honesty marks.
+    queued = (int((snap or {}).get("outbox_queued") or 0)
+              + int((snap or {}).get("outbox_relaying") or 0))
     if queued and drain.get("kept"):
         d_at = parse_ts(drain.get("at"))
         if d_at and (now - d_at).total_seconds() > 6 * 3600 or (drain.get("sent") == 0 and queued >= 3):
@@ -504,13 +512,21 @@ def record(obs, cfg):
 
 
 def notify(cfg, text):
+    """Queue one message. Returns True only if it is actually on disk.
+
+    This used to swallow every failure and return None, which the relay then counted as a delivery:
+    a full disk or a read-only state dir meant `held` incremented, the classroom was told to forget
+    the message, and both copies were gone. A hand-off that cannot say whether it caught the thing
+    is not a hand-off."""
     if not cfg.get("notify") or not cfg.get("notify_handle"):
-        return
+        return False
     try:
         import outbox
         outbox.enqueue(text, cfg["notify_handle"])
+        return True
     except Exception as e:
         print("[principal] notify failed: %s: %s" % (type(e).__name__, e))
+        return False
 
 
 def tick(only=None):
@@ -673,6 +689,43 @@ print(json.dumps({"committed": n}))
 """
 
 
+
+def should_relay(snap, thresh_minutes):
+    """Does this classroom have something the Principal must carry out? Returns (bool, why).
+
+    Pulled out of relay() because the first version's proof exercised the REMOTE program directly and
+    never asked whether relay() would ever issue it — a green tick over a path that could not run.
+    Two ways in:
+      blocked  — the classroom's own drain is failing, so it cannot speak for itself
+      stranded — a finding has sat longer than a classroom should ever hold one
+    and one that must never be missed: rows a previous relay TOOK but never committed. Those live in
+    outbox.relaying.jsonl, are invisible to the queue count, and would otherwise sit there forever
+    while the classroom graded clean."""
+    # Undelivered is undelivered: rows a relay TOOK but never committed sit in outbox.relaying.jsonl
+    # and are not in the queue count. Grading on the queue alone let a classroom holding findings
+    # nobody has read score full honesty marks.
+    queued = (int((snap or {}).get("outbox_queued") or 0)
+              + int((snap or {}).get("outbox_relaying") or 0))
+    relaying = int((snap or {}).get("outbox_relaying") or 0)
+    if relaying:
+        return True, "recovering %d message(s) a previous relay took but never delivered" % relaying
+    if not queued:
+        return False, "nothing queued"
+    drain = (snap or {}).get("outbox_last_drain") or {}
+    blocked = bool(drain.get("error")) or str(drain.get("why") or "") not in ("", "empty")
+    age = None
+    try:
+        oldest = min(parse_ts(json.loads(l)["at"]) for l in ((snap or {}).get("outbox_tail") or []) if l.strip())
+        age = (datetime.now(timezone.utc) - oldest).total_seconds() / 60.0
+    except Exception:
+        pass
+    if blocked:
+        return True, "its own mouth is blocked"
+    if age is not None and age >= thresh_minutes:
+        return True, "it has held this for %d min" % age
+    return False, "queued but recent, and its own mouth still works"
+
+
 def relay(only=None, min_age_minutes=None):
     """Be the mouth for a classroom that cannot speak.
 
@@ -696,21 +749,8 @@ def relay(only=None, min_age_minutes=None):
         if room.get("transport") != "ssh" or room.get("relay") is False: continue
         snap, err = gather(room)
         if not snap: continue
-        queued = int(snap.get("outbox_queued") or 0)
-        drain = snap.get("outbox_last_drain") or {}
-        # Is this classroom's own mouth actually blocked? The old expression ended in `or queued > 0`,
-        # which is always true here — so it never probed, and every relayed message went out under the
-        # claim "its own mouth is blocked" even when the machine was merely asleep between drains.
-        blocked = bool(drain.get("error")) or str(drain.get("why") or "") not in ("", "empty")
-        age = None
-        try:
-            oldest = min(parse_ts(json.loads(l)["at"]) for l in (snap.get("outbox_tail") or []) if l.strip())
-            age = (datetime.now(timezone.utc) - oldest).total_seconds() / 60.0
-        except Exception:
-            pass
-        stranded = age is not None and age >= thresh      # older than a classroom should ever hold a finding
-        if not queued: continue
-        if not (blocked or stranded): continue
+        go, why = should_relay(snap, thresh)
+        if not go: continue
         interp = room.get("python") or "python3"
 
         def run_phase(program, timeout=60):
@@ -737,20 +777,24 @@ def relay(only=None, min_age_minutes=None):
         # Durable hand-off: every row lands in the Principal's own locked outbox BEFORE the
         # classroom is told to forget it. If this raises, the rows are still in the classroom's
         # outbox.relaying.jsonl and the next relay takes them again.
-        why = "its own mouth is blocked" if blocked else "it has held this for %d min" % (age or 0)
         held = 0
         try:
             for raw in rows:
                 try: m = json.loads(raw)
                 except ValueError: continue
-                notify(cfg, "📨 relayed from %s (%s):\n%s" % (room["name"], why, m.get("text", "")[:900]))
-                held += 1
+                # held counts what is ON DISK here, never what we attempted — the classroom is about
+                # to be told to forget these.
+                if notify(cfg, "📨 relayed from %s (%s):\n%s" % (room["name"], why, m.get("text", "")[:900])):
+                    held += 1
         except Exception as e:
             print("[principal] relay %s: could not hold the messages (%s) — left with the classroom"
                   % (room["slug"], e)); continue
-        if not held:
-            print("[principal] relay %s: nothing readable in %d row(s) — left with the classroom"
-                  % (room["slug"], len(rows))); continue
+        if held < len([r for r in rows if r.strip()]):
+            # Some row did not land in our own outbox. Commit nothing: the classroom keeps every
+            # copy in outbox.relaying.jsonl, and the next relay (which now SEES that file) retries.
+            print("[principal] relay %s: only %d of %d message(s) could be held — committing nothing, "
+                  "the classroom keeps them" % (room["slug"], held, len(rows)))
+            continue
         try:
             done = run_phase(RELAY_COMMIT)
             print("[principal] relayed %d message(s) for %s (%s)" % (held, room["slug"], why))
@@ -921,26 +965,67 @@ try:
 except (TypeError, ValueError):
     ceiling = 3000
 bar = max(grace * 60, interval * 2, ceiling + 300)     # never below the tick's own sanctioned ceiling
+
+# macOS ps has NO `etimes` keyword -- only `etime`, formatted [[dd-]hh:]mm:ss. The first two versions
+# asked for etimes, got "keyword not found" on every Mac in the neighbourhood, and so computed 0
+# seconds for everything: nothing was ever hung. A detector that silently cannot run is worse than no
+# detector, because the heal reported success while leg 1 had never once executed.
+def etime_seconds(pid):
+    rc, out = sh("ps", "-o", "etime=", "-p", str(pid))
+    tok = (out or "").strip().split("\n")[0].strip()
+    if rc != 0 or not tok:
+        return None                                   # unknown is not zero (blind is not clean)
+    days = 0
+    if "-" in tok:
+        d, _, tok = tok.partition("-")
+        try: days = int(d)
+        except ValueError: return None
+    try: nums = [int(p) for p in tok.split(":")]
+    except ValueError: return None
+    while len(nums) < 3: nums.insert(0, 0)
+    return days * 86400 + nums[-3] * 3600 + nums[-2] * 60 + nums[-1]
+
+# launchd's job pid is run.sh (bash); it spawns `python3 sentinel.py` as a CHILD plus a reaper
+# subshell. TERMing only the wrapper orphans the python -- the process actually spending the model
+# budget -- and the kickstart then starts a SECOND tick beside the orphan.
+def process_tree(pid):
+    rc, out = sh("ps", "-Ao", "pid=,ppid=")
+    kids = {}
+    for line in (out or "").splitlines():
+        try: p, pp = (int(x) for x in line.split()[:2])
+        except (ValueError, IndexError): continue
+        kids.setdefault(pp, []).append(p)
+    order, stack = [], [pid]
+    while stack:
+        cur = stack.pop(); order.append(cur); stack.extend(kids.get(cur, []))
+    return list(reversed(order))                      # children before their parent
+
 if job_pid:
-    rc, ps = sh("ps", "-o", "etimes=", "-p", str(job_pid))
-    try: secs = int((ps or "0").strip().split()[0])
-    except (ValueError, IndexError): secs = 0
-    if secs > bar:
+    secs = etime_seconds(job_pid)
+    if secs is None:
+        out["findings"].append("cannot read the age of pid %d - not judging it hung" % job_pid)
+    elif secs > bar:
         hung.append((job_pid, secs))
     elif secs:
-        out["findings"].append("running %d min (ceiling %d min) — working, not hung" % (secs // 60, bar // 60))
-for pid, secs in hung:
-    out["findings"].append("hung %d min, past its own %d min ceiling (launchd job %s)" % (secs // 60, bar // 60, label))
-    sh("kill", "-TERM", str(pid))
+        out["findings"].append("running %d min (ceiling %d min) - working, not hung" % (secs // 60, bar // 60))
+for pid, secs in list(hung):
+    tree = process_tree(pid)
+    out["findings"].append("hung %d min, past its own %d min ceiling (launchd job %s, %d process(es))"
+                           % (secs // 60, bar // 60, label, len(tree)))
+    for p in tree: sh("kill", "-TERM", str(p))
     time.sleep(3)
-    gone = subprocess.run(["ps", "-p", str(pid)], capture_output=True, text=True).returncode != 0
-    if not gone:
-        sh("kill", "-KILL", str(pid))
-        time.sleep(1)
-        gone = subprocess.run(["ps", "-p", str(pid)], capture_output=True, text=True).returncode != 0
-    # R2: "ran" is not "worked" — a kill that did not kill must not be reported as one.
-    out["actions"].append("killed hung pid %d (%d min)" % (pid, secs // 60) if gone
-                          else "FAILED to kill pid %d (%d min) — it is still running" % (pid, secs // 60))
+    alive = [p for p in tree if subprocess.run(["ps", "-p", str(p)], capture_output=True, text=True).returncode == 0]
+    for p in alive: sh("kill", "-KILL", str(p))
+    if alive: time.sleep(1)
+    still = [p for p in tree if subprocess.run(["ps", "-p", str(p)], capture_output=True, text=True).returncode == 0]
+    if still:
+        # A kill that did not kill is not an action -- and we must not kickstart onto a survivor.
+        out["actions"].append("FAILED to kill %d of %d process(es) for pid %d - leaving it alone"
+                              % (len(still), len(tree), pid))
+        hung = []
+    else:
+        out["actions"].append("killed hung pid %d and %d child process(es) (%d min)"
+                              % (pid, len(tree) - 1, secs // 60))
 
 # --- 2. absent: state has not moved for 2+ intervals
 def age_minutes(path):
