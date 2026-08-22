@@ -321,7 +321,7 @@ def forget(slug):
     return True, "forgot %s" % slug
 
 
-def integrity(hub_dir=None):
+def integrity(hub_dir=None, cfg=None):
     """Compare what is installed against what was accepted. Pure: reads, never writes.
 
     Returns {"unaccepted": [...], "changed": [...], "missing": [...], "matched": [...], "malformed": [...]}
@@ -338,7 +338,10 @@ def integrity(hub_dir=None):
     """
     doc = read_ledger()
     accepted = doc["accepted"]
-    out = {"unaccepted": [], "changed": [], "missing": [], "matched": [], "malformed": []}
+    # A disabled sentinel is NOT executing (run_all skips it), so it must never be described as if it
+    # were. Its bytes changing is still worth saying — just not with the word "executing".
+    disabled = set((_config() if cfg is None else cfg).get("disabled") or [])
+    out = {"unaccepted": [], "changed": [], "missing": [], "matched": [], "malformed": [], "disabled": []}
     seen = set()
     for path, m, err in installed(hub_dir):
         seen.add(path.stem)
@@ -349,6 +352,12 @@ def integrity(hub_dir=None):
             continue
         rec = accepted.get(path.stem)
         name = (m or {}).get("name") or (rec or {}).get("name") or path.stem
+        if path.stem in disabled:
+            row = {"slug": path.stem, "name": name}
+            if rec and rec.get("sha256") != digest:
+                row["changed"] = True
+            out["disabled"].append(row)
+            continue
         if rec:                                     # identity first — validity is a separate question
             if rec.get("sha256") != digest:
                 row = {"slug": path.stem, "name": name,

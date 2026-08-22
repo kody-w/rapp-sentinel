@@ -586,6 +586,12 @@ python3 hub.py accept <slug>      # record the bytes now on disk, after reading 
 python3 hub.py forget <slug>      # drop the record of an uninstalled sentinel
 ```
 
+**What this is and is not:** the ledger *reports*, it does not *gate* — `run_all()` still executes what is
+in `hub/`, and the check tells you, loudly, that it did. Anyone who can write `hub/*.py` can usually also
+write `state/hub-integrity.json`, so this is not a defence against a determined local attacker. What it does
+defend is the far likelier failure: a silent update, an accidental edit, a sync tool, or a publisher whose
+file changed under a name you already trusted — a change that used to produce no signal at all.
+
 Changed bytes under an accepted name is **critical** — that is the case that must never pass quietly.
 An installed-but-never-accepted file is a **warn**, because that is the ordinary state between
 installing and accepting and the loop should say so rather than break. Acceptance is never automatic:
