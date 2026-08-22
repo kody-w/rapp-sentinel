@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -70,6 +71,9 @@ def git_bare(bare, *args):
 
 SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
        '<circle cx="5" cy="5" r="4"/></svg>')
+PNG = (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR"
+       + struct.pack(">II", 1536, 1024) + b"\x08\x06\x00\x00\x00"
+       + b"\x00\x00\x00\x00")
 
 
 def dada_cycle(slug, cycle=1, previous=None, rounds=1,
@@ -150,6 +154,7 @@ class ScratchCase(unittest.TestCase):
             "ALERT_PATH": self.state / "evolve-worker-alerts.json",
             "STATUS_PATH": self.state / "evolve-worker-status.json",
             "TRANSACTION_PATH": self.state / "evolve-worker-transaction.json",
+            "ART_ARCHIVE": self.state / "art",
         }
         for name, value in patches.items():
             p = mock.patch.object(EW, name, value)
@@ -503,12 +508,22 @@ class GateTests(ScratchCase):
             self.gate()
         self.assertIn("piece.md", str(cm.exception))
 
+    def test_instance_can_require_visual_svg_output(self):
+        self.wcfg["allowed_kinds"] = ["svg"]
+        self.submit(meta=meta_for("new-piece", cycle=2,
+                                  previous="already-here", kind="txt"),
+                    piece="plain text", piece_name="piece.txt")
+        with self.assertRaises(EW.GateError) as cm:
+            self.gate()
+        self.assertIn("requires svg", str(cm.exception))
+
     def test_unknown_license_is_rejected(self):
         self.submit(meta=meta_for("new-piece", cycle=2, previous="already-here",
                                   license="MIT"))
         with self.assertRaises(EW.GateError) as cm:
             self.gate()
         self.assertIn("license", str(cm.exception))
+
 
     def test_wrong_schema_is_rejected(self):
         self.submit(meta=meta_for("new-piece", cycle=2, previous="already-here",
@@ -725,6 +740,121 @@ class DadaCycleTests(unittest.TestCase):
     def test_a_missing_cycle_block_is_a_rejection(self):
         with self.assertRaises(EW.GateError):
             EW.validate_dada_cycle(None, "s", 1, None)
+
+
+class AzureImagePipelineTests(ScratchCase):
+    def setUp(self):
+        super().setUp()
+        self.staging = self.home / "staging"
+        self.out = EW.prepare_staging(self.staging)
+        self.baseline = EW.staging_manifest(self.staging)
+        self.wcfg = EW.worker_config({"evolve_worker": {
+            "allowed_kinds": ["png"],
+            "max_piece_bytes": 10 * 1024 * 1024,
+            "azure_image": {
+                "enabled": True,
+                "endpoint": "https://dada.example.openai.azure.com",
+                "deployment": "gpt-image-2",
+                "fallback_deployment": "gpt-image-2",
+                "max_attempts": 2,
+                "minimum_review_score": 8,
+            },
+        }})
+        self.prompt = (
+            "A museum-grade surreal landscape with a single impossible "
+            "architectural focal point, dramatic light, no labels.")
+        meta = meta_for("visual-piece", cycle=2, previous="already-here",
+                        kind="png", _image_prompt=self.prompt)
+        (self.out / "meta.json").write_text(
+            json.dumps(meta), encoding="utf-8")
+        (self.out / "piece.prompt").write_text(
+            self.prompt, encoding="utf-8")
+        (self.staging / "state-out.json").write_text(
+            '{"cycle":2,"last_slug":"visual-piece"}', encoding="utf-8")
+
+    @staticmethod
+    def good_review(*_):
+        return {
+            "schema": "rapp-image-review/1.0",
+            "score": 9,
+            "publish": True,
+            "failures": [],
+            "strengths": ["clear focal hierarchy", "finished composition"],
+        }
+
+    def test_controller_generates_reviews_archives_and_gates_png(self):
+        EW.verify_staging_tree(self.staging, self.baseline, self.wcfg)
+        receipt = EW.materialize_azure_image(
+            self.staging, self.wcfg,
+            generator=lambda prompt, cfg: (PNG, "gpt-image-2"),
+            reviewer=self.good_review)
+        self.assertEqual(9, receipt["score"])
+        self.assertFalse((self.out / "piece.prompt").exists())
+        self.assertEqual(PNG, (self.out / "piece.png").read_bytes())
+        self.assertEqual(PNG, (EW.ART_ARCHIVE / "visual-piece.png").read_bytes())
+        meta = json.loads((self.out / "meta.json").read_text())
+        self.assertEqual(9, meta["_image_generation"]["review"]["score"])
+        submission = EW.gate_directory(
+            self.staging / "out", self.wcfg, 2, "already-here", None,
+            {"already-here"})
+        self.assertEqual("png", submission["kind"])
+
+    def test_a_rejected_image_is_regenerated_with_visual_feedback(self):
+        prompts = []
+        reviews = iter([
+            {
+                "schema": "rapp-image-review/1.0", "score": 4,
+                "publish": False, "failures": ["muddy focal point"],
+                "strengths": ["good palette"],
+            },
+            self.good_review(),
+        ])
+
+        def generate(prompt, cfg):
+            prompts.append(prompt)
+            return PNG, "gpt-image-2"
+
+        receipt = EW.materialize_azure_image(
+            self.staging, self.wcfg, generator=generate,
+            reviewer=lambda *_: next(reviews))
+        self.assertEqual(2, receipt["attempts"])
+        self.assertIn("muddy focal point", prompts[1])
+
+    def test_two_bad_images_fail_the_cycle_without_a_publishable_piece(self):
+        bad = {
+            "schema": "rapp-image-review/1.0", "score": 3,
+            "publish": False, "failures": ["obvious malformed anatomy"],
+            "strengths": [],
+        }
+        with self.assertRaises(EW.GateError) as cm:
+            EW.materialize_azure_image(
+                self.staging, self.wcfg,
+                generator=lambda prompt, cfg: (PNG, "gpt-image-2"),
+                reviewer=lambda *_: bad)
+        self.assertIn("failed visual review", str(cm.exception))
+        self.assertFalse((self.out / "piece.png").exists())
+
+    def test_final_links_open_in_safari_only_when_enabled(self):
+        wcfg = EW.worker_config({"evolve_worker": {
+            "azure_image": {
+                "enabled": True,
+                "endpoint": "https://dada.example.openai.azure.com",
+                "open_in_browser": True,
+            },
+        }})
+        receipts = {
+            "collective_url": "https://example.test/collective",
+            "vision_url": "https://example.test/vision",
+        }
+        done = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(EW.sys, "platform", "darwin"), \
+             mock.patch.object(EW.subprocess, "run",
+                               return_value=done) as run:
+            self.assertTrue(EW.open_final_art(wcfg, receipts))
+        self.assertEqual(
+            ["/usr/bin/open", "-a", "Safari",
+             receipts["collective_url"], receipts["vision_url"]],
+            run.call_args.args[0])
 
 
 # ── end to end, against temp repos ──────────────────────────────────────────
@@ -1328,7 +1458,7 @@ class ArtNotificationTests(WorkerEnv):
     """The message a merge earns — and the silence everything else earns."""
 
     VIEW = ("https://kody-w.github.io/public-art-collective/"
-            "submissions/new-piece/piece.svg")
+            "view.html#/new-piece")
     SOURCE = ("https://github.com/kody-w/public-art-collective/blob/main/"
               "submissions/new-piece/piece.svg")
 
@@ -1399,7 +1529,7 @@ class ArtNotificationTests(WorkerEnv):
             EW.run_once(cfg=cfg, health=lambda phase: healthy())
         text = self.texts()[0]
         self.assertIn("https://someone-else.github.io/other-commons/"
-                      "submissions/new-piece/piece.svg", text)
+                      "view.html#/new-piece", text)
 
     def test_no_message_for_a_timeout(self):
         with mock.patch.object(EW, "run_model",
@@ -1453,16 +1583,15 @@ class ArtUrlTests(unittest.TestCase):
                 view, source = self.urls(f"submissions/a-slug/piece{ext}")
                 self.assertEqual(
                     f"https://kody-w.github.io/public-art-collective/"
-                    f"submissions/a-slug/piece{ext}", view)
+                    f"view.html#/a-slug", view)
                 self.assertEqual(
                     f"https://github.com/kody-w/public-art-collective/blob/main/"
                     f"submissions/a-slug/piece{ext}", source)
 
     def test_path_separators_survive_and_segments_are_encoded(self):
         view, source = self.urls("submissions/a b/piece.svg")
-        self.assertIn("/submissions/a%20b/piece.svg", view)
+        self.assertIn("/view.html#/a%20b", view)
         self.assertIn("/submissions/a%20b/piece.svg", source)
-        self.assertEqual(4, view.count("/") - 2, "slashes are not encoded away")
 
     def test_a_non_default_branch_lands_in_the_source_url(self):
         _, source = self.urls("submissions/a/piece.md", base="trunk")
@@ -1481,7 +1610,7 @@ class ArtUrlTests(unittest.TestCase):
             with self.subTest(commons=commons):
                 view, _ = self.urls("submissions/a/piece.svg", commons=commons)
                 self.assertEqual("https://kody-w.github.io/public-art-collective/"
-                                 "submissions/a/piece.svg", view)
+                                 "view.html#/a", view)
 
     def test_a_local_path_is_not_a_public_url(self):
         view, source = EW.art_urls(
@@ -1495,7 +1624,7 @@ class ArtUrlTests(unittest.TestCase):
                                    "base_branch": "main"},
                               {"piece_path": "submissions/a/piece.txt"})
         self.assertEqual("https://kody-w.github.io/public-art-collective/"
-                         "submissions/a/piece.txt", view)
+                         "view.html#/a", view)
 
     def test_a_message_without_a_derivable_url_says_so(self):
         text = EW.art_notification(
@@ -1541,7 +1670,8 @@ class VisionAdapterTests(ScratchCase):
             ["channels.json", "dada/channel.json",
              "dada/media/new-piece.svg"],
             changed)
-        self.assertEqual("media/new-piece.svg",
+        self.assertEqual(
+            "https://kody-w.github.io/public-art-collective/view.html#/new-piece",
                          entry["live"]["scenes"][1]["app"])
         self.assertEqual("media/new-piece.svg", entry["thumb"])
         self.assertEqual([], entry["sources"])
@@ -1574,7 +1704,9 @@ class VisionAdapterTests(ScratchCase):
         self.assertEqual(
             "https://kody-w.github.io/rapp-vision/dada/media/new-piece.svg",
             urls["media_url"])
-        self.assertEqual(urls["media_url"], urls["scene_url"])
+        self.assertEqual(
+            "https://kody-w.github.io/public-art-collective/view.html#/new-piece",
+            urls["scene_url"])
 
     def test_unsafe_channel_paths_are_refused(self):
         bad = dict(self.wcfg, rapp_vision={
@@ -1812,7 +1944,7 @@ class ArtDeliveryTests(WorkerEnv):
         self.assertIn("New Piece", message["text"])
         self.assertIn("Public Art Collective: "
                       "https://kody-w.github.io/public-art-collective/"
-                      "submissions/new-piece/piece.svg", message["text"])
+                      "view.html#/new-piece", message["text"])
         self.assertNotIn("Static HTML report:", message["text"])
         self.snapshot.assert_not_called()
         self.assertEqual(1, self.drain.call_count,

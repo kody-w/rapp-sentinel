@@ -46,6 +46,7 @@ import shlex
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import threading
@@ -61,6 +62,7 @@ from urllib.parse import quote, urlsplit
 import neighborhood as NB
 import sentinel
 import subsentinels as SS
+import azure_art
 from paths import HOME
 
 STATE = HOME / "state"
@@ -73,6 +75,7 @@ TURN_PATH = STATE / "evolve-worker-turn.json"
 ALERT_PATH = STATE / "evolve-worker-alerts.json"
 STATUS_PATH = STATE / "evolve-worker-status.json"
 TRANSACTION_PATH = STATE / "evolve-worker-transaction.json"
+ART_ARCHIVE = STATE / "art"
 
 # Every model process this pass started, so a timeout, a SIGTERM or a crash
 # can take the whole tree down instead of orphaning a 30-minute model run and
@@ -101,7 +104,23 @@ WORKER_DEFAULTS = {
     "max_piece_bytes": 51200,
     "max_meta_bytes": 262144,
     "max_state_bytes": 262144,
+    "allowed_kinds": ["svg", "md", "txt", "json", "png"],
     "notify_declines": False,
+    "azure_image": {
+        "enabled": False,
+        "endpoint": "",
+        "deployment": "gpt-image-2",
+        "fallback_deployment": "gpt-image",
+        "api_version": "2025-04-01-preview",
+        "size": "1536x1024",
+        "quality": "high",
+        "max_attempts": 3,
+        "minimum_review_score": 8,
+        "review_model": "gpt-5.4",
+        "review_timeout_s": 300,
+        "review_transcript_bytes": 16 * 1024 * 1024,
+        "open_in_browser": False,
+    },
     # Optional second deployment. The canonical submission still lands in
     # repo; this adapter mirrors the verified bytes into a RAPP Vision channel
     # and finalization waits until both Pages surfaces answer.
@@ -116,6 +135,7 @@ WORKER_DEFAULTS = {
         "registry_path": "channels.json",
         "branch_prefix": "art/dada-vision",
         "player_url": "https://kody-w.github.io/rapp-vision",
+        "collective_viewer_url": "https://kody-w.github.io/public-art-collective/view.html",
         "duration": 60,
         "deployment_retry_limit": 12,
     },
@@ -132,7 +152,9 @@ SUBMISSION_SCHEMA = "rapp-art-submission/1.0"
 REQUIRED_META_KEYS = ("schema", "title", "slug", "contributor", "kind",
                       "submitted_at", "remix_of", "license")
 ALLOWED_LICENSES = ("CC0-1.0",)
-KIND_EXTENSIONS = {"svg": ".svg", "md": ".md", "txt": ".txt", "json": ".json"}
+KIND_EXTENSIONS = {
+    "svg": ".svg", "md": ".md", "txt": ".txt", "json": ".json", "png": ".png",
+}
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 SLUG_MAX = 48
 
@@ -276,6 +298,229 @@ def worker_config(cfg):
     return merged
 
 
+def allowed_kinds(wcfg):
+    raw = wcfg.get("allowed_kinds")
+    values = list(KIND_EXTENSIONS) if raw is None else list(raw)
+    if not values or any(kind not in KIND_EXTENSIONS for kind in values):
+        raise GateError("allowed_kinds must be a non-empty subset of "
+                        + ", ".join(sorted(KIND_EXTENSIONS)))
+    return tuple(dict.fromkeys(values))
+
+
+def azure_image_config(wcfg):
+    defaults = dict(WORKER_DEFAULTS["azure_image"])
+    block = wcfg.get("azure_image")
+    if isinstance(block, dict):
+        defaults.update(block)
+    defaults["enabled"] = bool(defaults.get("enabled"))
+    if not defaults["enabled"]:
+        return defaults
+    endpoint = str(defaults.get("endpoint") or "").strip().rstrip("/")
+    if not endpoint.startswith("https://"):
+        raise GateError("azure_image.endpoint must be an HTTPS endpoint")
+    defaults["endpoint"] = endpoint
+    defaults["max_attempts"] = max(
+        1, min(5, int(defaults.get("max_attempts") or 2)))
+    defaults["minimum_review_score"] = max(
+        1, min(10, int(defaults.get("minimum_review_score") or 8)))
+    defaults["review_timeout_s"] = max(
+        30, min(900, int(defaults.get("review_timeout_s") or 300)))
+    return defaults
+
+
+def assert_visual_pipeline_ready(wcfg):
+    cfg = azure_image_config(wcfg)
+    if not cfg["enabled"]:
+        return "Azure visual generation disabled"
+    if "png" not in allowed_kinds(wcfg):
+        raise AbortError("azure_image is enabled but png is not allowed")
+    if not shutil.which("az"):
+        raise AbortError("Azure CLI is not installed")
+    if not shutil.which("copilot"):
+        raise AbortError("Copilot CLI is not installed for visual review")
+    auth_var = str(SS.fanout_config(wcfg).get(
+        "auth_env_var") or "COPILOT_GITHUB_TOKEN")
+    if not os.environ.get(auth_var):
+        raise AbortError(
+            f"{auth_var} is not available to the multimodal reviewer")
+    try:
+        token = azure_art._access_token(
+            str(cfg.get("az_binary") or "az"),
+            int(cfg.get("auth_timeout_s") or 60))
+    except azure_art.AzureArtError as exc:
+        raise AbortError(str(exc)) from exc
+    return f"Azure image auth ready ({len(token)} token chars); visual reviewer ready"
+
+
+def _visual_review_prompt(brief, minimum):
+    return (
+        "You are the final visual art director for a public gallery. Inspect "
+        "the ATTACHED IMAGE itself, not its filename and not the maker's claim. "
+        "Judge composition, visual impact, coherence, craft, originality, "
+        "legibility, obvious generation artifacts, accidental text/gibberish, "
+        "and whether this looks like finished art worth sending to friends. "
+        f"The intended brief was: {brief}\n\n"
+        "Return exactly one JSON object and no markdown: "
+        '{"schema":"rapp-image-review/1.0","score":0,'
+        '"publish":false,"failures":["specific visible defect"],'
+        '"strengths":["specific visible strength"]}. '
+        f"publish may be true only when score is at least {minimum}, there are "
+        "no obvious rendering defects, and the image feels complete."
+    )
+
+
+def review_generated_image(image_path, brief, wcfg):
+    cfg = azure_image_config(wcfg)
+    fcfg = SS.fanout_config(wcfg)
+    runtime = Path(image_path).parent / "review-runtime"
+    runtime.mkdir(parents=True, exist_ok=True)
+    env = SS.confined_env(fcfg, runtime, 0)
+    argv = SS.confined_argv(
+        _visual_review_prompt(brief, cfg["minimum_review_score"]),
+        str(cfg.get("review_model") or "gpt-5.4"),
+        runtime,
+        tools=SS.CHILD_TOOLS,
+        secret_vars=SS.secret_vars_for(fcfg),
+        log_dir=runtime / "copilot-logs",
+        json_output=True,
+    )
+    argv += ["--attachment", str(Path(image_path).resolve())]
+    proc = track(subprocess.Popen(
+        argv, cwd=str(runtime), env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=True))
+    try:
+        stdout, stderr = proc.communicate(timeout=cfg["review_timeout_s"])
+    except subprocess.TimeoutExpired:
+        SS._kill_group(proc, 5)
+        raise GateError("multimodal visual review timed out")
+    finally:
+        untrack(proc)
+    if proc.returncode != 0:
+        raise GateError(
+            f"multimodal visual review exited {proc.returncode}: "
+            f"{(stderr or stdout or '').strip()[:240]}")
+    content = SS.extract_assistant_message(
+        stdout,
+        max_bytes=int(cfg.get("review_transcript_bytes")
+                      or 16 * 1024 * 1024))
+    try:
+        review = SS.extract_report(content, 65536)
+    except Exception as exc:
+        raise GateError(f"visual review returned unreadable JSON: {exc}") from exc
+    if (not isinstance(review, dict)
+            or review.get("schema") != "rapp-image-review/1.0"
+            or not isinstance(review.get("score"), (int, float))
+            or isinstance(review.get("score"), bool)
+            or not isinstance(review.get("publish"), bool)
+            or not isinstance(review.get("failures"), list)
+            or not isinstance(review.get("strengths"), list)):
+        raise GateError("visual review has the wrong schema")
+    review["score"] = max(0, min(10, float(review["score"])))
+    review["failures"] = [str(item)[:240] for item in review["failures"][:8]]
+    review["strengths"] = [str(item)[:240] for item in review["strengths"][:8]]
+    return review
+
+
+def _atomic_write_bytes(path, payload):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with temp.open("wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def materialize_azure_image(staging, wcfg, generator=None, reviewer=None):
+    """Replace a maker-written piece.prompt with a reviewed Azure PNG."""
+    out = Path(staging) / "out" / SUBMISSION_DIR
+    meta_path = out / META_NAME
+    if not meta_path.is_file():
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if meta.get("kind") != "png":
+        return None
+    cfg = azure_image_config(wcfg)
+    if not cfg["enabled"]:
+        raise GateError("meta.kind is png but azure_image is disabled")
+    prompt_path = out / "piece.prompt"
+    if not prompt_path.is_file():
+        raise GateError("Azure PNG output requires piece.prompt")
+    prompt = prompt_path.read_text(encoding="utf-8").strip()
+    declared = str(meta.get("_image_prompt") or "").strip()
+    if not prompt or len(prompt) > 4000:
+        raise GateError("piece.prompt must contain 1-4000 characters")
+    if declared != prompt:
+        raise GateError("meta._image_prompt must exactly match piece.prompt")
+    generator = generator or azure_art.generate
+    reviewer = reviewer or review_generated_image
+    runtime = Path(staging).parent / "runtime" / "azure-art"
+    runtime.mkdir(parents=True, exist_ok=True)
+    failures = []
+    accepted = None
+    deployment = ""
+    review = None
+    current_prompt = prompt
+    for attempt in range(1, cfg["max_attempts"] + 1):
+        try:
+            image, deployment = generator(current_prompt, cfg)
+        except azure_art.AzureArtError as exc:
+            raise GateError(str(exc)) from exc
+        candidate = runtime / f"candidate-{attempt}.png"
+        _atomic_write_bytes(candidate, image)
+        review = reviewer(candidate, current_prompt, wcfg)
+        score_ok = review["score"] >= cfg["minimum_review_score"]
+        if review["publish"] and score_ok and not review["failures"]:
+            accepted = image
+            break
+        failures = review["failures"] or [
+            f"visual score {review['score']} is below "
+            f"{cfg['minimum_review_score']}"]
+        current_prompt = (
+            prompt + "\n\nA previous generated attempt was rejected by an "
+            "independent visual judge for these visible problems: "
+            + "; ".join(failures)
+            + ". Create a substantially improved composition that fixes every "
+              "problem while preserving the core concept."
+        )
+    if accepted is None:
+        raise GateError(
+            "Azure image failed visual review after "
+            f"{cfg['max_attempts']} attempt(s): " + "; ".join(failures))
+    piece_path = out / "piece.png"
+    _atomic_write_bytes(piece_path, accepted)
+    prompt_path.unlink()
+    meta["_image_generation"] = {
+        "provider": "Azure OpenAI",
+        "deployment": deployment,
+        "attempts": attempt,
+        "review": {
+            "model": str(cfg.get("review_model") or "gpt-5.4"),
+            "score": review["score"],
+            "strengths": review["strengths"],
+        },
+    }
+    meta_path.write_text(
+        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    archive = ART_ARCHIVE / f"{meta['slug']}.png"
+    _atomic_write_bytes(archive, accepted)
+    return {
+        "archive": str(archive),
+        "deployment": deployment,
+        "attempts": attempt,
+        "score": review["score"],
+    }
+
+
 def worker_enabled(cfg):
     """True when this instance delegates proactive art to this worker."""
     block = cfg.get("evolve_worker")
@@ -327,6 +572,10 @@ def vision_config(wcfg):
     defaults["player_url"] = str(defaults.get("player_url") or "").rstrip("/")
     if not defaults["player_url"].startswith("https://"):
         raise GateError("rapp_vision.player_url must be https")
+    defaults["collective_viewer_url"] = str(
+        defaults.get("collective_viewer_url") or "").rstrip("/")
+    if not defaults["collective_viewer_url"].startswith("https://"):
+        raise GateError("rapp_vision.collective_viewer_url must be https")
     defaults["duration"] = max(12, min(600, int(defaults.get("duration") or 60)))
     return defaults
 
@@ -387,10 +636,8 @@ def vision_video(submission, vcfg):
                 {
                     "t": 6,
                     "dur": duration - 6,
-                    # Live-scene app paths resolve against channel.json, just
-                    # like thumbs. A repo-root path here becomes dada/dada/...
-                    # when the channel itself lives under dada/.
-                    "app": thumb,
+                    "app": (f"{vcfg['collective_viewer_url']}#/"
+                            f"{quote(submission['slug'], safe='')}"),
                     "lower": {
                         "title": submission["title"],
                         "bench": "Public Art Collective",
@@ -794,9 +1041,7 @@ You cannot create directories: you have file tools and no shell, and that is
 deliberate. Every directory you need has been made for you. Write exactly:
 
   {workspace}/out/submission/meta.json      the protocol record (schema below)
-  {workspace}/out/submission/piece.<ext>    the work itself; ext is one of
-                                            .svg .md .txt .json and MUST match
-                                            meta.kind; at most {max_piece_kb} KB
+  {piece_instruction}
   {workspace}/state-out.json                your private next state
 
 Your slug goes in meta.json, NOT in a directory name — the controller creates
@@ -814,12 +1059,14 @@ meta.json:
   "title":        "<human title>",
   "slug":         "<your-slug>",
   "contributor":  "{contributor}",
-  "kind":         "svg|md|txt|json",
+  "kind":         "{allowed_kind_union}",
   "submitted_at": "<UTC ISO-8601, e.g. 2026-08-17T19:00:00Z>",
   "remix_of":     null or "<existing slug>",
   "license":      "{license}",
   "_dada_cycle":  {{ ... see below ... }}
 }}
+
+{azure_instruction}
 
 Slug rules: lowercase letters, digits and single hyphens, at most {slug_max}
 characters, and it must not already exist under submissions/.
@@ -914,6 +1161,32 @@ def build_prompt(cfg, wcfg, slug, workspace, expected_cycle,
         fanout_block = ""
         round_one = ("Round 1 is yours to populate; every round needs exactly "
                      f"{CANDIDATES_PER_ROUND} candidates.")
+    kinds = allowed_kinds(wcfg)
+    azure_cfg = azure_image_config(wcfg)
+    if azure_cfg["enabled"] and kinds == ("png",):
+        piece_instruction = (
+            f"{workspace}/out/submission/piece.prompt  a detailed 1-4000 "
+            "character visual-generation brief; the controller replaces it "
+            "with the reviewed piece.png"
+        )
+        azure_instruction = (
+            'For PNG output, meta.json MUST include "_image_prompt" and its '
+            "value MUST exactly match piece.prompt. Describe the composition, "
+            "medium, palette, lighting, focal hierarchy, texture, and what to "
+            "avoid. Do not put labels or prose into the image unless the concept "
+            "requires a small amount of intentional, correctly spelled text. "
+            "Azure generates the pixels and an independent multimodal Copilot "
+            "judge sees the actual image; failed images are regenerated or the "
+            "cycle is rejected."
+        )
+    else:
+        piece_instruction = (
+            f"{workspace}/out/submission/piece.<ext>    the work itself; ext is "
+            f"one of {' '.join(KIND_EXTENSIONS[kind] for kind in kinds)} and "
+            f"MUST match meta.kind; at most "
+            f"{int(wcfg['max_piece_bytes']) // 1024} KB"
+        )
+        azure_instruction = ""
     return WORKER_SITUATION.format(
         instance_name=sentinel.instance_name(cfg),
         slug=slug,
@@ -927,6 +1200,9 @@ def build_prompt(cfg, wcfg, slug, workspace, expected_cycle,
         repo=wcfg["repo"],
         state_in_note="present" if state_in.exists() else "absent — this is cycle 1",
         max_piece_kb=int(wcfg["max_piece_bytes"]) // 1024,
+        piece_instruction=piece_instruction,
+        azure_instruction=azure_instruction,
+        allowed_kind_union="|".join(allowed_kinds(wcfg)),
         schema=SUBMISSION_SCHEMA,
         contributor=wcfg.get("contributor") or _repo_owner(wcfg["repo"]),
         license=ALLOWED_LICENSES[0],
@@ -1706,12 +1982,25 @@ def _check_svg(raw, text):
             _reject_external_url(value, f"svg attribute {name}")
 
 
+def _check_png(raw):
+    if not raw.startswith(azure_art.PNG_SIGNATURE):
+        raise GateError("png has an invalid signature")
+    if len(raw) < 33 or raw[12:16] != b"IHDR":
+        raise GateError("png has no valid IHDR")
+    width, height = struct.unpack(">II", raw[16:24])
+    if width < 512 or height < 512 or width > 4096 or height > 4096:
+        raise GateError(f"png dimensions {width}x{height} are outside 512-4096")
+
+
 def _check_piece(path, kind, max_bytes):
     raw = path.read_bytes()
     if not raw:
         raise GateError("piece is empty")
     if len(raw) > max_bytes:
         raise GateError(f"piece is {len(raw)} bytes, over the {max_bytes} byte cap")
+    if kind == "png":
+        _check_png(raw)
+        return raw
     try:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
@@ -2105,6 +2394,7 @@ def verify_staging_tree(staging, baseline, wcfg=None):
     allowed_new = {STATE_OUT_NAME, f"out/{SUBMISSION_DIR}/{META_NAME}"}
     piece_names = {f"out/{SUBMISSION_DIR}/piece{ext}"
                    for ext in KIND_EXTENSIONS.values()}
+    piece_names.add(f"out/{SUBMISSION_DIR}/piece.prompt")
     current = _scan_staging(staging)
 
     for rel, before in sorted(baseline.items()):
@@ -2225,6 +2515,10 @@ def gate_directory(root, wcfg, expected_cycle, expected_previous,
     if kind not in KIND_EXTENSIONS:
         raise GateError(f"meta.kind is {kind!r}, expected one of "
                         f"{', '.join(sorted(KIND_EXTENSIONS))}")
+    permitted = allowed_kinds(wcfg)
+    if kind not in permitted:
+        raise GateError(f"meta.kind is {kind!r}, but this worker requires "
+                        f"{', '.join(permitted)}")
     if piece_name != f"piece{KIND_EXTENSIONS[kind]}":
         raise GateError(f"piece is {piece_name!r}, expected "
                         f"piece{KIND_EXTENSIONS[kind]} for kind {kind!r}")
@@ -2759,7 +3053,8 @@ def vision_urls(vcfg, submission):
                       f"{quote(submission['slug'], safe='')}"),
         "channel_url": f"{root}/{channel_path}",
         "media_url": f"{root}/{media_path}",
-        "scene_url": f"{root}/{media_path}",
+        "scene_url": (f"{vcfg['collective_viewer_url']}#/"
+                      f"{quote(submission['slug'], safe='')}"),
         "source_url": (f"https://github.com/{repo.owner}/{repo.name}/blob/"
                        f"{quote(str(vcfg.get('base_branch', 'main')), safe='')}/"
                        f"{media_path}"),
@@ -2954,6 +3249,7 @@ def verify_dual_pages(cfg, wcfg, submission, vision_receipts, probe=None,
     vision = vision_receipts or vision_urls(vcfg, submission)
     required = [
         ("Public Art Collective", collective_url),
+        ("Public Art piece", piece_pages_url(cfg, wcfg, submission)),
         ("RAPP Vision channel", vision.get("channel_url", "")),
         ("RAPP Vision media", vision.get("media_url", "")),
         ("RAPP Vision scene", vision.get("scene_url", "")),
@@ -3041,8 +3337,19 @@ def art_urls(cfg, wcfg, submission):
     path = "/".join(quote(seg, safe="")
                     for seg in str(submission["piece_path"]).split("/"))
     branch = quote(str(wcfg.get("base_branch", "main")), safe="")
-    return (f"https://{owner.lower()}.github.io/{name}/{path}",
+    slug = quote(str(submission.get("slug") or
+                     Path(submission["piece_path"]).parent.name), safe="")
+    return (f"https://{owner.lower()}.github.io/{name}/view.html#/{slug}",
             f"https://github.com/{owner}/{name}/blob/{branch}/{path}")
+
+
+def piece_pages_url(cfg, wcfg, submission):
+    owner, name = art_repo(cfg, wcfg)
+    if not owner or not name:
+        return ""
+    path = "/".join(quote(seg, safe="")
+                    for seg in str(submission["piece_path"]).split("/"))
+    return f"https://{owner.lower()}.github.io/{name}/{path}"
 
 
 def raw_url(cfg, wcfg, submission):
@@ -3182,6 +3489,30 @@ def art_notification(cfg, wcfg, submission, receipts, view="", note=""):
     if not view:
         lines += ["", "(no Public Art Collective Pages URL was verified)"]
     return "\n".join(lines)
+
+
+def open_final_art(wcfg, receipts):
+    if not azure_image_config(wcfg).get("open_in_browser"):
+        return False
+    urls = [
+        str(receipts.get("collective_url") or "").strip(),
+        str(receipts.get("vision_url") or "").strip(),
+    ]
+    urls = [url for url in urls if url.startswith("https://")]
+    if not urls or sys.platform != "darwin":
+        return False
+    try:
+        result = subprocess.run(
+            ["/usr/bin/open", "-a", "Safari", *urls],
+            capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        log(f"could not open final art in Safari: {type(exc).__name__}: {exc}")
+        return False
+    if result.returncode != 0:
+        log(f"could not open final art in Safari: "
+            f"{(result.stderr or result.stdout or '').strip()[:200]}")
+        return False
+    return True
 
 
 def record(history, row, path=None):
@@ -3566,6 +3897,9 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
                     vwcfg, git_home=STATE / "git-home-rapp-vision")
                 vision_auth = assert_publish_auth(vwcfg, ctx=vctx)
                 log(f"RAPP Vision publish auth ok — {vision_auth}")
+            if azure_image_config(wcfg)["enabled"]:
+                visual = assert_visual_pipeline_ready(wcfg)
+                log(f"visual generation ready — {visual}")
         except (AbortError, GateError, CommandError) as e:
             return _skip(f"publish auth unavailable: {e}")
 
@@ -3684,6 +4018,11 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             # second copy of the piece anywhere in staging fails the cycle
             # before its output is even read.
             verify_staging_tree(staging, baseline, wcfg)
+            visual_receipt = materialize_azure_image(staging, wcfg)
+            if visual_receipt:
+                log("Azure image accepted by multimodal review — "
+                    f"score {visual_receipt['score']:.1f}, "
+                    f"attempt {visual_receipt['attempts']}")
             submission = gate_directory(staging / "out", wcfg, expected_cycle,
                                         expected_previous,
                                         SS.expected_round1(finalists)
@@ -3803,7 +4142,8 @@ def fanout_situation(cfg, wcfg, role, cycle, previous_slug):
             f"commons: {wcfg.get('repo')}\n"
             f"standing directive: "
             f"{sentinel.evolve_brief(cfg) or 'none'}\n"
-            f"the piece must be one self-contained file (svg, md, txt or json) "
+            f"the piece must be one self-contained file "
+            f"({', '.join(allowed_kinds(wcfg))}) "
             f"under {int(wcfg.get('max_piece_bytes', 51200)) // 1024} KB, "
             f"CC0-1.0, in submissions/<slug>/")
 
@@ -3859,6 +4199,7 @@ def _finish(cfg, wcfg, history, row, outcome, detail, receipts=None,
                                               view, view_note),
                         to=art_recipient(cfg), kind="art",
                         attach_report=False)
+        open_final_art(wcfg, receipts)
     elif text and (outcome != OUTCOME_DECLINED or wcfg.get("notify_declines")):
         sentinel.notify(cfg, text)
     log(f"{row['role']}: {outcome} — {row['detail'][:200]}")
