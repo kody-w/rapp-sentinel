@@ -43,6 +43,7 @@
       "registry_path": "channels.json",
       "branch_prefix": "art/dada-vision",
       "player_url": "https://kody-w.github.io/rapp-vision",
+      "collective_viewer_url": "https://kody-w.github.io/public-art-collective/view.html",
       "duration": 60,
       "deployment_retry_limit": 12
     },
@@ -56,6 +57,24 @@
     "git_author_name": "RAPP Sentinel evolve worker",
     "git_author_email": "rapp-sentinel@users.noreply.github.com",
     "max_piece_bytes": 51200,
+    "_allowed_kinds_why": "Restrict the maker more narrowly than the public protocol. A visual-art instance can require only svg while other sentinels retain the full svg/md/txt/json protocol.",
+    "allowed_kinds": ["svg", "md", "txt", "json", "png"],
+    "_azure_image_why": "Optional trusted-controller image generation. The maker writes meta.json plus piece.prompt; the controller calls a dedicated Entra-authenticated Azure GPT Image deployment, sends the actual PNG back through Copilot CLI multimodal review, regenerates rejected attempts, archives the accepted PNG locally, and only then allows the ordinary publication gate.",
+    "azure_image": {
+      "enabled": false,
+      "endpoint": "",
+      "deployment": "gpt-image-2",
+      "fallback_deployment": "gpt-image-2",
+      "api_version": "2025-04-01-preview",
+      "size": "1536x1024",
+      "quality": "high",
+      "max_attempts": 3,
+      "minimum_review_score": 8,
+      "review_model": "gpt-5.4",
+      "review_timeout_s": 300,
+      "review_transcript_bytes": 16777216,
+      "open_in_browser": false
+    },
     "notify_declines": false,
     "fanout": {
       "enabled": false,
