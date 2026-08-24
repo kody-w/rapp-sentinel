@@ -552,6 +552,8 @@ Your previous reply could not be read, and this is the ONLY retry.
 WHAT WENT WRONG
 {error}
 
+{constraint}
+
 WHAT YOU SENT (truncated)
 {prior}
 
@@ -587,6 +589,7 @@ def repair_prompt(spec, fcfg, cycle, error, prior_content):
         cycle=cycle,
         max_candidates=int(fcfg.get("max_candidates_per_child", 8)),
         score_example=example,
+        constraint=str(fcfg.get("_prompt_constraint") or ""),
     )
 
 

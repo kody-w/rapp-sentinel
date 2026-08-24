@@ -2144,8 +2144,48 @@ def alerts_can_actually_reach_you():
     unverified = int(st.get("unverified") or 0)
     dead_letter = int(st.get("dead_letter") or 0)
     expired = int(st.get("expired") or 0)
+    unknown = int(st.get("unknown") or 0)
+    unknown_resolved = int(st.get("unknown_resolved") or 0)
+    ambiguity = int(st.get("dedupe_ambiguity") or 0)
+    strict_recovery = int(st.get("strict_recovery") or 0)
+    inflight = bool(st.get("inflight"))
+    inflight_age = st.get("inflight_minutes")
     last = st.get("last_drain") or {}
     why = (last.get("why") or "").strip()
+    if inflight:
+        stale_after = float(
+            getattr(outbox, "INFLIGHT_STALE_SECONDS", 120)) / 60
+        if not isinstance(inflight_age, (int, float)):
+            return fail(
+                "alert_delivery",
+                "outbox has in-flight send intent with unknown age",
+                critical=False)
+        if inflight_age >= stale_after:
+            return fail(
+                "alert_delivery",
+                f"outbox send intent is stale at {inflight_age:.1f}m "
+                f"(bar {stale_after:.1f}m); delivery remains UNKNOWN",
+                critical=False)
+    if unknown or ambiguity or strict_recovery:
+        parts = []
+        if unknown:
+            parts.append(f"{unknown} UNKNOWN delivery evidence record(s)")
+        if ambiguity:
+            parts.append(
+                f"{ambiguity} unresolved terminal-ledger corruption "
+                "incident(s) blocking dedupe-keyed sends")
+        if strict_recovery:
+            evidence = st.get("strict_recovery_evidence_file") or (
+                "outbox-strict-ledger-recovery.json")
+            parts.append(
+                f"{strict_recovery} unacknowledged strict-ledger recovery "
+                f"incident(s) blocking dedupe-keyed sends/resolution; inspect "
+                f"{evidence} and run `python3 outbox.py ack-recovery "
+                "<id> <reason>`")
+        return fail(
+            "alert_delivery",
+            "; ".join(parts),
+            critical=False)
     if missing:
         return fail("alert_delivery",
                     f"{missing} queued static report attachment(s) are missing",
@@ -2178,6 +2218,10 @@ def alerts_can_actually_reach_you():
         detail = "no queued alerts"
         if expired:
             detail += f"; {expired} historical undelivered report(s) retained as expired"
+        if unknown_resolved:
+            detail += (
+                f"; {unknown_resolved} historical UNKNOWN delivery record(s) "
+                "explicitly resolved")
         return ok("alert_delivery", detail)
     if age and age > 180:
         return fail("alert_delivery",

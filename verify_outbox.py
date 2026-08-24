@@ -111,7 +111,10 @@ def _candidates(connection, message):
 def verify():
     """Move uniquely matched uncertain sends to the verified sent ledger."""
     with outbox._locked(outbox.LOCK):
+        outbox._recover_terminal_tails_unlocked()
+        outbox._recover_inflight_unlocked()
         try:
+            outbox._read_terminal_records_unlocked(outbox.UNVERIFIED)
             snapshot = [
                 line for line in outbox.UNVERIFIED.read_text(
                     encoding="utf-8").splitlines() if line.strip()
@@ -146,6 +149,9 @@ def verify():
         connection.close()
 
     with outbox._locked(outbox.LOCK):
+        outbox._recover_terminal_tails_unlocked()
+        outbox._recover_inflight_unlocked()
+        outbox._read_terminal_records_unlocked(outbox.UNVERIFIED)
         current = [
             line for line in outbox.UNVERIFIED.read_text(
                 encoding="utf-8").splitlines() if line.strip()

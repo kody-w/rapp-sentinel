@@ -213,29 +213,33 @@ The worker (`evolve_worker.py`, `com.rapp.evolve-worker`, every 30 min):
 | honest cleanup | if the clone no longer verifies, an abandoned branch is deleted from the canonical URL through a fresh repository with global/system git config neutralised, then confirmed with `ls-remote` — an injected remote is never contacted, and a real branch is never left orphaned |
 | tracked process tree | maker and children each get their own process group; a timeout or SIGTERM kills the tree, then the workspace is deleted, and only then is the lock released |
 | verified index | the git **index** is checked before the push — exactly two `100644` blobs whose bytes are the bytes that passed the gate |
+| target-native validation | after staging and before commit or push, the controller proves `tools/build_index.py` is the exact blob from canonical `origin/main`, then runs `[sys.executable, ..., "--validate"]` with captured output and a 120-second timeout. A missing or failing validator stops publication; reconciliation never reruns it |
+| protected reviewed-PNG provenance | an `azure-reviewed-png` PR persists its URL/number before reading exit-zero `gh pr view --json statusCheckRollup,mergeStateStatus,state`; only the exact CheckRun job `Verify controller provenance` from workflow `Reviewed PNG provenance` is classified. After exact success the complete rollup is read again, and only `CLEAN` permits `gh pr merge`; `BLOCKED`, `BEHIND`, pending checks, and inspection/non-JSON failure durably retain the PR in `checks-pending`. Absence is never success; a lone `CANCELLED` gets the same bounded grace for a cancel-in-progress replacement, while a pending exact replacement remains pending. Expired absence/cancellation and explicit failure/timed-out/action-required/stale results abort only after non-merge is proved |
 | reconciliation | a cycle killed between `gh pr merge` and the ledger write is finished (or its PR closed) on the next pass, from the PR and `origin/main` |
 | continuity that migrates | the creative ledger's current cycle is read canonically — `cycle`, else `last_cycle`, else a validated `cycles[]` — and fields that disagree fail closed rather than guessing. History is a strictly ordered contiguous run: a prefix from cycle 1, or a bounded tail that must carry an explicit counter, be exactly `creative_history_limit` long and end at that counter. Reader and writer share one constant, so the state written after cycle 50 is state the worker can still read. A rejected attempt is a failed spend that leaves public continuity alone |
 | liveness | every pass writes a heartbeat, and `w_evolve_worker` reports enabled-but-never-loaded or stale |
 | bounded sub-sentinel fan-out | optional: 3-5 read-only children in separate processes with no repo, no token and no ability to spawn children, aggregated deterministically into exactly 10 finalists — see below |
-| deterministic gate | exactly **two root-level regular files** (`lstat`: no symlink, no hardlink, no fifo, not executable, nothing nested) in one new `submissions/<slug>/`, valid slug/schema/kind/extension/license, piece ≤ 50 KB, SVG parses with no script, no `on*` handler and no external reference (including CSS), and `_dada_cycle` proving 1-5 rounds of **exactly 10** scored candidates whose round one reproduces the finalist records by digest |
+| deterministic gate | exactly **two root-level regular files** (`lstat`: no symlink, no hardlink, no fifo, not executable, nothing nested) in one new `submissions/<slug>/`, valid slug/schema/kind/extension/license, piece within the configured bounded cap (50 KB by default), SVG parses with no script, no `on*` handler and no external reference (including CSS), and `_dada_cycle` proving 1-5 rounds of **exactly 10** scored candidates whose round one reproduces the finalist records by digest |
 | one repository, two names | the configured `repo` is normalised once: a validated transport URL for git, and `[HOST/]OWNER/REPO` for gh. `owner/name`, a full `https://` URL and a `.git` suffix all describe the same repository — before this, a URL config passed the auth preflight and then died at `gh pr create --repo https://…` |
 | one controller per pass | the pinned git and gh binaries, the sanitized git environment with its generated credential helper, the gh environment and both repository forms are resolved **once** and threaded through every call — preflight, clone, push, PR, merge, cleanup and reconciliation. No module-level cache, so a pass cannot inherit a choice made by an earlier one |
 | publish auth, checked first | before any child process, the controller asks GitHub whether this account may push to the configured repo and asks `git credential fill` whether credentials resolve — lengths logged, never values. Its credential helper is generated, not inherited: a fixed `gh auth git-credential` with the real HOME and validated gh config given to that process alone, never to git's environment and never to a model's |
 | child replies are typed | children run with `--output-format=json` and are read only from the final `assistant.message` event — never reasoning, which contains the same JSON. One unparseable reply earns exactly one format-repair process if the deadline and process cap allow (`format_repair_attempts` is 0 or 1 — anything else is a configuration error, not a clamp); it is debited as a spend, recorded, and every attempt's transcript is kept outside the disposable workspace |
 | controller-owned publish | the branch, commit, PR, PR **file scope as GitHub reports it**, squash merge, and the re-read of `origin/main` and the merge commit afterwards are all done by code |
-| dual public deployment | optional `rapp_vision` mirrors the exact gated bytes into a RAPP Vision channel after the canonical collective merge; success stays pending until both GitHub Pages experiences answer, and reconciliation retries without spending another model |
-| Azure visual studio | optional `azure_image` turns a maker-authored visual brief into a local GPT Image PNG, attaches the actual pixels to a tool-less Copilot multimodal art director, regenerates rejected images, archives the accepted file on-device, and publishes only after the score clears the configured bar |
-| honest outcomes | only a re-read merge sends a 🎨; a timeout, failure, rejection or decline is recorded as what it was |
-| one text per deployment | a verified dual deployment sends exactly one iMessage: title, one sentence, the Public Art Collective Pages experience, and the RAPP Vision watch experience — no private report or LAN URL |
+| dual public deployment | optional `rapp_vision` mirrors the exact gated bytes into a RAPP Vision channel after the canonical collective merge; success stays pending until both GitHub Pages experiences answer, and reconciliation retries without spending another model. Once their verified routes are persisted in a digest/profile-bound deployment receipt, a notification-only retry reuses those exact URLs and does not re-probe Pages/CDN |
+| Azure visual studio | `azure-reviewed-png` preflights bounded deployment/model identifiers before model spend, rejects credential material recursively from child/maker/final metadata, turns a maker-authored visual brief into a local GPT Image PNG, validates the complete PNG and inflated scanlines, attaches actual pixels to a tool-less Copilot multimodal art director, regenerates rejected images, and issues a versioned digest-bound receipt only after score, publish decision, and zero-failure review clear the captured bar |
+| honest outcomes | only a re-read merge sends a 🎨; once the canonical merge command is invoked, a timeout/error remains pending until fresh PR and `origin/main` evidence proves merge or non-merge |
+| one text per deployment | a verified dual deployment durably enqueues exactly one idempotent iMessage: title, one sentence, the Public Art Collective Pages experience, and the RAPP Vision watch experience — no private report or LAN URL |
 
 `SENTINEL_RESULT: CONTRIBUTED` is a claim, not a receipt. The creative ledger,
 the cadence history, the chain frame and the notification move only after the
 merge commit has been fetched back and the merged bytes match the bytes that
 passed the gate. The temporary clone is removed on every path out.
 
-Honest limit: the deterministic gate encodes the submission protocol *as it
-was read* — a repo that changes its protocol needs the gate updated with it,
-on purpose, so a PR cannot relax the rules that judge it.
+The local deterministic gate remains an early, spend-saving mirror of the
+submission protocol. Exact target acceptance does not depend on that mirror
+remaining current: the freshly cloned canonical base branch supplies the
+trusted `tools/build_index.py --validate` that judges the staged candidate
+before any bytes can be pushed. Submission bytes cannot replace that validator.
 
 #### The one text a dual deployment earns
 
@@ -247,7 +251,7 @@ A verified final deployment — and *only* that deployment — sends one iMessag
 
 Nine consecutive attestations so identical that each one's prev equals its own payload_hash.
 
-Public Art Collective: https://kody-w.github.io/public-art-collective/submissions/nine-sworn-assurances/piece.svg
+Public Art Collective: https://kody-w.github.io/public-art-collective/submissions/nine-sworn-assurances/piece.png
 RAPP Vision: https://kody-w.github.io/rapp-vision/#/watch/nine-sworn-assurances
 ```
 
@@ -274,18 +278,169 @@ either experience is not ready, the transaction remains pending and the next
 worker pass retries deployment without spending another model. A triumphant
 404 teaches the reader to ignore the next one.
 
-It is queued through the ordinary outbox exactly once, like every other alert,
-and the delivery layer classifies it: sent, unverified, or dead-lettered after
-its retries. This worker never asserts delivery — it hands the message over and
-stops talking. That matters because the **art arm refuses to run at all while
+It is queued through the ordinary outbox exactly once, like every other alert.
+Every enqueue receives a persisted random `entry_id`, separate from its stable
+optional `dedupe_key`, so even byte-identical plain alerts created in the same
+second retain distinct queue hashes, watcher attempts, send intents, and
+terminal evidence. Legacy queue and in-flight records without an `entry_id`
+remain readable through a digest-derived identity. The delivery layer
+classifies each entry: sent, unverified, or dead-lettered after its retries.
+This worker never asserts delivery — it hands the message over and stops
+talking. That matters because the **art arm refuses to run at all while
 `alert_delivery` is failing**: unverified or dead-lettered alerts mean the
 estate cannot reach a human, and a system that makes paintings while its own
 alarm is broken is the exact silence this repo exists to refuse. Naming
 `alert_delivery` in `degraded_allowlist` does not help; it is one of two ids
 (with `health_runtime`) the gate refuses to silence.
 
+Every terminal outbox append is flushed and fsynced. A torn final terminal
+JSONL record still moves the potentially affected queue head to explicit
+`UNKNOWN` evidence instead of automatically sending it again. Malformed
+interior records, blank records, invalid UTF-8, and non-object JSON are copied
+byte-for-byte (base64 plus SHA-256) into the durable terminal quarantine under
+the exclusive lock; the affected ledger is then atomically rewritten with
+every valid record preserved. Ordinary non-deduplicated operational alerts
+continue to enqueue, drain, and reach the watcher. Because the corrupt bytes
+may conceal an already-sent dedupe key, queued keyed alerts become `UNKNOWN`
+and all new keyed enqueue/send attempts fail closed until each reported
+incident is explicitly acknowledged with
+`python3 outbox.py resolve-quarantine <incident-id> <reason>`. The evidence is
+append-only and remains visible in `outbox.py status` and `alert_delivery`.
+Quarantine acknowledgment resolves only corrupt terminal bytes; it does not
+resolve any `UNKNOWN` delivery result.
+
+The quarantine and resolution ledgers are strict evidence too:
+`outbox-terminal-quarantine.jsonl`,
+`outbox-terminal-quarantine-resolved.jsonl`, and
+`outbox-unknown-resolved.jsonl`. If a crash tears a tail or interior record in
+one of them, recovery reads the raw bytes under the outbox lock before strict
+JSON parsing, copies every invalid physical record byte-for-byte into the
+atomically replaced and fsynced
+`outbox-strict-ledger-recovery.json`, then atomically rewrites the source with
+only its valid records. A corrupt resolution is never treated as a resolution:
+the corresponding UNKNOWN or quarantine evidence stays unresolved. Plain
+non-deduplicated alerts continue to enqueue, drain, and appear in status, while
+dedupe-keyed sends and both resolution commands remain fail-closed. Inspect
+`strict_recovery_ids` and `strict_recovery_evidence_file` in
+`python3 outbox.py status`, then acknowledge preserved raw evidence with
+`python3 outbox.py ack-recovery <incident-id> <reason>`. That acknowledgment
+does not resolve an UNKNOWN delivery or terminal-quarantine incident; record
+those decisions separately with the existing resolution commands.
+
+`UNKNOWN` delivery evidence is also append-only and never becomes healthy by
+age or retry. Read `unknown_unresolved_ids` from `python3 outbox.py status`,
+check Messages/chat.db or the recipient-side evidence to decide whether that
+specific entry was delivered, then record the decision with
+`python3 outbox.py resolve-unknown <unknown-id> delivered <reason>` or
+`python3 outbox.py resolve-unknown <unknown-id> not-delivered <reason>`.
+Resolution is appended to a separate ledger; the raw UNKNOWN line remains on
+disk. Status exposes unresolved, total, and resolved counts, while
+`alert_delivery` gates only the unresolved count and turns green only after
+every UNKNOWN has this explicit operator decision (assuming no other delivery
+issue remains).
+
 Set `commons_repo` and `evolve_worker.rapp_vision` to enable the two-link final
 receipt. A dual deployment with either URL missing does not send.
+
+#### Source-enforced reviewed-PNG Dada profile
+
+Use the named profile when this worker is the Dada visual publisher:
+
+```json
+{
+  "evolve_worker": {
+    "publication_profile": "azure-reviewed-png",
+    "allowed_kinds": ["png"],
+    "max_piece_bytes": 16777216,
+    "azure_image": {
+      "enabled": true,
+      "endpoint": "https://YOUR-RESOURCE.openai.azure.com",
+      "deployment": "gpt-image-2",
+      "fallback_deployment": "gpt-image-2",
+      "max_attempts": 3,
+      "minimum_review_score": 8,
+      "review_model": "gpt-5.4"
+    },
+    "rapp_vision": {
+      "enabled": true,
+      "repo": "kody-w/rapp-vision"
+    }
+  }
+}
+```
+
+The same profile activates for an existing deployment that omits
+`publication_profile` but already has **exactly** `allowed_kinds: ["png"]` and
+`azure_image.enabled: true`. This compatibility rule does not relax the
+contract: startup still refuses the cycle before fan-out or maker spend unless
+RAPP Vision is enabled, the review threshold is 8-10, and `max_piece_bytes` is
+between 4 MiB and 32 MiB. An unknown profile or a conflicting setting is a
+preflight failure, not a late publishing surprise.
+
+Under this profile, children deliberate only about visual image concepts and
+the default `execution-designer` seat becomes an `image-concept-designer`.
+The maker writes exactly `meta.json`, `piece.prompt`, and `state-out.json`.
+It never writes `piece.png`, SVG, markdown, text, JSON art, or
+`_image_generation`; there is no nonvisual fallback when generation or review
+fails.
+
+Controller code accepts only non-interlaced 8-bit RGB/RGBA PNGs with a valid
+signature, bounded and CRC-valid chunks, first/13-byte IHDR, bounded positive
+dimensions and at most 16,000,000 total pixels, at most one pre-IDAT PLTE,
+consecutive IDAT data, final zero-byte IEND, no trailing bytes, and a zlib
+stream that inflates to exactly the IHDR scanline size. The accepted image
+receives a strict `rapp-image-generation/1.0` receipt binding the profile,
+provider/deployment, attempts, exact SHA-256 and IHDR dimensions to the
+`rapp-image-review/1.0` model, `publish: true`, an integer score, captured
+integer minimum, `failures: []`, and bounded strengths. The ordinary gate
+recomputes all of it; a direct PNG, missing/forged receipt, fractional score,
+low score, review failure, or digest mismatch fails closed.
+
+Deployment and review-model names use Collective's exact 1-100 character
+identifier grammar. Reviewer strengths reject control characters and raw
+credential patterns, while the full reviewed-PNG metadata tree rejects
+credential-like values and normalized key names such as `_api_key`, including
+material nested in prompts, concepts, and candidate premises. Maker metadata
+is checked before Azure generation: `contributor` must be exactly `kody-w`,
+and `title` must match Collective's clean-string grammar (already stripped,
+1-200 characters, with no code point below `0x20`). The model-controlled slug
+must match the exact 1-48 character lowercase ASCII slug grammar before any
+runtime/archive write, and its resolved archive destination must be one direct
+child of the resolved archive root. The completed receipt and metadata are
+checked again at the staging gate, merged-byte reconciliation, and final
+deployment receipt.
+
+The profile snapshot is part of the durable publication transaction.
+Reconciliation re-reads merged metadata and PNG bytes and validates the
+snapshot and receipt without calling the maker, Azure generator, materializer,
+reviewer, or pre-push target validator. Immediately before RAPP Vision, the
+same PNG is validated again;
+its exact bytes are mirrored and its width, height, and orientation come from
+IHDR. Final Pages verification separately requires both direct media URLs to
+answer HTTP 2xx with `Content-Type: image/png` and a PNG signature, while the
+Collective and RAPP Vision player/watch routes must also answer. A visual gate
+failure sends no art notification. Reviewed-profile preflight also proves the
+required channel, media, and registry paths do not collide or escape their
+relative representations, and that both the channel thumb and viewer app
+fields can be formed safely, before fan-out or maker spend.
+
+Leave `publication_profile` empty (and do not use the exact legacy activation
+pair) for existing non-PNG workers. Their SVG/markdown/text/JSON prompt,
+fan-out, and publication behavior is unchanged. PNG in any legacy or mixed
+configuration is rejected during preflight because the Collective requires a
+review receipt for every PNG.
+
+The reviewed profile also owns its cross-repository controller identity in
+source, rather than accepting it from child output or mutable metadata. Before
+controller construction, fan-out, maker, reviewer, or Azure spend, omitted
+identity settings are derived and explicit conflicts are rejected. The only
+accepted branch is `art/dada/<slug>-<8 lowercase hex>`; both Git author and
+committer are exactly `Dada Collective <kody-w@users.noreply.github.com>`; and
+the provenance body line is exactly
+`Autonomous submission by the <role> neighbor of Dada Collective.` The next
+body line remains the deterministic Dada cycle/round attestation required by
+Collective's current offline verifier. Nonvisual profiles retain the existing
+generic branch and Git identity defaults.
 
 #### Sub-sentinels: a bounded fan-out before the maker
 

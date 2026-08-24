@@ -1,0 +1,15 @@
+{
+  "schema": "rapp-collective-reviewed-png-controller-contract/1.0",
+  "profile": "azure-reviewed-png",
+  "branch_prefix": "art/dada",
+  "branch_suffix": "<slug>-<8 lowercase hex>",
+  "commit_name": "Dada Collective",
+  "commit_email": "kody-w@users.noreply.github.com",
+  "contributor": "kody-w",
+  "title_max_chars": 200,
+  "title_error_template": "{label} must be a clean non-empty string of at most {max_chars} characters",
+  "commit_body_template": "Autonomous submission by the {role} neighbor of Dada Collective.",
+  "workflow": "Reviewed PNG provenance",
+  "job": "Verify controller provenance",
+  "rollup_json_fields": "statusCheckRollup,mergeStateStatus,state"
+}

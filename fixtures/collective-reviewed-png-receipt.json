@@ -1,0 +1,23 @@
+{
+  "schema": "rapp-image-generation/1.0",
+  "profile": "azure-reviewed-png",
+  "provider": "azure-openai",
+  "deployment": "gpt-image-2",
+  "attempts": 1,
+  "image_sha256": "1266debba45397aeea74979b9193a9e7f67a9203055c8013ecb95167bd7b0a3f",
+  "image": {
+    "width": 512,
+    "height": 512
+  },
+  "review": {
+    "schema": "rapp-image-review/1.0",
+    "model": "gpt-5.4",
+    "publish": true,
+    "score": 9,
+    "minimum_score": 8,
+    "failures": [],
+    "strengths": [
+      "clear visual hierarchy"
+    ]
+  }
+}

@@ -55,6 +55,7 @@ import urllib.error
 import urllib.request
 import uuid
 import xml.etree.ElementTree as ET
+import zlib
 from datetime import datetime, timedelta
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlsplit
@@ -104,7 +105,12 @@ WORKER_DEFAULTS = {
     "max_piece_bytes": 51200,
     "max_meta_bytes": 262144,
     "max_state_bytes": 262144,
-    "allowed_kinds": ["svg", "md", "txt", "json", "png"],
+    "publication_profile": "",
+    # A newly opened PR can take a short time to receive its protected
+    # provenance check. Absence, and a lone cancel-in-progress result while
+    # GitHub schedules its replacement, are pending only for this window.
+    "provenance_absent_grace_s": 300,
+    "allowed_kinds": ["svg", "md", "txt", "json"],
     "notify_declines": False,
     "azure_image": {
         "enabled": False,
@@ -158,6 +164,63 @@ KIND_EXTENSIONS = {
 SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 SLUG_MAX = 48
 
+AZURE_REVIEWED_PNG_PROFILE = "azure-reviewed-png"
+PROFILE_SNAPSHOT_SCHEMA = "rapp-publication-profile/1.0"
+IMAGE_GENERATION_SCHEMA = "rapp-image-generation/1.0"
+IMAGE_REVIEW_SCHEMA = "rapp-image-review/1.0"
+FINAL_NOTIFICATION_SCHEMA = "rapp-evolve-art-notification/1.0"
+DEPLOYMENT_RECEIPT_SCHEMA = "rapp-evolve-deployment-receipt/1.0"
+IMAGE_PROVIDER = "azure-openai"
+PROFILE_MIN_PIECE_BYTES = 4 * 1024 * 1024
+PROFILE_MAX_PIECE_BYTES = 32 * 1024 * 1024
+PNG_MIN_DIMENSION = 512
+PNG_MAX_DIMENSION = 4096
+PNG_MAX_PIXELS = 16_000_000
+PNG_MAX_CHUNK_BYTES = PROFILE_MAX_PIECE_BYTES
+PNG_MAX_CHUNKS = 10_000
+IMAGE_MAX_IDENTIFIER_CHARS = 100
+IMAGE_MAX_STRENGTHS = 8
+IMAGE_MAX_STRENGTH_CHARS = 240
+IMAGE_IDENTIFIER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+COLLECTIVE_PROVENANCE_WORKFLOW = "Reviewed PNG provenance"
+COLLECTIVE_PROVENANCE_CHECK = "Verify controller provenance"
+COLLECTIVE_PROVENANCE_FULL_NAME = (
+    f"{COLLECTIVE_PROVENANCE_WORKFLOW} / {COLLECTIVE_PROVENANCE_CHECK}")
+PROVENANCE_ROLLUP_JSON_FIELDS = (
+    "statusCheckRollup,mergeStateStatus,state")
+PROVENANCE_PENDING_STATUSES = frozenset({
+    "EXPECTED", "PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING",
+})
+PROVENANCE_FAILURE_CONCLUSIONS = frozenset({
+    "ACTION_REQUIRED", "FAILURE", "NEUTRAL", "SKIPPED", "STALE",
+    "STARTUP_FAILURE", "TIMED_OUT",
+})
+REVIEWED_PNG_BRANCH_PREFIX = "art/dada"
+REVIEWED_PNG_COMMIT_NAME = "Dada Collective"
+REVIEWED_PNG_COMMIT_EMAIL = "kody-w@users.noreply.github.com"
+REVIEWED_PNG_CONTRIBUTOR = "kody-w"
+REVIEWED_PNG_TITLE_MAX_CHARS = 200
+REVIEWED_PNG_COMMIT_BODY_TEMPLATE = (
+    "Autonomous submission by the {role} neighbor of Dada Collective.")
+REVIEWED_PNG_ROLE_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._ -]{0,63}$")
+RAW_CREDENTIAL_RE = re.compile(
+    r"(?i)(?:"
+    r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}|"
+    r"\b(?:gh[pousr]_|github_pat_|sk-)[A-Za-z0-9_-]{8,}|"
+    r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|"
+    r"\b(?:api[ _-]?key|access[ _-]?token|client[ _-]?secret|password)"
+    r"\s*[:=]\s*\S+|"
+    r"[?&](?:sig|token|key)=[^&\s]+"
+    r")"
+)
+CREDENTIAL_KEY_NAMES = frozenset({
+    "apikey", "accesstoken", "refreshtoken", "token", "credential",
+    "credentials", "password", "secret", "clientsecret", "authorization",
+})
+COLLECTIVE_VALIDATOR_PATH = "tools/build_index.py"
+COLLECTIVE_VALIDATOR_TIMEOUT_S = 120
+
 # ── the dada cycle invariants ───────────────────────────────────────────────
 # The point of the cycle block is that the SEARCH is evidence, not decoration:
 # a fixed candidate count per round is the difference between "it explored"
@@ -201,6 +264,142 @@ class CommandError(RuntimeError):
 
 class DeploymentPending(RuntimeError):
     """A merge is real but both public Pages deployments are not ready yet."""
+
+
+class MergeAmbiguous(RuntimeError):
+    """The canonical merge command was invoked, so failure is not non-merge."""
+
+
+class MergeNotConfirmed(CommandError):
+    """GitHub explicitly reports that the PR is not merged."""
+
+    def __init__(self, pr_number, state):
+        self.pr_number = str(pr_number)
+        self.state = str(state or "")
+        super().__init__(
+            f"PR {self.pr_number} is not merged: {self.state!r}")
+
+
+class ChecksPending(RuntimeError):
+    """A protected PR check is not yet a durable permission to merge."""
+
+
+class ProvenanceCheckFailed(AbortError):
+    """The required Collective provenance check or merge gate rejected a PR."""
+
+
+class NotificationPending(RuntimeError):
+    """The contribution is durable but its final outbox enqueue is not."""
+
+
+def _collective_text(value, label, max_chars=500):
+    """Use Collective verify_png_attestation._text's exact grammar."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > max_chars
+        or any(ord(char) < 0x20 for char in value)
+    ):
+        raise GateError(
+            f"{label} must be a clean non-empty string of at most "
+            f"{max_chars} characters"
+        )
+    return value
+
+
+def _submission_slug(value):
+    if (
+        not isinstance(value, str)
+        or len(value) > SLUG_MAX
+        or not SLUG_RE.fullmatch(value)
+    ):
+        raise GateError(
+            f"meta.slug {value!r} is not lowercase-alphanumeric-hyphen "
+            f"within {SLUG_MAX} characters"
+        )
+    return value
+
+
+def validate_reviewed_submission_contract(meta, expected_slug=None):
+    """Validate metadata fields pinned by Collective's reviewed-PNG gate."""
+    if not isinstance(meta, dict):
+        raise GateError("reviewed-PNG meta.json must be an object")
+    slug = _submission_slug(meta.get("slug"))
+    if expected_slug is not None and slug != expected_slug:
+        raise GateError("reviewed PNG metadata conflicts with its gated slug")
+    title = _collective_text(
+        meta.get("title"),
+        f"{slug}: title",
+        REVIEWED_PNG_TITLE_MAX_CHARS,
+    )
+    if meta.get("contributor") != REVIEWED_PNG_CONTRIBUTOR:
+        raise GateError(
+            f"{slug}: reviewed PNG contributor must be "
+            f"'{REVIEWED_PNG_CONTRIBUTOR}'"
+        )
+    return {"slug": slug, "title": title,
+            "contributor": REVIEWED_PNG_CONTRIBUTOR}
+
+
+def reviewed_archive_destination(meta):
+    """Resolve a validated slug to one direct child of the archive root."""
+    slug = _submission_slug(
+        meta.get("slug") if isinstance(meta, dict) else None)
+    archive_root = Path(ART_ARCHIVE).resolve()
+    archive = (archive_root / f"{slug}.png").resolve()
+    if archive.parent != archive_root:
+        raise GateError(
+            "reviewed PNG archive destination is not a direct child of "
+            "the configured archive root"
+        )
+    return archive
+
+
+def _bounded_receipt_text(value, subject, label, max_chars, identifier=False):
+    """Mirror Public Art Collective's reviewed-PNG text contract exactly."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > max_chars
+    ):
+        raise GateError(
+            f"{subject}: {label} must be a non-empty string of at most "
+            f"{max_chars} characters"
+        )
+    if any(ord(char) < 0x20 for char in value):
+        raise GateError(f"{subject}: {label} contains control characters")
+    if identifier and not IMAGE_IDENTIFIER_RE.fullmatch(value):
+        raise GateError(f"{subject}: {label} is not a bounded identifier")
+    if RAW_CREDENTIAL_RE.search(value):
+        raise GateError(f"{subject}: {label} appears to contain a credential")
+    return value
+
+
+def _reject_credential_material(value, subject, path="meta"):
+    """Mirror Collective's recursive credential field and value rejection."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            normalized = re.sub(r"[^a-z0-9]", "", key.lower())
+            child_path = f"{path}.{key}"
+            if any(
+                normalized == name or normalized.endswith(name)
+                for name in CREDENTIAL_KEY_NAMES
+            ):
+                raise GateError(
+                    f"{subject}: {child_path} is a forbidden credential field"
+                )
+            _reject_credential_material(child, subject, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_credential_material(
+                child, subject, f"{path}[{index}]"
+            )
+    elif isinstance(value, str) and RAW_CREDENTIAL_RE.search(value):
+        raise GateError(
+            f"{subject}: {path} appears to contain a raw credential or token"
+        )
 
 
 # ── the process tree ────────────────────────────────────────────────────────
@@ -300,7 +499,8 @@ def worker_config(cfg):
 
 def allowed_kinds(wcfg):
     raw = wcfg.get("allowed_kinds")
-    values = list(KIND_EXTENSIONS) if raw is None else list(raw)
+    values = (list(WORKER_DEFAULTS["allowed_kinds"])
+              if raw is None else list(raw))
     if not values or any(kind not in KIND_EXTENSIONS for kind in values):
         raise GateError("allowed_kinds must be a non-empty subset of "
                         + ", ".join(sorted(KIND_EXTENSIONS)))
@@ -361,12 +561,54 @@ def _visual_review_prompt(brief, minimum):
         "and whether this looks like finished art worth sending to friends. "
         f"The intended brief was: {brief}\n\n"
         "Return exactly one JSON object and no markdown: "
-        '{"schema":"rapp-image-review/1.0","score":0,'
+        f'{{"schema":"{IMAGE_REVIEW_SCHEMA}","score":0,'
         '"publish":false,"failures":["specific visible defect"],'
         '"strengths":["specific visible strength"]}. '
         f"publish may be true only when score is at least {minimum}, there are "
         "no obvious rendering defects, and the image feels complete."
     )
+
+
+def normalize_visual_review(review):
+    """Strict, bounded reviewer output, including injected test reviewers."""
+    score = review.get("score") if isinstance(review, dict) else None
+    if (not isinstance(review, dict)
+            or set(review) != {
+                "schema", "score", "publish", "failures", "strengths"}
+            or review.get("schema") != IMAGE_REVIEW_SCHEMA
+            or not isinstance(score, (int, float))
+            or isinstance(score, bool)
+            or score != score
+            or score in (float("inf"), float("-inf"))
+            or not float(score).is_integer()
+            or not 0 <= score <= 10
+            or not isinstance(review.get("publish"), bool)
+            or not isinstance(review.get("failures"), list)
+            or not isinstance(review.get("strengths"), list)):
+        raise GateError("visual review has the wrong schema")
+    bounded = {}
+    for field in ("failures", "strengths"):
+        values = review[field]
+        if len(values) > IMAGE_MAX_STRENGTHS:
+            raise GateError(
+                f"visual review {field} must contain at most "
+                f"{IMAGE_MAX_STRENGTHS} strings")
+        bounded[field] = [
+            _bounded_receipt_text(
+                item,
+                "visual review",
+                f"{field}[{index}]",
+                IMAGE_MAX_STRENGTH_CHARS,
+            )
+            for index, item in enumerate(values)
+        ]
+    return {
+        "schema": IMAGE_REVIEW_SCHEMA,
+        "score": int(score),
+        "publish": review["publish"],
+        "failures": bounded["failures"],
+        "strengths": bounded["strengths"],
+    }
 
 
 def review_generated_image(image_path, brief, wcfg):
@@ -408,18 +650,7 @@ def review_generated_image(image_path, brief, wcfg):
         review = SS.extract_report(content, 65536)
     except Exception as exc:
         raise GateError(f"visual review returned unreadable JSON: {exc}") from exc
-    if (not isinstance(review, dict)
-            or review.get("schema") != "rapp-image-review/1.0"
-            or not isinstance(review.get("score"), (int, float))
-            or isinstance(review.get("score"), bool)
-            or not isinstance(review.get("publish"), bool)
-            or not isinstance(review.get("failures"), list)
-            or not isinstance(review.get("strengths"), list)):
-        raise GateError("visual review has the wrong schema")
-    review["score"] = max(0, min(10, float(review["score"])))
-    review["failures"] = [str(item)[:240] for item in review["failures"][:8]]
-    review["strengths"] = [str(item)[:240] for item in review["strengths"][:8]]
-    return review
+    return normalize_visual_review(review)
 
 
 def _atomic_write_bytes(path, payload):
@@ -446,11 +677,23 @@ def materialize_azure_image(staging, wcfg, generator=None, reviewer=None):
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
+    if not isinstance(meta, dict):
+        raise GateError("reviewed-PNG meta.json must be an object")
     if meta.get("kind") != "png":
         return None
+    archive = reviewed_archive_destination(meta)
+    validate_reviewed_submission_contract(meta)
+    profile_snapshot = publication_profile_snapshot(wcfg)
+    if not profile_snapshot:
+        raise GateError(
+            "PNG generation requires the azure-reviewed-png publication profile")
     cfg = azure_image_config(wcfg)
     if not cfg["enabled"]:
         raise GateError("meta.kind is png but azure_image is disabled")
+    if profile_snapshot and "_image_generation" in meta:
+        raise GateError(
+            "the maker may not supply _image_generation; only the controller "
+            "can issue a reviewed-PNG receipt")
     prompt_path = out / "piece.prompt"
     if not prompt_path.is_file():
         raise GateError("Azure PNG output requires piece.prompt")
@@ -460,6 +703,9 @@ def materialize_azure_image(staging, wcfg, generator=None, reviewer=None):
         raise GateError("piece.prompt must contain 1-4000 characters")
     if declared != prompt:
         raise GateError("meta._image_prompt must exactly match piece.prompt")
+    _reject_credential_material(
+        meta, str(meta.get("slug") or "reviewed-PNG submission")
+    )
     generator = generator or azure_art.generate
     reviewer = reviewer or review_generated_image
     runtime = Path(staging).parent / "runtime" / "azure-art"
@@ -468,15 +714,25 @@ def materialize_azure_image(staging, wcfg, generator=None, reviewer=None):
     accepted = None
     deployment = ""
     review = None
+    image_info = None
     current_prompt = prompt
     for attempt in range(1, cfg["max_attempts"] + 1):
         try:
             image, deployment = generator(current_prompt, cfg)
         except azure_art.AzureArtError as exc:
             raise GateError(str(exc)) from exc
+        if not isinstance(image, bytes):
+            raise GateError("Azure image generation returned a non-bytes payload")
+        max_bytes = int(wcfg.get("max_piece_bytes", 51200))
+        if len(image) > max_bytes:
+            raise GateError(
+                f"generated PNG is {len(image)} bytes, over the "
+                f"{max_bytes} byte cap")
+        image_info = _check_png(image)
         candidate = runtime / f"candidate-{attempt}.png"
         _atomic_write_bytes(candidate, image)
-        review = reviewer(candidate, current_prompt, wcfg)
+        review = normalize_visual_review(
+            reviewer(candidate, current_prompt, wcfg))
         score_ok = review["score"] >= cfg["minimum_review_score"]
         if review["publish"] and score_ok and not review["failures"]:
             accepted = image
@@ -498,20 +754,30 @@ def materialize_azure_image(staging, wcfg, generator=None, reviewer=None):
     piece_path = out / "piece.png"
     _atomic_write_bytes(piece_path, accepted)
     prompt_path.unlink()
+    digest = hashlib.sha256(accepted).hexdigest()
     meta["_image_generation"] = {
-        "provider": "Azure OpenAI",
+        "schema": IMAGE_GENERATION_SCHEMA,
+        "profile": AZURE_REVIEWED_PNG_PROFILE,
+        "provider": IMAGE_PROVIDER,
         "deployment": deployment,
         "attempts": attempt,
+        "image_sha256": digest,
+        "image": {
+            "width": image_info["width"],
+            "height": image_info["height"],
+        },
         "review": {
-            "model": str(cfg.get("review_model") or "gpt-5.4"),
+            "schema": IMAGE_REVIEW_SCHEMA,
+            "model": profile_snapshot["review_model"],
+            "publish": True,
             "score": review["score"],
+            "minimum_score": profile_snapshot["minimum_review_score"],
+            "failures": [],
             "strengths": review["strengths"],
         },
     }
-    meta_path.write_text(
-        json.dumps(meta, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8")
-    archive = ART_ARCHIVE / f"{meta['slug']}.png"
+    validate_image_generation_receipt(meta, accepted, profile_snapshot)
+    atomic_write_json(meta_path, meta)
     _atomic_write_bytes(archive, accepted)
     return {
         "archive": str(archive),
@@ -539,9 +805,12 @@ VISION_NETWORK_SCHEMA = "rapp-vision-network/1.0"
 
 
 def _repo_relative_path(value, label):
-    text = str(value or "").strip().strip("/")
+    raw = str(value or "").strip()
+    text = raw.rstrip("/")
     path = PurePosixPath(text)
-    if (not text or path.is_absolute() or ".." in path.parts
+    if (not text or raw.startswith("/") or "\\" in raw or "//" in raw
+            or path.is_absolute() or path.as_posix() != text
+            or ".." in path.parts
             or any(not part or part.startswith(".") for part in path.parts)):
         raise GateError(f"{label} must be a plain repository-relative path")
     return path.as_posix()
@@ -580,6 +849,284 @@ def vision_config(wcfg):
     return defaults
 
 
+PROFILE_SNAPSHOT_KEYS = {
+    "schema", "profile", "allowed_kinds", "max_piece_bytes", "provider",
+    "deployments", "max_attempts", "review_schema", "review_model",
+    "minimum_review_score", "rapp_vision_enabled",
+}
+
+
+def publication_profile_name(wcfg):
+    """Resolve explicit profile selection plus the deployed legacy signal."""
+    raw = wcfg.get("publication_profile")
+    explicit = "" if raw is None else raw
+    if not isinstance(explicit, str):
+        raise GateError("publication_profile must be a string")
+    explicit = explicit.strip()
+    if explicit and explicit != AZURE_REVIEWED_PNG_PROFILE:
+        raise GateError(
+            f"unknown publication_profile {explicit!r}; supported profile is "
+            f"{AZURE_REVIEWED_PNG_PROFILE!r}")
+    azure = wcfg.get("azure_image")
+    legacy_active = (
+        isinstance(wcfg.get("allowed_kinds"), list)
+        and wcfg.get("allowed_kinds") == ["png"]
+        and isinstance(azure, dict)
+        and azure.get("enabled") is True
+    )
+    return explicit or (
+        AZURE_REVIEWED_PNG_PROFILE if legacy_active else "")
+
+
+def validate_profile_snapshot(snapshot):
+    """Validate a persisted profile without consulting mutable config."""
+    if not isinstance(snapshot, dict) or set(snapshot) != PROFILE_SNAPSHOT_KEYS:
+        raise GateError(
+            "publication profile snapshot has the wrong fields")
+    if snapshot.get("schema") != PROFILE_SNAPSHOT_SCHEMA:
+        raise GateError("publication profile snapshot has the wrong schema")
+    if snapshot.get("profile") != AZURE_REVIEWED_PNG_PROFILE:
+        raise GateError("publication profile snapshot names the wrong profile")
+    if snapshot.get("allowed_kinds") != ["png"]:
+        raise GateError("publication profile snapshot must allow exactly png")
+    cap = snapshot.get("max_piece_bytes")
+    if (isinstance(cap, bool) or not isinstance(cap, int)
+            or not PROFILE_MIN_PIECE_BYTES <= cap <= PROFILE_MAX_PIECE_BYTES):
+        raise GateError(
+            "publication profile snapshot has an unsafe max_piece_bytes")
+    if snapshot.get("provider") != IMAGE_PROVIDER:
+        raise GateError("publication profile snapshot has the wrong provider")
+    deployments = snapshot.get("deployments")
+    if (not isinstance(deployments, list)
+            or not 1 <= len(deployments) <= 2
+            or any(not isinstance(item, str) for item in deployments)):
+        raise GateError(
+            "publication profile snapshot has invalid Azure deployments")
+    for index, deployment in enumerate(deployments):
+        _bounded_receipt_text(
+            deployment,
+            "publication profile snapshot",
+            f"deployments[{index}]",
+            IMAGE_MAX_IDENTIFIER_CHARS,
+            identifier=True,
+        )
+    if len(set(deployments)) != len(deployments):
+        raise GateError(
+            "publication profile snapshot has duplicate Azure deployments")
+    attempts = snapshot.get("max_attempts")
+    if (isinstance(attempts, bool) or not isinstance(attempts, int)
+            or not 1 <= attempts <= 5):
+        raise GateError(
+            "publication profile snapshot has invalid max_attempts")
+    if snapshot.get("review_schema") != IMAGE_REVIEW_SCHEMA:
+        raise GateError("publication profile snapshot has the wrong review schema")
+    _bounded_receipt_text(
+        snapshot.get("review_model"),
+        "publication profile snapshot",
+        "review_model",
+        IMAGE_MAX_IDENTIFIER_CHARS,
+        identifier=True,
+    )
+    minimum = snapshot.get("minimum_review_score")
+    if (isinstance(minimum, bool) or not isinstance(minimum, int)
+            or not 8 <= minimum <= 10):
+        raise GateError(
+            "publication profile snapshot requires minimum_review_score 8..10")
+    if snapshot.get("rapp_vision_enabled") is not True:
+        raise GateError("publication profile snapshot requires RAPP Vision")
+    return {
+        **snapshot,
+        "allowed_kinds": ["png"],
+        "deployments": list(deployments),
+    }
+
+
+def publication_profile_snapshot(wcfg):
+    """Return the immutable active profile contract, or None for legacy."""
+    profile = publication_profile_name(wcfg)
+    kinds = allowed_kinds(wcfg)
+    if profile != AZURE_REVIEWED_PNG_PROFILE:
+        if "png" in kinds:
+            raise GateError(
+                "PNG requires the azure-reviewed-png publication profile; "
+                "legacy and mixed PNG configurations are not publishable")
+        return None
+    if (not isinstance(wcfg.get("allowed_kinds"), list)
+            or wcfg.get("allowed_kinds") != ["png"]):
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} requires allowed_kinds exactly "
+            "['png']")
+    azure_block = wcfg.get("azure_image")
+    if not isinstance(azure_block, dict) or azure_block.get("enabled") is not True:
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} requires azure_image.enabled=true")
+    vision_block = wcfg.get("rapp_vision")
+    if not isinstance(vision_block, dict) or vision_block.get("enabled") is not True:
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} requires rapp_vision.enabled=true")
+    max_piece_bytes = wcfg.get("max_piece_bytes")
+    if (isinstance(max_piece_bytes, bool)
+            or not isinstance(max_piece_bytes, int)
+            or not PROFILE_MIN_PIECE_BYTES <= max_piece_bytes
+            <= PROFILE_MAX_PIECE_BYTES):
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} requires max_piece_bytes between "
+            f"{PROFILE_MIN_PIECE_BYTES} and {PROFILE_MAX_PIECE_BYTES}")
+    minimum = azure_block.get(
+        "minimum_review_score",
+        WORKER_DEFAULTS["azure_image"]["minimum_review_score"])
+    if (isinstance(minimum, bool) or not isinstance(minimum, int)
+            or not 8 <= minimum <= 10):
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} requires "
+            "minimum_review_score between 8 and 10")
+    attempts = azure_block.get(
+        "max_attempts", WORKER_DEFAULTS["azure_image"]["max_attempts"])
+    if (isinstance(attempts, bool) or not isinstance(attempts, int)
+            or not 1 <= attempts <= 5):
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} requires max_attempts between 1 and 5")
+    try:
+        azure = azure_image_config(wcfg)
+        vision = vision_config(wcfg)
+    except (TypeError, ValueError) as exc:
+        raise GateError(f"invalid {AZURE_REVIEWED_PNG_PROFILE} config: {exc}") from exc
+    validate_reviewed_vision_config(vision)
+    deployments = []
+    for key in ("deployment", "fallback_deployment"):
+        deployment = azure.get(key)
+        if deployment is None or deployment == "":
+            continue
+        _bounded_receipt_text(
+            deployment,
+            "publication profile config",
+            f"azure_image.{key}",
+            IMAGE_MAX_IDENTIFIER_CHARS,
+            identifier=True,
+        )
+        if deployment not in deployments:
+            deployments.append(deployment)
+    if not deployments:
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} requires an Azure deployment")
+    model = _bounded_receipt_text(
+        azure.get("review_model"),
+        "publication profile config",
+        "azure_image.review_model",
+        IMAGE_MAX_IDENTIFIER_CHARS,
+        identifier=True,
+    )
+    snapshot = {
+        "schema": PROFILE_SNAPSHOT_SCHEMA,
+        "profile": AZURE_REVIEWED_PNG_PROFILE,
+        "allowed_kinds": ["png"],
+        "max_piece_bytes": max_piece_bytes,
+        "provider": IMAGE_PROVIDER,
+        "deployments": deployments,
+        "max_attempts": attempts,
+        "review_schema": IMAGE_REVIEW_SCHEMA,
+        "review_model": model,
+        "minimum_review_score": minimum,
+        "rapp_vision_enabled": True,
+    }
+    return validate_profile_snapshot(snapshot)
+
+
+def enforce_reviewed_controller_contract(wcfg, profile_snapshot,
+                                         configured=None):
+    """Apply the pinned Collective identity or reject an explicit conflict."""
+    if not _requires_collective_provenance(profile_snapshot):
+        return None
+    configured = configured if isinstance(configured, dict) else None
+    expected = {
+        "branch_prefix": REVIEWED_PNG_BRANCH_PREFIX,
+        "git_author_name": REVIEWED_PNG_COMMIT_NAME,
+        "git_author_email": REVIEWED_PNG_COMMIT_EMAIL,
+    }
+    for field, required in expected.items():
+        if configured is not None:
+            if field in configured and configured[field] != required:
+                raise GateError(
+                    f"{AZURE_REVIEWED_PNG_PROFILE} requires {field}="
+                    f"{required!r}; configured override "
+                    f"{configured[field]!r} is incompatible")
+        else:
+            actual = wcfg.get(field)
+            if actual not in (WORKER_DEFAULTS[field], required):
+                raise GateError(
+                    f"{AZURE_REVIEWED_PNG_PROFILE} requires {field}="
+                    f"{required!r}; value {actual!r} is incompatible")
+        wcfg[field] = required
+    return dict(expected)
+
+
+VISUAL_CHILD_RULE = (
+    "This publication profile is visual-only. Propose and critique concrete "
+    "image concepts for a finished PNG: composition, spatial relationships, "
+    "palette, light, texture, focal hierarchy, and visible failure modes. "
+    "Never propose SVG, markdown, text, JSON, code, an interactive experience, "
+    "or a nonvisual fallback."
+)
+
+VISUAL_DEFAULT_ROLES = [
+    {
+        "name": "novelty-archaeologist",
+        "wave": 1,
+        "brief": (
+            "Compare the visible concept, composition, symbolism, and palette "
+            "against prior work. Veto image concepts that merely repaint an "
+            "existing premise."
+        ),
+    },
+    {
+        "name": "image-concept-designer",
+        "wave": 1,
+        "brief": (
+            "Design image concepts that can be expressed as one finished "
+            "generated PNG. State the composition, focal subject, spatial "
+            "logic, medium, palette, lighting, texture, and exclusions."
+        ),
+    },
+    {
+        "name": "adversarial-verifier",
+        "wave": 2,
+        "verifier": True,
+        "brief": (
+            "Attack the proposed images for generic composition, incoherent "
+            "geometry, accidental text, generation artifacts, weak hierarchy, "
+            "and concepts that are not legible from pixels alone."
+        ),
+    },
+]
+
+
+def profiled_fanout_config(wcfg, profile_snapshot=None):
+    """Apply visual-only child roles while leaving every legacy cast intact."""
+    fcfg = SS.fanout_config(wcfg)
+    snapshot = (validate_profile_snapshot(profile_snapshot)
+                if profile_snapshot is not None
+                else publication_profile_snapshot(wcfg))
+    if not snapshot:
+        return fcfg
+    block = wcfg.get("fanout")
+    declared = block.get("roles") if isinstance(block, dict) else None
+    source = declared or VISUAL_DEFAULT_ROLES
+    roles = []
+    for role in source:
+        if not isinstance(role, dict):
+            roles.append(role)
+            continue
+        brief = str(role.get("brief") or "").strip()
+        roles.append({
+            **role,
+            "brief": f"{VISUAL_CHILD_RULE} {brief}".strip(),
+        })
+    fcfg["roles"] = roles
+    fcfg["_publication_profile"] = AZURE_REVIEWED_PNG_PROFILE
+    fcfg["_prompt_constraint"] = VISUAL_CHILD_RULE
+    return fcfg
+
+
 def vision_worker_config(wcfg, vcfg=None):
     vcfg = vcfg or vision_config(wcfg)
     merged = dict(wcfg)
@@ -597,10 +1144,81 @@ def vision_media_path(submission, vcfg):
             f"{submission['slug']}{extension}").as_posix()
 
 
-def vision_video(submission, vcfg):
+def _safe_channel_relative(path, channel_path, label):
+    parent = PurePosixPath(channel_path).parent.as_posix()
+    relative = posixpath.relpath(path, parent if parent != "." else ".")
+    parsed = PurePosixPath(relative)
+    if (parsed.is_absolute() or ".." in parsed.parts
+            or any(not part or part.startswith(".") for part in parsed.parts)):
+        raise GateError(
+            f"{label} cannot be represented as a safe channel-relative path")
+    return parsed.as_posix()
+
+
+def _vision_app_url(vcfg, slug):
+    """Build the channel app field from a clean HTTPS viewer base."""
+    if not isinstance(slug, str) or not SLUG_RE.fullmatch(slug):
+        raise GateError("RAPP Vision app slug must be a lowercase slug")
+    base = str(vcfg.get("collective_viewer_url") or "")
+    parsed = urlsplit(base)
+    if (parsed.scheme != "https" or not parsed.netloc
+            or parsed.username is not None or parsed.password is not None
+            or parsed.query or parsed.fragment
+            or any(char.isspace() or ord(char) < 32 for char in base)):
+        raise GateError(
+            "rapp_vision.collective_viewer_url must be a clean HTTPS URL "
+            "without credentials, query, or fragment")
+    return f"{base}#/{quote(slug, safe='')}"
+
+
+def validate_reviewed_vision_config(vcfg):
+    """Prove reviewed-PNG channel paths are non-colliding and representable."""
+    if not isinstance(vcfg, dict) or vcfg.get("enabled") is not True:
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} requires enabled RAPP Vision")
+    channel = PurePosixPath(vcfg["channel_path"])
+    media = PurePosixPath(vcfg["media_dir"])
+    registry_raw = vcfg.get("registry_path")
+    registry = PurePosixPath(registry_raw) if registry_raw else None
+
+    if registry is None:
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} requires rapp_vision.registry_path")
+    if channel == media or media in channel.parents:
+        raise GateError(
+            "rapp_vision.channel_path must not be inside media_dir")
+    if registry == channel:
+        raise GateError(
+            "rapp_vision.registry_path must differ from channel_path")
+    if registry == media or media in registry.parents:
+        raise GateError(
+            "rapp_vision.registry_path must not be inside media_dir")
+    _safe_channel_relative(
+        channel.as_posix(), registry.as_posix(),
+        "RAPP Vision registry channel")
+
+    _safe_channel_relative(
+        (media / "profile-preflight.png").as_posix(),
+        channel.as_posix(), "RAPP Vision thumb")
+    _vision_app_url(vcfg, "profile-preflight")
+    return vcfg
+
+
+def vision_video(submission, vcfg, image_info=None):
     media = vision_media_path(submission, vcfg)
-    channel_parent = PurePosixPath(vcfg["channel_path"]).parent.as_posix()
-    thumb = posixpath.relpath(media, channel_parent if channel_parent != "." else "")
+    receipt = ((submission.get("meta") or {}).get("_image_generation")
+               if isinstance(submission.get("meta"), dict) else None)
+    reviewed_png = (
+        submission.get("kind") == "png"
+        and isinstance(receipt, dict)
+        and receipt.get("profile") == AZURE_REVIEWED_PNG_PROFILE)
+    if reviewed_png:
+        thumb = _safe_channel_relative(
+            media, vcfg["channel_path"], "RAPP Vision thumb")
+    else:
+        channel_parent = PurePosixPath(vcfg["channel_path"]).parent.as_posix()
+        thumb = posixpath.relpath(
+            media, channel_parent if channel_parent != "." else "")
     submitted = str(submission["meta"].get("submitted_at") or "")
     try:
         published = datetime.fromisoformat(
@@ -609,15 +1227,26 @@ def vision_video(submission, vcfg):
         raise GateError(f"submitted_at is not ISO-8601: {e}")
     concept = concept_sentence(submission["meta"])
     duration = int(vcfg["duration"])
+    if reviewed_png:
+        if not isinstance(image_info, dict):
+            raise GateError(
+                "RAPP Vision PNG metadata must be derived from validated IHDR")
+        width, height = image_info["width"], image_info["height"]
+        orientation = (
+            "landscape" if width > height
+            else "portrait" if height > width
+            else "square")
+    else:
+        width, height, orientation = 1280, 800, "landscape"
     return {
         "id": submission["slug"],
         "title": submission["title"],
         "description": concept,
         "published": published,
         "duration": duration,
-        "width": 1280,
-        "height": 800,
-        "orientation": "landscape",
+        "width": width,
+        "height": height,
+        "orientation": orientation,
         "tags": ["dada-collective", "public-art", "cc0"],
         "thumb": thumb,
         "sources": [],
@@ -636,8 +1265,7 @@ def vision_video(submission, vcfg):
                 {
                     "t": 6,
                     "dur": duration - 6,
-                    "app": (f"{vcfg['collective_viewer_url']}#/"
-                            f"{quote(submission['slug'], safe='')}"),
+                    "app": _vision_app_url(vcfg, submission["slug"]),
                     "lower": {
                         "title": submission["title"],
                         "bench": "Public Art Collective",
@@ -677,7 +1305,9 @@ def vision_registry_entry(vcfg):
     return {
         "id": vcfg["channel_id"],
         "name": vcfg["channel_name"],
-        "url": vcfg["channel_path"],
+        "url": _safe_channel_relative(
+            vcfg["channel_path"], vcfg["registry_path"],
+            "RAPP Vision registry channel"),
         "repo": source,
         "_why": "Verified Dada works mirrored from the Public Art Collective.",
     }
@@ -698,7 +1328,9 @@ def _load_json_file(path, label):
 def write_vision_files(clone, submission, piece_bytes, vcfg):
     """Materialize one idempotent RAPP Vision entry in a controller clone."""
     clone = Path(clone)
-    entry = vision_video(submission, vcfg)
+    image_info = (_check_png(piece_bytes)
+                  if submission.get("kind") == "png" else None)
+    entry = vision_video(submission, vcfg, image_info)
     changed = []
 
     media_rel = vision_media_path(submission, vcfg)
@@ -1029,12 +1661,14 @@ rooted at {workspace} and reach nothing else on this machine.
 YOU MAY NOT PUBLISH. THIS IS ABSOLUTE.
 You have no shell, no git, no gh and no network tool, so there is nothing to
 run — and nothing you write can become a commit, a branch, a remote, a pull
-request or a merge. Leave two files on disk; that is the whole job.
+request or a merge. Leave only the bounded submission inputs and private state
+listed below; that is the whole job.
 
 A controller — code, not a model — reads what you leave behind, checks it
-against the submission protocol deterministically, copies the two files into a
-clone you never see, and only then creates the branch, the commit, the pull
-request and the merge.
+against the submission protocol deterministically, turns the two submission
+inputs into the two publishable files inside a clone you never see, and only
+then creates the branch, the commit, the pull request and the merge.
+{controller_action}
 
 WHAT TO LEAVE BEHIND — THREE FILES, IN PATHS THAT ALREADY EXIST
 You cannot create directories: you have file tools and no shell, and that is
@@ -1050,8 +1684,7 @@ create any directory, and do not leave anything else behind: a stray file, a
 draft, or a hidden file like .probe fails the whole cycle.
 
 The controller validates that directory, reads your slug from meta.json,
-copies exactly those two files into its own private clone, and refuses
-everything else.
+accepts exactly those two submission inputs, and refuses everything else.
 
 meta.json:
 {{
@@ -1105,9 +1738,7 @@ you actually build. {round_one}
 {previous_slug}. Those two values are how the controller proves this cycle
 continues the last one rather than restarting the count.
 
-If your piece is an SVG it must parse as XML and contain no <script>, no
-on* event attributes, and no external references — fragment (#id) references
-only. Everything must be self-contained.
+{format_rules}
 
 {workspace}/state-out.json (private, never published):
 {{
@@ -1162,22 +1793,41 @@ def build_prompt(cfg, wcfg, slug, workspace, expected_cycle,
         round_one = ("Round 1 is yours to populate; every round needs exactly "
                      f"{CANDIDATES_PER_ROUND} candidates.")
     kinds = allowed_kinds(wcfg)
-    azure_cfg = azure_image_config(wcfg)
-    if azure_cfg["enabled"] and kinds == ("png",):
+    profile_snapshot = publication_profile_snapshot(wcfg)
+    if profile_snapshot:
         piece_instruction = (
             f"{workspace}/out/submission/piece.prompt  a detailed 1-4000 "
-            "character visual-generation brief; the controller replaces it "
-            "with the reviewed piece.png"
+            "character visual image brief; this is the ONLY piece file you "
+            "write, and the controller replaces it with reviewed pixels"
         )
         azure_instruction = (
-            'For PNG output, meta.json MUST include "_image_prompt" and its '
+            f'This is the {AZURE_REVIEWED_PNG_PROFILE} profile. Every candidate, '
+            "critique, round winner, and final premise MUST be a visual image "
+            "concept whose meaning is carried by pixels. There is no SVG, "
+            "markdown, text, JSON, code, interactive, or nonvisual fallback. "
+            'meta.json MUST include "_image_prompt" and its '
             "value MUST exactly match piece.prompt. Describe the composition, "
             "medium, palette, lighting, focal hierarchy, texture, and what to "
             "avoid. Do not put labels or prose into the image unless the concept "
             "requires a small amount of intentional, correctly spelled text. "
             "Azure generates the pixels and an independent multimodal Copilot "
             "judge sees the actual image; failed images are regenerated or the "
-            "cycle is rejected."
+            "cycle is rejected. NEVER write piece.png yourself and NEVER add "
+            '"_image_generation" to meta.json; those bytes and that receipt are '
+            "created only by the trusted controller."
+        )
+        controller_action = (
+            "For this profile the controller does not copy your piece.prompt "
+            "into the repository. It validates the brief, generates a PNG with "
+            "Azure, validates the complete PNG structure and pixels, obtains an "
+            "approved multimodal review, then writes a digest-bound receipt. "
+            "Only that reviewed PNG can reach publication."
+        )
+        format_rules = (
+            "Your output is a visual concept brief, not an image file. Write "
+            "meta.json, piece.prompt, and state-out.json only. Direct PNG, SVG, "
+            "markdown, text, or JSON piece files fail the cycle; generation or "
+            "review failure has no fallback."
         )
     else:
         piece_instruction = (
@@ -1187,6 +1837,12 @@ def build_prompt(cfg, wcfg, slug, workspace, expected_cycle,
             f"{int(wcfg['max_piece_bytes']) // 1024} KB"
         )
         azure_instruction = ""
+        controller_action = ""
+        format_rules = (
+            "If your piece is an SVG it must parse as XML and contain no "
+            "<script>, no on* event attributes, and no external references — "
+            "fragment (#id) references only. Everything must be self-contained."
+        )
     return WORKER_SITUATION.format(
         instance_name=sentinel.instance_name(cfg),
         slug=slug,
@@ -1202,6 +1858,8 @@ def build_prompt(cfg, wcfg, slug, workspace, expected_cycle,
         max_piece_kb=int(wcfg["max_piece_bytes"]) // 1024,
         piece_instruction=piece_instruction,
         azure_instruction=azure_instruction,
+        controller_action=controller_action,
+        format_rules=format_rules,
         allowed_kind_union="|".join(allowed_kinds(wcfg)),
         schema=SUBMISSION_SCHEMA,
         contributor=wcfg.get("contributor") or _repo_owner(wcfg["repo"]),
@@ -1983,13 +2641,232 @@ def _check_svg(raw, text):
 
 
 def _check_png(raw):
-    if not raw.startswith(azure_art.PNG_SIGNATURE):
+    """Parse and inflate the complete supported PNG, rejecting ambiguity."""
+    if not isinstance(raw, bytes) or not raw.startswith(azure_art.PNG_SIGNATURE):
         raise GateError("png has an invalid signature")
-    if len(raw) < 33 or raw[12:16] != b"IHDR":
+    offset = len(azure_art.PNG_SIGNATURE)
+    chunks = 0
+    ihdr = None
+    idat = []
+    seen_idat = False
+    idat_closed = False
+    seen_iend = False
+    seen_plte = False
+
+    while offset < len(raw):
+        chunks += 1
+        if chunks > PNG_MAX_CHUNKS:
+            raise GateError(f"png has more than {PNG_MAX_CHUNKS} chunks")
+        if len(raw) - offset < 12:
+            raise GateError("png has a truncated chunk frame")
+        length = struct.unpack(">I", raw[offset:offset + 4])[0]
+        if length > PNG_MAX_CHUNK_BYTES:
+            raise GateError(
+                f"png chunk length {length} exceeds {PNG_MAX_CHUNK_BYTES}")
+        chunk_type = raw[offset + 4:offset + 8]
+        if (len(chunk_type) != 4
+                or any(not (65 <= byte <= 90 or 97 <= byte <= 122)
+                       for byte in chunk_type)
+                or not 65 <= chunk_type[2] <= 90):
+            raise GateError("png has an invalid chunk type")
+        data_start = offset + 8
+        data_end = data_start + length
+        frame_end = data_end + 4
+        if data_end < data_start or frame_end > len(raw):
+            raise GateError(
+                f"png chunk {chunk_type.decode('ascii')} is truncated")
+        data = raw[data_start:data_end]
+        expected_crc = struct.unpack(">I", raw[data_end:frame_end])[0]
+        actual_crc = zlib.crc32(chunk_type)
+        actual_crc = zlib.crc32(data, actual_crc) & 0xFFFFFFFF
+        if expected_crc != actual_crc:
+            raise GateError(
+                f"png chunk {chunk_type.decode('ascii')} has an invalid CRC")
+
+        if chunks == 1:
+            if chunk_type != b"IHDR" or length != 13:
+                raise GateError("png IHDR must be the first chunk with length 13")
+        elif chunk_type == b"IHDR":
+            raise GateError("png contains more than one IHDR")
+
+        if chunk_type == b"IHDR":
+            if ihdr is not None or length != 13:
+                raise GateError("png has an invalid IHDR")
+            width, height, bit_depth, color_type, compression, filtering, interlace = (
+                struct.unpack(">IIBBBBB", data))
+            if (width < PNG_MIN_DIMENSION or height < PNG_MIN_DIMENSION
+                    or width > PNG_MAX_DIMENSION or height > PNG_MAX_DIMENSION):
+                raise GateError(
+                    f"png dimensions {width}x{height} are outside "
+                    f"{PNG_MIN_DIMENSION}-{PNG_MAX_DIMENSION}")
+            if width * height > PNG_MAX_PIXELS:
+                raise GateError(
+                    f"png has {width * height} pixels, over the "
+                    f"{PNG_MAX_PIXELS} pixel cap")
+            if bit_depth != 8 or color_type not in (2, 6):
+                raise GateError(
+                    "png must be 8-bit RGB or RGBA")
+            if compression != 0 or filtering != 0 or interlace != 0:
+                raise GateError(
+                    "png must use standard compression/filtering and be "
+                    "non-interlaced")
+            ihdr = {
+                "width": width,
+                "height": height,
+                "bit_depth": bit_depth,
+                "color_type": color_type,
+                "channels": 3 if color_type == 2 else 4,
+            }
+        elif chunk_type == b"PLTE":
+            if (seen_plte or seen_idat or not 3 <= length <= 768
+                    or length % 3):
+                raise GateError("png has an invalid PLTE")
+            seen_plte = True
+        elif chunk_type == b"IDAT":
+            if ihdr is None:
+                raise GateError("png IDAT appears before IHDR")
+            if idat_closed:
+                raise GateError("png IDAT chunks are not consecutive")
+            seen_idat = True
+            idat.append(data)
+        elif chunk_type == b"IEND":
+            if length != 0:
+                raise GateError("png IEND must have zero length")
+            if not seen_idat:
+                raise GateError("png has no IDAT")
+            seen_iend = True
+            offset = frame_end
+            if offset != len(raw):
+                raise GateError("png has trailing bytes after IEND")
+            break
+        else:
+            if seen_idat:
+                idat_closed = True
+            if 65 <= chunk_type[0] <= 90:
+                raise GateError(
+                    f"png has unsupported critical chunk "
+                    f"{chunk_type.decode('ascii')}")
+        offset = frame_end
+
+    if ihdr is None:
         raise GateError("png has no valid IHDR")
-    width, height = struct.unpack(">II", raw[16:24])
-    if width < 512 or height < 512 or width > 4096 or height > 4096:
-        raise GateError(f"png dimensions {width}x{height} are outside 512-4096")
+    if not seen_iend:
+        raise GateError("png has no final IEND")
+    compressed = b"".join(idat)
+    if not compressed:
+        raise GateError("png IDAT payload is empty")
+    stride = 1 + ihdr["width"] * ihdr["channels"]
+    expected_size = stride * ihdr["height"]
+    inflater = zlib.decompressobj()
+    try:
+        pixels = inflater.decompress(compressed, expected_size + 1)
+        if inflater.unconsumed_tail or len(pixels) > expected_size:
+            raise GateError("png decompressed data exceeds its IHDR dimensions")
+        pixels += inflater.flush(expected_size - len(pixels) + 1)
+    except zlib.error as exc:
+        raise GateError(f"png IDAT zlib stream is invalid: {exc}") from exc
+    if (not inflater.eof or inflater.unused_data or inflater.unconsumed_tail):
+        raise GateError("png IDAT does not contain exactly one complete zlib stream")
+    if len(pixels) != expected_size:
+        raise GateError(
+            f"png decompressed to {len(pixels)} bytes, expected {expected_size}")
+    if any(pixels[row * stride] > 4 for row in range(ihdr["height"])):
+        raise GateError("png scanline has an invalid filter type")
+    return ihdr
+
+
+def validate_image_generation_receipt(meta, image_bytes, profile_snapshot):
+    """Bind controller review evidence to exact PNG bytes and profile policy."""
+    snapshot = validate_profile_snapshot(profile_snapshot)
+    image_info = _check_png(image_bytes)
+    contract = validate_reviewed_submission_contract(meta)
+    subject = contract["slug"]
+    receipt = meta.get("_image_generation") if isinstance(meta, dict) else None
+    expected_receipt = {
+        "schema", "profile", "provider", "deployment", "attempts",
+        "image_sha256", "image", "review",
+    }
+    if not isinstance(receipt, dict) or set(receipt) != expected_receipt:
+        raise GateError("reviewed PNG has a missing or malformed generation receipt")
+    if receipt.get("schema") != IMAGE_GENERATION_SCHEMA:
+        raise GateError("reviewed PNG receipt has the wrong schema")
+    if receipt.get("profile") != snapshot["profile"]:
+        raise GateError("reviewed PNG receipt has the wrong profile")
+    if receipt.get("provider") != snapshot["provider"]:
+        raise GateError("reviewed PNG receipt has the wrong provider")
+    deployment = _bounded_receipt_text(
+        receipt.get("deployment"),
+        subject,
+        "_image_generation.deployment",
+        IMAGE_MAX_IDENTIFIER_CHARS,
+        identifier=True,
+    )
+    if deployment not in snapshot["deployments"]:
+        raise GateError("reviewed PNG receipt names an unconfigured deployment")
+    attempts = receipt.get("attempts")
+    if (isinstance(attempts, bool) or not isinstance(attempts, int)
+            or not 1 <= attempts <= snapshot["max_attempts"]):
+        raise GateError("reviewed PNG receipt has invalid attempts")
+    digest = hashlib.sha256(image_bytes).hexdigest()
+    if (not isinstance(receipt.get("image_sha256"), str)
+            or receipt.get("image_sha256") != digest):
+        raise GateError("reviewed PNG receipt digest does not match piece.png")
+    dimensions = receipt.get("image")
+    if (not isinstance(dimensions, dict)
+            or set(dimensions) != {"width", "height"}
+            or isinstance(dimensions.get("width"), bool)
+            or not isinstance(dimensions.get("width"), int)
+            or isinstance(dimensions.get("height"), bool)
+            or not isinstance(dimensions.get("height"), int)
+            or dimensions.get("width") != image_info["width"]
+            or dimensions.get("height") != image_info["height"]):
+        raise GateError("reviewed PNG receipt dimensions do not match IHDR")
+    review = receipt.get("review")
+    expected_review = {
+        "schema", "model", "publish", "score", "minimum_score",
+        "failures", "strengths",
+    }
+    if not isinstance(review, dict) or set(review) != expected_review:
+        raise GateError("reviewed PNG receipt has a malformed review")
+    if review.get("schema") != snapshot["review_schema"]:
+        raise GateError("reviewed PNG receipt has the wrong review schema")
+    model = _bounded_receipt_text(
+        review.get("model"),
+        subject,
+        "_image_generation.review.model",
+        IMAGE_MAX_IDENTIFIER_CHARS,
+        identifier=True,
+    )
+    if model != snapshot["review_model"]:
+        raise GateError("reviewed PNG receipt has the wrong review model")
+    if review.get("publish") is not True:
+        raise GateError("reviewed PNG receipt is not approved for publication")
+    score = review.get("score")
+    if (isinstance(score, bool) or not isinstance(score, int)
+            or not 0 <= score <= 10):
+        raise GateError("reviewed PNG receipt has an invalid score")
+    minimum_score = review.get("minimum_score")
+    if (isinstance(minimum_score, bool)
+            or not isinstance(minimum_score, int)
+            or minimum_score != snapshot["minimum_review_score"]):
+        raise GateError("reviewed PNG receipt captured the wrong minimum score")
+    if score < snapshot["minimum_review_score"]:
+        raise GateError("reviewed PNG receipt score is below the captured minimum")
+    if review.get("failures") != []:
+        raise GateError("reviewed PNG receipt still contains review failures")
+    strengths = review.get("strengths")
+    if (not isinstance(strengths, list)
+            or len(strengths) > IMAGE_MAX_STRENGTHS):
+        raise GateError("reviewed PNG receipt strengths are not bounded")
+    for index, strength in enumerate(strengths):
+        _bounded_receipt_text(
+            strength,
+            subject,
+            f"_image_generation.review.strengths[{index}]",
+            IMAGE_MAX_STRENGTH_CHARS,
+        )
+    _reject_credential_material(meta, subject)
+    return image_info
 
 
 def _check_piece(path, kind, max_bytes):
@@ -2379,7 +3256,7 @@ def staging_manifest(staging):
     return baseline
 
 
-def verify_staging_tree(staging, baseline, wcfg=None):
+def verify_staging_tree(staging, baseline, wcfg=None, profile_snapshot=None):
     """The WHOLE staging tree, not just the corner the submission lives in.
 
     The gate used to read out/, state-out.json and .git and call it done — so
@@ -2391,10 +3268,16 @@ def verify_staging_tree(staging, baseline, wcfg=None):
     Returns the piece filename. Raises GateError on the first difference.
     """
     staging = Path(staging)
+    snapshot = (validate_profile_snapshot(profile_snapshot)
+                if profile_snapshot is not None
+                else publication_profile_snapshot(wcfg or {}))
     allowed_new = {STATE_OUT_NAME, f"out/{SUBMISSION_DIR}/{META_NAME}"}
-    piece_names = {f"out/{SUBMISSION_DIR}/piece{ext}"
-                   for ext in KIND_EXTENSIONS.values()}
-    piece_names.add(f"out/{SUBMISSION_DIR}/piece.prompt")
+    if snapshot:
+        piece_names = {f"out/{SUBMISSION_DIR}/piece.prompt"}
+    else:
+        piece_names = {f"out/{SUBMISSION_DIR}/piece{ext}"
+                       for ext in KIND_EXTENSIONS.values()}
+        piece_names.add(f"out/{SUBMISSION_DIR}/piece.prompt")
     current = _scan_staging(staging)
 
     for rel, before in sorted(baseline.items()):
@@ -2432,11 +3315,23 @@ def verify_staging_tree(staging, baseline, wcfg=None):
                         f"out/{SUBMISSION_DIR}/piece.<ext>, {STATE_OUT_NAME})")
     if len(pieces) > 1:
         raise GateError(f"more than one piece: {', '.join(pieces)}")
+    if snapshot:
+        required = {
+            STATE_OUT_NAME,
+            f"out/{SUBMISSION_DIR}/{META_NAME}",
+            f"out/{SUBMISSION_DIR}/piece.prompt",
+        }
+        if set(new_paths) != required:
+            raise GateError(
+                f"{AZURE_REVIEWED_PNG_PROFILE} maker output must be exactly "
+                "meta.json + piece.prompt + state-out.json; direct piece.png, "
+                "SVG, markdown, text, and JSON pieces are forbidden")
     return Path(pieces[0]).name if pieces else ""
 
 
 def gate_directory(root, wcfg, expected_cycle, expected_previous,
-                   expected_round1=None, known_slugs=()):
+                   expected_round1=None, known_slugs=(),
+                   profile_snapshot=None):
     """Validate the fixed output directory. No git anywhere near it.
 
     `root` is `<staging>/out`, whose only child is the precreated
@@ -2445,6 +3340,9 @@ def gate_directory(root, wcfg, expected_cycle, expected_previous,
     and the controller materialises the gated bytes under that slug in its own
     clone. Returns the submission record INCLUDING the validated bytes.
     """
+    snapshot = (validate_profile_snapshot(profile_snapshot)
+                if profile_snapshot is not None
+                else publication_profile_snapshot(wcfg))
     root = Path(root)
     if not root.is_dir():
         raise GateError("no staging output directory exists")
@@ -2497,10 +3395,7 @@ def gate_directory(root, wcfg, expected_cycle, expected_previous,
         raise GateError(f"meta.schema is {meta['schema']!r}, expected "
                         f"{SUBMISSION_SCHEMA!r}")
 
-    slug = meta.get("slug")
-    if not isinstance(slug, str) or not SLUG_RE.match(slug) or len(slug) > SLUG_MAX:
-        raise GateError(f"meta.slug {slug!r} is not lowercase-alphanumeric-hyphen "
-                        f"within {SLUG_MAX} characters")
+    slug = _submission_slug(meta.get("slug"))
     if slug in set(known_slugs):
         raise GateError(f"slug {slug!r} already exists on the base branch")
 
@@ -2537,10 +3432,21 @@ def gate_directory(root, wcfg, expected_cycle, expected_previous,
 
     piece_bytes = _check_piece(piece_path, kind,
                               int(wcfg.get("max_piece_bytes", 51200)))
+    image_info = None
+    if snapshot:
+        if kind != "png":
+            raise GateError(
+                f"{AZURE_REVIEWED_PNG_PROFILE} accepts only piece.png")
+        validate_reviewed_submission_contract(meta, expected_slug=slug)
+        image_info = validate_image_generation_receipt(
+            meta, piece_bytes, snapshot)
+    elif kind == "png":
+        raise GateError(
+            "PNG requires the azure-reviewed-png publication profile")
     validate_dada_cycle(meta.get("_dada_cycle"), slug, expected_cycle,
                         expected_previous, expected_round1)
 
-    return {
+    submission = {
         "slug": slug,
         "title": meta["title"],
         "kind": kind,
@@ -2552,6 +3458,12 @@ def gate_directory(root, wcfg, expected_cycle, expected_previous,
         "meta_sha256": hashlib.sha256(meta_bytes).hexdigest(),
         "piece_sha256": hashlib.sha256(piece_bytes).hexdigest(),
     }
+    if image_info:
+        submission["image"] = {
+            "width": image_info["width"],
+            "height": image_info["height"],
+        }
+    return submission
 
 
 def base_branch_slugs(clone, base_branch, wcfg, ctx=None):
@@ -2781,16 +3693,511 @@ def verify_staged_tree(clone, submission, wcfg, paths, ctx=None):
     return {path: blob for _, blob, _, path in staged}
 
 
+def verify_staged_worktree_scope(clone, submission, wcfg, paths, ctx=None):
+    """Require the validator's working tree to match the staged candidate."""
+    ctx = ctx or controller_for(wcfg)
+    git_t = int(wcfg.get("git_timeout_s", 600))
+    changes = working_tree_changes(clone, timeout=git_t, ctx=ctx)
+    actual = []
+    for code, path, origin in changes:
+        if code != "A " or origin is not None:
+            raise GateError(
+                f"the staged validator tree has an unexpected change: "
+                f"{code} {path}"
+                + (f" (from {origin})" if origin else "")
+            )
+        actual.append(path)
+    if sorted(actual) != paths:
+        raise GateError(
+            f"the staged validator tree holds {sorted(actual)}, expected "
+            f"exactly {paths}"
+        )
+    for rel, digest in (
+        (submission["meta_path"], submission["meta_sha256"]),
+        (submission["piece_path"], submission["piece_sha256"]),
+    ):
+        path = Path(clone) / rel
+        _regular_file(path, rel)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+            raise GateError(
+                f"{rel} in the validator working tree is not the file "
+                "that passed the gate"
+            )
+
+
+def validate_staged_collective_candidate(clone, wcfg, ctx=None):
+    """Run canonical target-main validation against the staged working tree."""
+    ctx = ctx or controller_for(wcfg)
+    clone = Path(clone)
+    base = wcfg.get("base_branch", "main")
+    git_t = int(wcfg.get("git_timeout_s", 600))
+    validator = clone / COLLECTIVE_VALIDATOR_PATH
+    listing = [
+        line for line in _git(
+            clone,
+            "ls-tree",
+            f"origin/{base}",
+            "--",
+            COLLECTIVE_VALIDATOR_PATH,
+            timeout=git_t,
+            ctx=ctx,
+        ).splitlines()
+        if line.strip()
+    ]
+    if len(listing) != 1:
+        raise GateError(
+            f"canonical origin/{base} is missing "
+            f"{COLLECTIVE_VALIDATOR_PATH}"
+        )
+    info, separator, path = listing[0].partition("\t")
+    fields = info.split()
+    if (
+        not separator
+        or path != COLLECTIVE_VALIDATOR_PATH
+        or len(fields) != 3
+        or fields[0] != "100644"
+        or fields[1] != "blob"
+    ):
+        raise GateError(
+            f"canonical origin/{base} has an unsafe "
+            f"{COLLECTIVE_VALIDATOR_PATH}"
+        )
+    _regular_file(validator, COLLECTIVE_VALIDATOR_PATH)
+    trusted = _git_bytes(
+        clone, "cat-file", "blob", fields[2], timeout=git_t, ctx=ctx
+    )
+    if validator.read_bytes() != trusted:
+        raise GateError(
+            f"{COLLECTIVE_VALIDATOR_PATH} does not match canonical "
+            f"origin/{base}"
+        )
+    try:
+        result = subprocess.run(
+            [sys.executable, str(validator), "--validate"],
+            cwd=str(clone),
+            env=ctx.git_env,
+            capture_output=True,
+            text=True,
+            timeout=COLLECTIVE_VALIDATOR_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise GateError(
+            "canonical Public Art Collective validation timed out after "
+            f"{COLLECTIVE_VALIDATOR_TIMEOUT_S}s"
+        ) from exc
+    except OSError as exc:
+        raise GateError(
+            f"canonical Public Art Collective validator could not run: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[:600]
+        raise GateError(
+            "canonical Public Art Collective validation rejected the staged "
+            f"candidate (exit {result.returncode})"
+            + (f": {detail}" if detail else "")
+        )
+    return (result.stdout or "").strip()
+
+
+def _requires_collective_provenance(profile_snapshot):
+    return bool(
+        isinstance(profile_snapshot, dict)
+        and profile_snapshot.get("profile") == AZURE_REVIEWED_PNG_PROFILE
+    )
+
+
+def _provenance_poll_settings(wcfg):
+    """Reuse the bounded, operator-configured publication probe cadence."""
+    try:
+        attempts = int(wcfg.get("view_probe_attempts", 5))
+    except (TypeError, ValueError) as exc:
+        raise GateError("view_probe_attempts must be an integer") from exc
+    if not 1 <= attempts <= 12:
+        raise GateError("view_probe_attempts must be between 1 and 12")
+    raw_backoff = wcfg.get("view_probe_backoff") or (5, 10, 20, 30)
+    if not isinstance(raw_backoff, (list, tuple)) or not raw_backoff:
+        raise GateError("view_probe_backoff must be a non-empty array")
+    try:
+        backoff = [float(value) for value in raw_backoff]
+    except (TypeError, ValueError) as exc:
+        raise GateError("view_probe_backoff must contain numbers") from exc
+    if any(value < 0 or value > 300 for value in backoff):
+        raise GateError(
+            "view_probe_backoff values must be between 0 and 300 seconds")
+    return attempts, backoff
+
+
+def _provenance_first_seen(value):
+    if not isinstance(value, str) or not value:
+        raise GateError("provenance check has no durable first-seen timestamp")
+    try:
+        stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise GateError(
+            "provenance check has an invalid durable first-seen timestamp") from exc
+    if stamp.tzinfo is None:
+        raise GateError(
+            "provenance check first-seen timestamp must include a timezone")
+    return stamp
+
+
+def _provenance_grace_expired(first_seen, wcfg):
+    try:
+        grace = int(wcfg.get("provenance_absent_grace_s", 300))
+    except (TypeError, ValueError) as exc:
+        raise GateError("provenance_absent_grace_s must be an integer") from exc
+    if not 0 <= grace <= 3600:
+        raise GateError(
+            "provenance_absent_grace_s must be between 0 and 3600 seconds")
+    elapsed = (sentinel.now() - _provenance_first_seen(first_seen)).total_seconds()
+    # A future clock must not grant an unlimited grace period.
+    if elapsed < -60:
+        raise GateError("provenance check first-seen timestamp is in the future")
+    return elapsed >= grace
+
+
+def _provenance_absence_expired(first_seen, wcfg):
+    return _provenance_grace_expired(first_seen, wcfg)
+
+
+def _is_exact_collective_provenance_check(check):
+    if check.get("__typename") not in (None, "CheckRun"):
+        return False
+    if check.get("name") != COLLECTIVE_PROVENANCE_CHECK:
+        return False
+    for field in ("workflowName", "workflow"):
+        if (field in check
+                and check[field] != COLLECTIVE_PROVENANCE_WORKFLOW):
+            return False
+    return True
+
+
+def _collective_pr_rollup(pr_number, wcfg, ctx=None):
+    """Read the PR and its rollup through an exit-zero gh command."""
+    ctx = ctx or controller_for(wcfg)
+    repo = ctx.gh_repo()
+    gh_t = int(wcfg.get("gh_timeout_s", 300))
+    try:
+        raw = _gh(
+            "pr", "view", str(pr_number), "--repo", repo,
+            "--json", PROVENANCE_ROLLUP_JSON_FIELDS,
+            timeout=gh_t, ctx=ctx)
+        value = json.loads(raw)
+    except (CommandError, subprocess.TimeoutExpired, json.JSONDecodeError,
+            TypeError, ValueError) as exc:
+        raise CommandError(
+            f"could not inspect {COLLECTIVE_PROVENANCE_FULL_NAME}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise CommandError("gh pr view returned a non-object rollup")
+    checks = value.get("statusCheckRollup")
+    if not isinstance(checks, list):
+        raise CommandError(
+            "gh pr view returned no statusCheckRollup array")
+    return value
+
+
+def _classify_collective_provenance_rollup(value):
+    """Classify only Collective's exact protected provenance CheckRun."""
+    checks = value["statusCheckRollup"]
+    matches = []
+    for check in checks:
+        if not isinstance(check, dict):
+            raise CommandError(
+                "gh pr view returned a non-object status check")
+        if _is_exact_collective_provenance_check(check):
+            status = check.get("status")
+            conclusion = check.get("conclusion")
+            if not isinstance(status, str) or not status.strip():
+                raise CommandError(
+                    "exact provenance CheckRun returned no usable status")
+            status = status.strip().upper()
+            if conclusion is not None and not isinstance(conclusion, str):
+                raise CommandError(
+                    "exact provenance CheckRun returned a non-string conclusion")
+            conclusion = (
+                conclusion.strip().upper()
+                if isinstance(conclusion, str) and conclusion.strip() else "")
+            if status in PROVENANCE_PENDING_STATUSES:
+                if conclusion:
+                    raise CommandError(
+                        "pending provenance CheckRun returned a conclusion")
+                classification = "pending"
+            elif status == "COMPLETED":
+                if conclusion == "SUCCESS":
+                    classification = "success"
+                elif conclusion == "CANCELLED":
+                    classification = "cancelled"
+                elif conclusion in PROVENANCE_FAILURE_CONCLUSIONS:
+                    classification = "failure"
+                elif not conclusion:
+                    raise CommandError(
+                        "completed provenance CheckRun returned no conclusion")
+                else:
+                    raise CommandError(
+                        "completed provenance CheckRun returned unknown "
+                        f"conclusion {conclusion!r}")
+            else:
+                raise CommandError(
+                    "exact provenance CheckRun returned unknown status "
+                    f"{status!r}")
+            matches.append({
+                "status": status,
+                "conclusion": conclusion,
+                "classification": classification,
+            })
+    if not matches:
+        return {
+            "classification": "absent",
+            "present": False,
+            "states": [],
+            "detail": f"{COLLECTIVE_PROVENANCE_FULL_NAME} is absent",
+            "pull_request": value,
+        }
+    classifications = {match["classification"] for match in matches}
+    if "failure" in classifications:
+        classification = "failure"
+    elif "pending" in classifications:
+        # cancel-in-progress can briefly expose both the cancelled old run and
+        # its queued replacement. The replacement is actionable, not failure.
+        classification = "pending"
+    elif "success" in classifications:
+        classification = "success"
+    else:
+        classification = "cancelled"
+    states = [
+        f"{match['status']}/{match['conclusion'] or '-'}"
+        for match in matches
+    ]
+    return {
+        "classification": classification,
+        "present": True,
+        "states": states,
+        "detail": (
+            f"{COLLECTIVE_PROVENANCE_FULL_NAME}: "
+            + ", ".join(states)
+        ),
+        "pull_request": value,
+    }
+
+
+def collective_provenance_check_state(pr_number, wcfg, ctx=None):
+    """Read and classify only Collective's exact protected provenance check.
+
+    `gh pr view --json statusCheckRollup,...` exits zero while checks are
+    pending or failed. CheckRun entries use `name`, `workflowName`, `status`,
+    and `conclusion`; StatusContext entries are unrelated and ignored. A
+    similarly named check can never turn an absent required check into success.
+    """
+    return _classify_collective_provenance_rollup(
+        _collective_pr_rollup(pr_number, wcfg, ctx))
+
+
+def wait_for_collective_provenance(pr_number, wcfg, first_seen, transaction,
+                                   ctx=None, sleep=None,
+                                   cancelled_first_seen=None):
+    """Poll the exact required check without silently converting absence to OK."""
+    attempts, backoff = _provenance_poll_settings(wcfg)
+    sleep = sleep or time.sleep
+    for attempt in range(attempts):
+        try:
+            result = collective_provenance_check_state(pr_number, wcfg, ctx)
+        except (CommandError, subprocess.TimeoutExpired, json.JSONDecodeError,
+                TypeError, ValueError) as exc:
+            detail = (
+                f"provenance check inspection failed: "
+                f"{type(exc).__name__}: {str(exc)[:300]}")
+            transaction(
+                phase="checks-pending",
+                provenance_check_state="error",
+                provenance_check_detail=detail,
+                provenance_first_seen_at=first_seen,
+            )
+            raise ChecksPending(detail) from exc
+        classification = result["classification"]
+        if classification == "cancelled":
+            cancelled_first_seen = (
+                cancelled_first_seen
+                or sentinel.now().isoformat(timespec="seconds")
+            )
+        elif classification != "absent":
+            cancelled_first_seen = ""
+        transaction(
+            phase="checks-pending",
+            provenance_check_state=classification,
+            provenance_check_detail=result["detail"][:400],
+            provenance_check_states=result["states"],
+            provenance_first_seen_at=first_seen,
+            provenance_cancelled_first_seen_at=cancelled_first_seen,
+        )
+        if classification == "success":
+            return result
+        if classification == "failure":
+            raise ProvenanceCheckFailed(
+                f"required provenance check failed: {result['detail']}")
+        if (classification == "cancelled"
+                and _provenance_grace_expired(
+                    cancelled_first_seen, wcfg)):
+            raise ProvenanceCheckFailed(
+                f"required provenance check remained cancelled beyond its "
+                f"bounded replacement grace period: {result['detail']}")
+        absence_first_seen = cancelled_first_seen or first_seen
+        if (classification == "absent"
+                and _provenance_absence_expired(
+                    absence_first_seen, wcfg)):
+            raise ProvenanceCheckFailed(
+                f"required provenance check never appeared within its "
+                f"bounded grace period: {result['detail']}")
+        if attempt + 1 < attempts:
+            sleep(backoff[min(attempt, len(backoff) - 1)])
+    raise ChecksPending(
+        f"required provenance check is still pending after {attempts} "
+        f"bounded inspection(s)")
+
+
+def collective_merge_readiness(pr_number, wcfg, ctx=None):
+    """Re-read the PR merge gate after the provenance check has succeeded."""
+    try:
+        value = _collective_pr_rollup(pr_number, wcfg, ctx)
+    except CommandError as exc:
+        raise ChecksPending(
+            f"could not inspect required PR merge state: "
+            f"{type(exc).__name__}: {str(exc)[:300]}") from exc
+    state = str(value.get("state") or "").upper()
+    merge_state = str(value.get("mergeStateStatus") or "").upper()
+    if state == "MERGED":
+        return "merged"
+    if state != "OPEN":
+        raise ProvenanceCheckFailed(
+            f"PR {pr_number} is {state or 'missing-state'}, not an open "
+            "merge candidate")
+    fresh_provenance = _classify_collective_provenance_rollup(value)
+    if fresh_provenance["classification"] == "failure":
+        raise ProvenanceCheckFailed(
+            "required provenance check failed in the fresh merge rollup: "
+            f"{fresh_provenance['detail']}")
+    if fresh_provenance["classification"] != "success":
+        raise ChecksPending(
+            "required provenance check changed before merge readiness: "
+            f"{fresh_provenance['detail']}")
+    if merge_state in (
+            "", "UNKNOWN", "UNSTABLE", "BLOCKED", "BEHIND"):
+        raise ChecksPending(
+            f"PR {pr_number} merge state is still pending "
+            f"(mergeStateStatus={merge_state or 'missing'})")
+    if merge_state != "CLEAN":
+        raise ProvenanceCheckFailed(
+            f"PR {pr_number} is not eligible for the required merge "
+            f"(mergeStateStatus={merge_state or 'missing'})")
+    return "ready"
+
+
+def verify_collective_pr_scope(pr_number, branch, paths, wcfg, ctx=None):
+    """Re-read GitHub's PR file scope before a resumed protected merge."""
+    if (not isinstance(branch, str) or not branch
+            or not paths or any(not isinstance(path, str) or not path
+                                for path in paths)):
+        raise GateError("protected PR lacks a durable branch or exact file scope")
+    ctx = ctx or controller_for(wcfg)
+    repo = ctx.gh_repo()
+    base = wcfg.get("base_branch", "main")
+    gh_t = int(wcfg.get("gh_timeout_s", 300))
+    try:
+        raw = _gh(
+            "pr", "view", str(pr_number), "--repo", repo, "--json",
+            "files,state,baseRefName,headRefName,isCrossRepository",
+            timeout=gh_t, ctx=ctx)
+        view = json.loads(raw)
+    except (CommandError, subprocess.TimeoutExpired, json.JSONDecodeError,
+            TypeError, ValueError) as exc:
+        raise ChecksPending(
+            f"could not re-read protected PR file scope: "
+            f"{type(exc).__name__}: {str(exc)[:300]}") from exc
+    if not isinstance(view, dict):
+        raise ChecksPending("protected PR scope inspection returned a non-object")
+    state = str(view.get("state") or "").upper()
+    if state == "MERGED":
+        return "merged"
+    if state != "OPEN":
+        raise ProvenanceCheckFailed(
+            f"protected PR {pr_number} is {state or 'missing-state'}")
+    files = view.get("files")
+    if not isinstance(files, list):
+        raise ChecksPending("protected PR scope inspection returned no file list")
+    remote_paths = sorted(
+        item.get("path") for item in files if isinstance(item, dict))
+    if len(remote_paths) != len(files) or remote_paths != sorted(paths):
+        raise ProvenanceCheckFailed(
+            f"protected PR touches {remote_paths}, expected {sorted(paths)}")
+    if any(int(item.get("deletions") or 0)
+           for item in files if isinstance(item, dict)):
+        raise ProvenanceCheckFailed(
+            "protected PR deletes lines from an existing file")
+    if view.get("baseRefName") != base or view.get("headRefName") != branch:
+        raise ProvenanceCheckFailed(
+            "protected PR branch or base conflicts with its durable transaction")
+    return "open"
+
+
+def _merge_collective_pr(clone, submission, wcfg, pr_number, paths, note,
+                         branch="", commit="", pr_url="", ctx=None):
+    """Invoke the canonical merge once; every later error is ambiguous."""
+    ctx = ctx or controller_for(wcfg)
+    repo = ctx.gh_repo()
+    gh_t = int(wcfg.get("gh_timeout_s", 300))
+    try:
+        _gh("pr", "merge", str(pr_number), "--repo", repo, "--squash",
+            "--delete-branch", timeout=gh_t, ctx=ctx)
+        note(phase="merge-called", pr_number=str(pr_number))
+        receipts = confirm_merge(
+            clone, submission, wcfg, pr_number, paths, ctx)
+        receipts.update({
+            "branch": branch,
+            "commit": commit,
+            "pr_url": pr_url,
+            "pr_number": str(pr_number),
+        })
+        note(phase="merged", **receipts)
+        return receipts
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {str(exc)[:300]}"
+        try:
+            note(phase="merge-ambiguous", last_merge_error=detail)
+        except Exception as note_error:
+            log("could not persist merge-ambiguous phase: "
+                f"{type(note_error).__name__}: {note_error}")
+        raise MergeAmbiguous(
+            f"canonical merge invocation is ambiguous: {detail}") from exc
+
+
+def _close_failed_provenance_pr(clone, submission, wcfg, pr_number, paths,
+                                ctx=None):
+    """Close a known-rejected PR only after proving it did not land."""
+    try:
+        closed = prove_non_merge(
+            clone, submission, wcfg, pr_number, paths, ctx)
+    except (CommandError, subprocess.TimeoutExpired, json.JSONDecodeError,
+            KeyError, OSError, ValueError, GateError) as exc:
+        raise ChecksPending(
+            f"required provenance check failed but its PR could not be "
+            f"closed and verified: {type(exc).__name__}: {str(exc)[:300]}") from exc
+    if not closed:
+        raise MergeAmbiguous(
+            "required provenance check failed, but public state does not "
+            "prove that the PR remained unmerged")
+    return True
+
+
 def publish(clone, submission, wcfg, health, branch=None, transaction=None,
-            ctx=None):
+            ctx=None, profile_snapshot=None):
     """Branch, commit, PR, verify, re-check health, merge, re-read main.
 
     Every remote step is preceded by a health run and followed by evidence
     read back from GitHub. Returns a dict of receipts; raises AbortError,
-    GateError or CommandError. A PR opened before an abort is closed on the
-    way out — for ANY exception, including a timeout, a malformed gh reply, or
-    the operator's Ctrl-C — so a stopped cycle does not leave a half-open
-    contribution behind (#5).
+    GateError or CommandError. Before merge invocation, any abandoned PR is
+    closed. After invocation, every timeout/error is ambiguous and the durable
+    transaction is retained for public-state reconciliation.
 
     `transaction` is a callable the caller supplies to persist each step, so
     a process killed between the merge call and the ledger write can be
@@ -2803,7 +4210,22 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None,
     git_t = int(wcfg.get("git_timeout_s", 600))
     gh_t = int(wcfg.get("gh_timeout_s", 300))
     slug = submission["slug"]
-    branch = branch or f"{wcfg.get('branch_prefix', 'art')}/{slug}-{uuid.uuid4().hex[:8]}"
+    requires_provenance = _requires_collective_provenance(profile_snapshot)
+    if requires_provenance:
+        enforce_reviewed_controller_contract(wcfg, profile_snapshot)
+        expected_branch = re.compile(
+            rf"^{re.escape(REVIEWED_PNG_BRANCH_PREFIX)}/"
+            rf"{re.escape(slug)}-[0-9a-f]{{8}}$")
+        branch = branch or (
+            f"{REVIEWED_PNG_BRANCH_PREFIX}/{slug}-{uuid.uuid4().hex[:8]}")
+        if not expected_branch.fullmatch(branch):
+            raise GateError(
+                "reviewed-PNG branch must be exactly "
+                f"{REVIEWED_PNG_BRANCH_PREFIX}/{slug}-<8 lowercase hex>")
+    else:
+        branch = branch or (
+            f"{wcfg.get('branch_prefix', 'art')}/"
+            f"{slug}-{uuid.uuid4().hex[:8]}")
     paths = sorted([submission["meta_path"], submission["piece_path"]])
     note = transaction or (lambda **_: None)
 
@@ -2830,16 +4252,56 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None,
         raise GateError(f"staged set is {staged}, expected exactly two additions "
                         f"{paths}")
     blobs = verify_staged_tree(clone, submission, wcfg, paths, ctx)
+    verify_staged_worktree_scope(
+        clone, submission, wcfg, paths, ctx
+    )
+    validate_staged_collective_candidate(clone, wcfg, ctx)
+    verify_staged_worktree_scope(
+        clone, submission, wcfg, paths, ctx
+    )
+    verified_again = verify_staged_tree(
+        clone, submission, wcfg, paths, ctx
+    )
+    if verified_again != blobs:
+        raise GateError(
+            "the staged candidate changed during Collective validation"
+        )
 
-    message = (f"art: {submission['title']} ({slug})\n\n"
-               f"Autonomous submission by the {wcfg.get('role', 'evolve')} "
-               f"neighbor of {wcfg.get('instance_name', 'this collective')}.\n"
-               f"Dada cycle {submission['meta']['_dada_cycle']['cycle']}, "
-               f"{len(submission['meta']['_dada_cycle']['rounds'])} round(s) of "
-               f"{CANDIDATES_PER_ROUND} candidates.\n")
-    _git(clone, "-c", f"user.name={wcfg['git_author_name']}",
-         "-c", f"user.email={wcfg['git_author_email']}",
-         "commit", "-m", message, timeout=git_t, ctx=ctx)
+    role = str(wcfg.get("role") or "evolve")
+    if requires_provenance and not REVIEWED_PNG_ROLE_RE.fullmatch(role):
+        raise GateError(
+            "reviewed-PNG controller role must be a clean 1-64 character name")
+    collective = (
+        REVIEWED_PNG_COMMIT_NAME if requires_provenance
+        else wcfg.get("instance_name", "this collective"))
+    provenance = (
+        REVIEWED_PNG_COMMIT_BODY_TEMPLATE.format(role=role)
+        if requires_provenance
+        else f"Autonomous submission by the {role} neighbor of {collective}.")
+    message = (
+        f"art: {submission['title']} ({slug})\n\n"
+        f"{provenance}\n"
+        f"Dada cycle {submission['meta']['_dada_cycle']['cycle']}, "
+        f"{len(submission['meta']['_dada_cycle']['rounds'])} round(s) of "
+        f"{CANDIDATES_PER_ROUND} candidates.\n")
+    if requires_provenance:
+        commit_date = sentinel.now().isoformat(timespec="seconds")
+        commit_env = {
+            **ctx.git_env,
+            "GIT_AUTHOR_NAME": REVIEWED_PNG_COMMIT_NAME,
+            "GIT_AUTHOR_EMAIL": REVIEWED_PNG_COMMIT_EMAIL,
+            "GIT_AUTHOR_DATE": commit_date,
+            "GIT_COMMITTER_NAME": REVIEWED_PNG_COMMIT_NAME,
+            "GIT_COMMITTER_EMAIL": REVIEWED_PNG_COMMIT_EMAIL,
+            "GIT_COMMITTER_DATE": commit_date,
+        }
+        _git(
+            clone, "commit", "-m", message, timeout=git_t,
+            env=commit_env, ctx=ctx)
+    else:
+        _git(clone, "-c", f"user.name={wcfg['git_author_name']}",
+             "-c", f"user.email={wcfg['git_author_email']}",
+             "commit", "-m", message, timeout=git_t, ctx=ctx)
     head = _git(clone, "rev-parse", "HEAD", timeout=git_t, ctx=ctx).strip()
     note(phase="committed", branch=branch, commit=head, blobs=blobs, paths=paths)
     # The last thing before bytes leave this machine: the chokepoint proves
@@ -2858,7 +4320,14 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None,
                      "--body", body, timeout=gh_t,
                      ctx=ctx).strip().splitlines()[-1].strip()
         pr_number = pr_url.rstrip("/").split("/")[-1]
-        note(phase="pr-open", pr_url=pr_url, pr_number=pr_number)
+        first_seen = (
+            sentinel.now().isoformat(timespec="seconds")
+            if requires_provenance else None
+        )
+        note(
+            phase="pr-open", pr_url=pr_url, pr_number=pr_number,
+            provenance_first_seen_at=first_seen,
+        )
 
         # What GitHub says the PR contains, not what we think we pushed.
         view = json.loads(_gh("pr", "view", pr_number, "--repo", repo, "--json",
@@ -2874,18 +4343,56 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None,
                             f"{view.get('headRefName')!r}, expected {base!r} from "
                             f"{branch!r}")
 
+        if requires_provenance:
+            wait_for_collective_provenance(
+                pr_number, wcfg, first_seen, note, ctx)
+            merge_state = collective_merge_readiness(
+                pr_number, wcfg, ctx)
+            if merge_state == "merged":
+                # The controller did not invoke a merge, so another actor may
+                # have raced it. Reconcile fresh public state rather than
+                # treating that as permission to run a second merge command.
+                note(
+                    phase="merge-ambiguous",
+                    last_merge_error=(
+                        "PR reported merged before the controller invoked "
+                        "its canonical merge"),
+                )
+                raise MergeAmbiguous(
+                    "PR reported merged before the controller invoked its "
+                    "canonical merge")
+            note(
+                phase="provenance-succeeded",
+                provenance_check_state="success",
+            )
+
         # Health again, immediately before the merge (#3/#6).
         probe_health(health, "pre-merge", wcfg)
 
         note(phase="merging", pr_url=pr_url, pr_number=pr_number)
-        _gh("pr", "merge", pr_number, "--repo", repo, "--squash",
-            "--delete-branch", timeout=gh_t, ctx=ctx)
-        note(phase="merge-called", pr_url=pr_url, pr_number=pr_number)
+    except ChecksPending:
+        # PR identity and every observed check state are already durable. A
+        # later worker pass resumes this exact PR instead of spending again.
+        raise
+    except ProvenanceCheckFailed:
+        try:
+            _close_failed_provenance_pr(
+                clone, submission, wcfg, pr_number, paths, ctx)
+        except ChecksPending:
+            note(phase="checks-pending")
+            raise
+        except MergeAmbiguous as exc:
+            note(phase="merge-ambiguous", last_merge_error=str(exc)[:400])
+            raise
+        note(phase="checks-failed-closed")
+        raise
+    except MergeAmbiguous:
+        # A PR already reported merged before our call is public-state
+        # ambiguity, not an abandoned branch to close.
+        raise
     except BaseException:
-        # EVERY exception, not three named ones: a gh timeout, a malformed
-        # json reply, a KeyboardInterrupt from launchd's ceiling, a bug in
-        # this function. Whatever it was, an open PR nobody is going to
-        # finish is worse than no PR.
+        # The merge command has not been invoked yet, so cleanup is still
+        # unambiguous.
         if pr_number:
             _close_pr(repo, pr_number, gh_t, ctx)
         else:
@@ -2893,11 +4400,11 @@ def publish(clone, submission, wcfg, health, branch=None, transaction=None,
         note(phase="cleaned-up")
         raise
 
-    receipts = confirm_merge(clone, submission, wcfg, pr_number, paths, ctx)
-    receipts.update({"branch": branch, "commit": head, "pr_url": pr_url,
-                     "pr_number": pr_number})
-    note(phase="merged", **receipts)
-    return receipts
+    # From this instruction onward, a timeout or exception cannot prove that
+    # GitHub did not merge. Never close, clear, or spend again on that guess.
+    return _merge_collective_pr(
+        clone, submission, wcfg, pr_number, paths, note,
+        branch=branch, commit=head, pr_url=pr_url, ctx=ctx)
 
 
 def confirm_merge(clone, submission, wcfg, pr_number, paths, ctx=None):
@@ -2915,8 +4422,7 @@ def confirm_merge(clone, submission, wcfg, pr_number, paths, ctx=None):
                             "--json", "state,mergeCommit",
                             timeout=gh_t, ctx=ctx))
     if str(merged.get("state")).upper() != "MERGED":
-        raise CommandError(f"PR {pr_number} is not merged: "
-                           f"{merged.get('state')!r}")
+        raise MergeNotConfirmed(pr_number, merged.get("state"))
     merge_sha = ((merged.get("mergeCommit") or {}).get("oid") or "").strip()
     if not merge_sha:
         raise CommandError(f"PR {pr_number} reports no merge commit")
@@ -2931,15 +4437,117 @@ def confirm_merge(clone, submission, wcfg, pr_number, paths, ctx=None):
                _git(clone, "show", "--name-status", "--format=", merge_sha,
                     timeout=git_t, ctx=ctx).splitlines() if ln.strip()]
     if sorted(p for _, p in touched) != paths or any(s != "A" for s, _ in touched):
-        raise CommandError(f"the merge commit touches {touched}, expected exactly "
-                           f"two additions {paths}")
+        raise GateError(f"the merge commit touches {touched}, expected exactly "
+                        f"two additions {paths}")
     for path, digest in ((submission["meta_path"], submission["meta_sha256"]),
                          (submission["piece_path"], submission["piece_sha256"])):
         blob = _git_bytes(clone, "cat-file", "blob", f"origin/{base}:{path}",
                           timeout=git_t, ctx=ctx)
         if hashlib.sha256(blob).hexdigest() != digest:
-            raise CommandError(f"{path} on origin/{base} is not the file we gated")
+            raise GateError(f"{path} on origin/{base} is not the file we gated")
     return {"merge_commit": merge_sha, "base_sha": main_sha, "paths": paths}
+
+
+def prove_non_merge(clone, submission, wcfg, pr_number, paths, ctx=None):
+    """Close an open PR and prove both PR state and main exclude this change."""
+    expected_paths = (
+        sorted([submission.get("meta_path"), submission.get("piece_path")])
+        if isinstance(submission, dict) else [])
+    if (not paths or any(not isinstance(path, str) or not path for path in paths)
+            or sorted(paths) != expected_paths):
+        raise GateError(
+            "cannot prove non-merge without the submission's exact paths")
+    ctx = ctx or controller_for(wcfg)
+    clone = Path(clone)
+    repo = ctx.gh_repo()
+    base = wcfg.get("base_branch", "main")
+    git_t = int(wcfg.get("git_timeout_s", 600))
+    gh_t = int(wcfg.get("gh_timeout_s", 300))
+
+    def read_pr():
+        value = json.loads(_gh(
+            "pr", "view", str(pr_number), "--repo", repo,
+            "--json", "state,mergeCommit", timeout=gh_t, ctx=ctx))
+        return (
+            str(value.get("state") or "").upper(),
+            str((value.get("mergeCommit") or {}).get("oid") or "").strip(),
+        )
+
+    state, merge_sha = read_pr()
+    if state == "MERGED" or merge_sha:
+        return False
+    if state == "OPEN":
+        _gh("pr", "close", str(pr_number), "--repo", repo,
+            "--delete-branch", timeout=gh_t, ctx=ctx)
+        state, merge_sha = read_pr()
+    if state != "CLOSED" or merge_sha:
+        return False
+
+    _git_remote(clone, wcfg, "fetch", "--no-tags", "origin", base,
+                timeout=git_t, ctx=ctx)
+    present = {
+        line.strip() for line in _git(
+            clone, "ls-tree", "-r", "--name-only", f"origin/{base}",
+            "--", *paths, timeout=git_t, ctx=ctx).splitlines()
+        if line.strip()
+    }
+    if present:
+        return False
+    return True
+
+
+def revalidate_merged_profile_submission(clone, submission, wcfg,
+                                         profile_snapshot, ctx=None):
+    """Re-read and deterministically gate profile bytes already on base."""
+    snapshot = validate_profile_snapshot(profile_snapshot)
+    if not isinstance(submission, dict):
+        raise GateError("profile transaction submission is not an object")
+    required = {
+        "slug", "kind", "meta", "meta_path", "piece_path",
+        "meta_sha256", "piece_sha256",
+    }
+    if not required.issubset(submission):
+        raise GateError("profile transaction submission is incomplete")
+    slug = submission.get("slug")
+    if (not isinstance(slug, str) or not SLUG_RE.fullmatch(slug)
+            or submission.get("kind") != "png"
+            or submission.get("meta_path") !=
+            f"submissions/{slug}/{META_NAME}"
+            or submission.get("piece_path") !=
+            f"submissions/{slug}/piece.png"):
+        raise GateError("profile transaction submission paths conflict")
+    ctx = ctx or controller_for(wcfg)
+    base = wcfg.get("base_branch", "main")
+    git_t = int(wcfg.get("git_timeout_s", 600))
+    meta_bytes = _git_bytes(
+        clone, "cat-file", "blob",
+        f"origin/{base}:{submission['meta_path']}", timeout=git_t, ctx=ctx)
+    piece_bytes = _git_bytes(
+        clone, "cat-file", "blob",
+        f"origin/{base}:{submission['piece_path']}", timeout=git_t, ctx=ctx)
+    if hashlib.sha256(meta_bytes).hexdigest() != submission["meta_sha256"]:
+        raise GateError("merged profile meta digest conflicts with transaction")
+    if hashlib.sha256(piece_bytes).hexdigest() != submission["piece_sha256"]:
+        raise GateError("merged profile PNG digest conflicts with transaction")
+    try:
+        merged_meta = json.loads(meta_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise GateError(f"merged profile meta is invalid: {exc}") from exc
+    if merged_meta != submission.get("meta"):
+        raise GateError("merged profile meta conflicts with transaction state")
+    if (not isinstance(merged_meta, dict)
+            or merged_meta.get("slug") != slug
+            or merged_meta.get("kind") != "png"):
+        raise GateError("merged profile meta conflicts with submission identity")
+    validate_reviewed_submission_contract(merged_meta, expected_slug=slug)
+    image_info = validate_image_generation_receipt(
+        merged_meta, piece_bytes, snapshot)
+    captured = submission.get("image")
+    expected_dimensions = {
+        "width": image_info["width"], "height": image_info["height"]}
+    if captured is not None and captured != expected_dimensions:
+        raise GateError("profile transaction dimensions conflict with merged IHDR")
+    return meta_bytes, piece_bytes, image_info
 
 
 def _close_pr(repo, pr_number, timeout, ctx=None):
@@ -3079,7 +4687,9 @@ def confirm_vision_state(clone, submission, piece_bytes, vcfg, ctx,
         channel = json.loads(channel_blob.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as e:
         raise CommandError(f"{channel_rel} on origin/{base} is invalid: {e}")
-    expected_entry = vision_video(submission, vcfg)
+    image_info = (_check_png(piece_bytes)
+                  if submission.get("kind") == "png" else None)
+    expected_entry = vision_video(submission, vcfg, image_info)
     actual = next((video for video in channel.get("videos", [])
                    if isinstance(video, dict)
                    and video.get("id") == submission["slug"]), None)
@@ -3116,14 +4726,25 @@ def confirm_vision_state(clone, submission, piece_bytes, vcfg, ctx,
 
 
 def publish_rapp_vision(workspace, submission, piece_bytes, wcfg, health,
-                        transaction=None, ctx=None):
+                        transaction=None, ctx=None, profile_snapshot=None):
     """Deploy the already-gated art into its RAPP Vision channel.
 
     The adapter is idempotent against origin/main. A crash after the merge but
     before the collective ledger moves simply re-enters here, sees the exact
     media and channel entry, and returns the same public receipts.
     """
+    snapshot = (validate_profile_snapshot(profile_snapshot)
+                if profile_snapshot is not None
+                else publication_profile_snapshot(wcfg))
+    if snapshot:
+        validate_image_generation_receipt(
+            submission.get("meta") or {}, piece_bytes, snapshot)
     vcfg = vision_config(wcfg)
+    if snapshot:
+        validate_reviewed_vision_config(vcfg)
+    if snapshot and not vcfg["enabled"]:
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} cannot publish without RAPP Vision")
     if not vcfg["enabled"]:
         return {}
     vwcfg = vision_worker_config(wcfg, vcfg)
@@ -3237,32 +4858,56 @@ def publish_rapp_vision(workspace, submission, piece_bytes, wcfg, health,
 
 
 def verify_dual_pages(cfg, wcfg, submission, vision_receipts, probe=None,
-                      sleep=None):
+                      sleep=None, png_probe=None, profile_snapshot=None):
     """Require both actual GitHub Pages experiences before finalizing."""
+    snapshot = (validate_profile_snapshot(profile_snapshot)
+                if profile_snapshot is not None
+                else publication_profile_snapshot(wcfg))
     vcfg = vision_config(wcfg)
+    if snapshot:
+        validate_reviewed_vision_config(vcfg)
+    if snapshot and not vcfg["enabled"]:
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} cannot verify without RAPP Vision")
     if not vcfg["enabled"]:
         view, kind, note = verified_view(cfg, wcfg, submission, probe, sleep)
         return {"collective_url": view, "collective_kind": kind, "note": note}
     probe = probe or probe_url
+    png_probe = png_probe or probe_png_url
     sleep = sleep or time.sleep
     collective_url, _ = art_urls(cfg, wcfg, submission)
     vision = vision_receipts or vision_urls(vcfg, submission)
-    required = [
+    required_routes = [
         ("Public Art Collective", collective_url),
-        ("Public Art piece", piece_pages_url(cfg, wcfg, submission)),
         ("RAPP Vision channel", vision.get("channel_url", "")),
-        ("RAPP Vision media", vision.get("media_url", "")),
         ("RAPP Vision scene", vision.get("scene_url", "")),
         ("RAPP Vision player", vcfg["player_url"]),
     ]
+    required_media = []
+    if snapshot:
+        required_routes.append(
+            ("RAPP Vision watch", vision.get("watch_url", "")))
+        required_media = [
+            ("Public Art piece", piece_pages_url(cfg, wcfg, submission)),
+            ("RAPP Vision media", vision.get("media_url", "")),
+        ]
+    else:
+        required_routes.insert(
+            1, ("Public Art piece", piece_pages_url(cfg, wcfg, submission)))
+        required_routes.insert(
+            3, ("RAPP Vision media", vision.get("media_url", "")))
     timeout = int(wcfg.get("view_probe_timeout_s", 10))
     backoff = list(wcfg.get("view_probe_backoff") or (5, 10, 20, 30))
     attempts = max(1, int(wcfg.get("view_probe_attempts", len(backoff) + 1)))
     last = []
     for attempt in range(attempts):
         last = []
-        for label, url in required:
+        for label, url in required_routes:
             ok, detail = probe(url, timeout) if url else (False, "no url")
+            if not ok:
+                last.append(f"{label}: {detail}")
+        for label, url in required_media:
+            ok, detail = png_probe(url, timeout) if url else (False, "no url")
             if not ok:
                 last.append(f"{label}: {detail}")
         if not last:
@@ -3277,6 +4922,149 @@ def verify_dual_pages(cfg, wcfg, submission, vision_receipts, probe=None,
         if attempt + 1 < attempts:
             sleep(backoff[min(attempt, len(backoff) - 1)])
     raise DeploymentPending("public deployment is not ready: " + "; ".join(last))
+
+
+def durable_deployment_receipt(cfg, wcfg, submission, collective_receipts,
+                               vision_receipts, deployed,
+                               profile_snapshot=None):
+    """Bind already-probed public URLs to the gated bytes and profile."""
+    snapshot = (validate_profile_snapshot(profile_snapshot)
+                if profile_snapshot is not None
+                else publication_profile_snapshot(wcfg))
+    if snapshot:
+        validate_reviewed_submission_contract(
+            submission.get("meta") if isinstance(submission, dict) else None,
+            expected_slug=(
+                submission.get("slug") if isinstance(submission, dict) else None
+            ),
+        )
+    if not isinstance(deployed, dict):
+        raise GateError("deployment verification did not return an object")
+    required = {
+        "meta_sha256": submission.get("meta_sha256"),
+        "piece_sha256": submission.get("piece_sha256"),
+        "collective_merge_commit": collective_receipts.get("merge_commit"),
+    }
+    if any(
+            not isinstance(value, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", value)
+            for key, value in required.items()
+            if key != "collective_merge_commit"):
+        raise GateError("deployment receipt lacks gated submission digests")
+    if (not isinstance(required["collective_merge_commit"], str)
+            or not required["collective_merge_commit"]):
+        raise GateError("deployment receipt lacks the Collective merge commit")
+    vcfg = vision_config(wcfg)
+    vision_merge = ""
+    if vcfg["enabled"]:
+        vision_merge = (vision_receipts or {}).get("merge_commit")
+        if not isinstance(vision_merge, str) or not vision_merge:
+            raise GateError("deployment receipt lacks the RAPP Vision merge commit")
+    return {
+        "schema": DEPLOYMENT_RECEIPT_SCHEMA,
+        "profile": snapshot["profile"] if snapshot else "",
+        **required,
+        "vision_merge_commit": vision_merge,
+        **deployed,
+    }
+
+
+def persisted_deployment_receipts(state, cfg, wcfg, submission,
+                                  collective_receipts, profile_snapshot=None):
+    """Validate and rehydrate a previously verified deployment without probing."""
+    snapshot = (validate_profile_snapshot(profile_snapshot)
+                if profile_snapshot is not None
+                else publication_profile_snapshot(wcfg))
+    if snapshot:
+        validate_reviewed_submission_contract(
+            submission.get("meta") if isinstance(submission, dict) else None,
+            expected_slug=(
+                submission.get("slug") if isinstance(submission, dict) else None
+            ),
+        )
+    receipt = state.get("deployment_receipts")
+    if not isinstance(receipt, dict):
+        raise GateError("notification retry has no persisted deployment receipt")
+    profile = snapshot["profile"] if snapshot else ""
+    required = {
+        "schema", "profile", "meta_sha256", "piece_sha256",
+        "collective_merge_commit", "vision_merge_commit",
+        "collective_url", "collective_kind", "note",
+    }
+    vcfg = vision_config(wcfg)
+    if vcfg["enabled"]:
+        required.update({
+            "vision_url", "vision_channel_url", "vision_media_url",
+        })
+    if set(receipt) != required:
+        raise GateError("persisted deployment receipt has an invalid shape")
+    if receipt.get("schema") != DEPLOYMENT_RECEIPT_SCHEMA:
+        raise GateError("persisted deployment receipt has an invalid schema")
+    if receipt.get("profile") != profile:
+        raise GateError("persisted deployment receipt profile conflicts with transaction")
+    for key in ("meta_sha256", "piece_sha256"):
+        expected = submission.get(key)
+        actual = receipt.get(key)
+        if (not isinstance(expected, str)
+                or not re.fullmatch(r"[0-9a-f]{64}", expected)
+                or actual != expected):
+            raise GateError(
+                f"persisted deployment receipt {key} conflicts with gated bytes")
+    merge_commit = collective_receipts.get("merge_commit")
+    if (not isinstance(merge_commit, str) or not merge_commit
+            or receipt.get("collective_merge_commit") != merge_commit):
+        raise GateError(
+            "persisted deployment receipt conflicts with the Collective merge")
+    if (not isinstance(receipt.get("collective_url"), str)
+            or not isinstance(receipt.get("collective_kind"), str)
+            or not isinstance(receipt.get("note"), str)
+            or len(receipt["note"]) > 600):
+        raise GateError("persisted deployment receipt has invalid public URL fields")
+
+    collective_view, _ = art_urls(cfg, wcfg, submission)
+    if vcfg["enabled"]:
+        vision = vision_urls(vcfg, submission)
+        expected_urls = {
+            "collective_url": collective_view,
+            "collective_kind": "pages",
+            "vision_url": vision["watch_url"],
+            "vision_channel_url": vision["channel_url"],
+            "vision_media_url": vision["media_url"],
+            "note": "",
+        }
+        if any(receipt.get(key) != value for key, value in expected_urls.items()):
+            raise GateError(
+                "persisted deployment receipt public routes conflict with "
+                "the captured deployment contract")
+        vision_receipts = state.get("vision_receipts")
+        if not isinstance(vision_receipts, dict):
+            raise GateError(
+                "persisted deployment receipt lacks RAPP Vision merge evidence")
+        vision_merge = vision_receipts.get("merge_commit")
+        if (not isinstance(vision_merge, str) or not vision_merge
+                or receipt.get("vision_merge_commit") != vision_merge):
+            raise GateError(
+                "persisted deployment receipt conflicts with the RAPP Vision merge")
+    else:
+        kind = receipt["collective_kind"]
+        expected_url = (
+            collective_view if kind == "pages"
+            else raw_url(cfg, wcfg, submission) if kind == "raw"
+            else ""
+        )
+        if not expected_url or receipt["collective_url"] != expected_url:
+            raise GateError(
+                "persisted deployment receipt has an invalid Collective route")
+        if receipt.get("vision_merge_commit") != "":
+            raise GateError(
+                "persisted deployment receipt unexpectedly names a Vision merge")
+        vision_receipts = {}
+
+    return {
+        **collective_receipts,
+        **receipt,
+        "vision": dict(vision_receipts),
+    }
 
 
 # ── bookkeeping ─────────────────────────────────────────────────────────────
@@ -3378,6 +5166,38 @@ def probe_url(url, timeout=10):
         return False, f"HTTP {e.code}"
     except Exception as e:
         return False, f"{type(e).__name__}: {str(e)[:80]}"
+
+
+def probe_png_url(url, timeout=10, opener=None):
+    """Verify a direct HTTP PNG response without trusting its URL suffix."""
+    if not url:
+        return False, "no url"
+    request = urllib.request.Request(
+        url, method="GET", headers={"User-Agent": "rapp-sentinel"})
+    opener = opener or urllib.request.urlopen
+    try:
+        with opener(request, timeout=timeout) as response:
+            code = getattr(response, "status", None) or response.getcode()
+            headers = getattr(response, "headers", {})
+            if hasattr(headers, "get_content_type"):
+                content_type = headers.get_content_type()
+            else:
+                content_type = str(
+                    headers.get("Content-Type", "")).split(";", 1)[0].strip()
+            signature = response.read(len(azure_art.PNG_SIGNATURE))
+            if not 200 <= int(code) < 300:
+                return False, f"HTTP {code}"
+            if str(content_type).lower() != "image/png":
+                return False, (
+                    f"HTTP {code} Content-Type "
+                    f"{content_type or '(missing)'}, expected image/png")
+            if signature != azure_art.PNG_SIGNATURE:
+                return False, f"HTTP {code} body has no PNG signature"
+            return True, f"HTTP {code} image/png PNG"
+    except urllib.error.HTTPError as exc:
+        return False, f"HTTP {exc.code}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {str(exc)[:80]}"
 
 
 def verified_view(cfg, wcfg, submission, probe=None, sleep=None):
@@ -3489,6 +5309,77 @@ def art_notification(cfg, wcfg, submission, receipts, view="", note=""):
     if not view:
         lines += ["", "(no Public Art Collective Pages URL was verified)"]
     return "\n".join(lines)
+
+
+def final_notification_id(row, submission, receipts):
+    row_id = row.get("id") if isinstance(row, dict) else None
+    slug = submission.get("slug") if isinstance(submission, dict) else None
+    merge_commit = receipts.get("merge_commit") if isinstance(receipts, dict) else None
+    if (not isinstance(row_id, str) or not row_id
+            or not isinstance(slug, str) or not SLUG_RE.fullmatch(slug)
+            or not isinstance(merge_commit, str) or not merge_commit):
+        raise GateError(
+            "final art notification identity lacks row, slug, or merge commit")
+    material = f"{row_id}\0{slug}\0{merge_commit}".encode("utf-8")
+    return "evolve-art:" + hashlib.sha256(material).hexdigest()
+
+
+def final_notification_record(cfg, wcfg, row, submission, receipts,
+                              view, view_note):
+    recipient = art_recipient(cfg)
+    required = bool(
+        cfg.get("notify")
+        and sentinel.notification_allowed(cfg, "art")
+        and recipient)
+    return {
+        "schema": FINAL_NOTIFICATION_SCHEMA,
+        "id": final_notification_id(row, submission, receipts),
+        "required": required,
+        "to": recipient,
+        "text": art_notification(
+            cfg, wcfg, submission, receipts, view, view_note),
+    }
+
+
+def validate_final_notification(record, expected):
+    fields = {"schema", "id", "required", "to", "text"}
+    if (not isinstance(record, dict) or set(record) != fields
+            or record.get("schema") != FINAL_NOTIFICATION_SCHEMA
+            or not isinstance(record.get("id"), str)
+            or record.get("id") != expected["id"]
+            or not isinstance(record.get("required"), bool)
+            or not isinstance(record.get("to"), str)
+            or not isinstance(record.get("text"), str)
+            or not record.get("text")
+            or (record.get("required") and not record.get("to"))):
+        raise GateError("final art notification transaction is malformed")
+    return dict(record)
+
+
+def enqueue_final_art_notification(cfg, record, transaction=None):
+    """Persist intent, idempotently enqueue, then persist confirmation."""
+    if transaction:
+        transaction(
+            phase="notification-pending",
+            final_notification=record,
+            notification_id=record["id"])
+    if not record["required"]:
+        if transaction:
+            transaction(phase="notification-skipped")
+        return False
+
+    delivery_cfg = dict(cfg)
+    delivery_cfg["notify"] = True
+    delivery_cfg["notification_mode"] = "art-only"
+    queued = sentinel.notify(
+        delivery_cfg, record["text"], to=record["to"], kind="art",
+        attach_report=False, dedupe_key=record["id"])
+    if queued is False:
+        raise NotificationPending(
+            f"outbox did not confirm {record['id']}")
+    if transaction:
+        transaction(phase="notification-enqueued")
+    return True
 
 
 def open_final_art(wcfg, receipts):
@@ -3607,9 +5498,17 @@ def clear_transaction():
 
 def finish_platform_deployments(cfg, wcfg, workspace, collective_clone,
                                 submission, collective_receipts, health,
-                                transaction=None):
+                                transaction=None, profile_snapshot=None):
     """Verify the canonical merge and, when enabled, its RAPP Vision mirror."""
+    snapshot = (validate_profile_snapshot(profile_snapshot)
+                if profile_snapshot is not None
+                else publication_profile_snapshot(wcfg))
     vcfg = vision_config(wcfg)
+    if snapshot:
+        validate_reviewed_vision_config(vcfg)
+    if snapshot and not vcfg["enabled"]:
+        raise GateError(
+            f"{AZURE_REVIEWED_PNG_PROFILE} cannot publish without RAPP Vision")
     if not vcfg["enabled"]:
         return dict(collective_receipts)
     base = wcfg.get("base_branch", "main")
@@ -3621,22 +5520,29 @@ def finish_platform_deployments(cfg, wcfg, workspace, collective_clone,
         timeout=git_t, ctx=ctx)
     if hashlib.sha256(piece_bytes).hexdigest() != submission["piece_sha256"]:
         raise CommandError("the collective bytes changed before RAPP Vision deploy")
+    if snapshot:
+        validate_image_generation_receipt(
+            submission.get("meta") or {}, piece_bytes, snapshot)
     vwcfg = vision_worker_config(wcfg, vcfg)
     vctx = controller_for(
         vwcfg, git_home=STATE / "git-home-rapp-vision")
     assert_publish_auth(vwcfg, ctx=vctx)
     vision_receipts = publish_rapp_vision(
         workspace, submission, piece_bytes, wcfg, health,
-        transaction=transaction, ctx=vctx)
+        transaction=transaction, ctx=vctx, profile_snapshot=snapshot)
     deployed = verify_dual_pages(
-        cfg, wcfg, submission, vision_receipts)
+        cfg, wcfg, submission, vision_receipts,
+        profile_snapshot=snapshot)
+    deployment_receipts = durable_deployment_receipt(
+        cfg, wcfg, submission, collective_receipts, vision_receipts, deployed,
+        profile_snapshot=snapshot)
     receipts = dict(collective_receipts)
     receipts["vision"] = vision_receipts
-    receipts.update(deployed)
+    receipts.update(deployment_receipts)
     if transaction:
         transaction(phase="platforms-verified",
                     vision_receipts=vision_receipts,
-                    deployment_receipts=deployed)
+                    deployment_receipts=deployment_receipts)
     return receipts
 
 
@@ -3695,6 +5601,67 @@ def deployment_pending(history, row, error, transaction=None, wcfg=None):
             "detail": detail}
 
 
+def collective_checks_pending(history, row, error, transaction=None):
+    """Retain an open protected PR until its exact gate is decisive."""
+    detail = f"Collective provenance checks pending: {type(error).__name__}: {error}"
+    if transaction:
+        transaction(
+            phase="checks-pending",
+            last_check_error=detail[:400],
+        )
+    row["detail"] = detail[:400]
+    save_history(history)
+    write_status(
+        "checks-pending", detail, role=row.get("role", ""),
+        cycle=row.get("cycle"), slug=row.get("slug", ""))
+    log(detail)
+    return {"outcome": "checks-pending", "reason": detail, "detail": detail}
+
+
+def canonical_merge_pending(history, row, error, transaction=None):
+    """Keep an invoked canonical merge unresolved until public proof arrives."""
+    detail = f"canonical merge pending reconciliation: {type(error).__name__}: {error}"
+    if transaction:
+        transaction(
+            phase="merge-ambiguous",
+            last_merge_error=detail[:400])
+    row["detail"] = detail[:400]
+    save_history(history)
+    write_status(
+        "merge-pending", detail, role=row.get("role", ""),
+        cycle=row.get("cycle"), slug=row.get("slug", ""))
+    log(detail)
+    return {"outcome": "merge-pending", "reason": detail, "detail": detail}
+
+
+def final_notification_pending(history, row, error):
+    """The contribution is real; retain its transaction until enqueue is kept."""
+    detail = f"final art notification pending: {type(error).__name__}: {error}"
+    row["notification_error"] = detail[:400]
+    save_history(history)
+    write_status(
+        "notification-pending", detail, role=row.get("role", ""),
+        cycle=row.get("cycle"), slug=row.get("slug", ""))
+    log(detail)
+    return {
+        "outcome": "notification-pending",
+        "reason": detail,
+        "detail": detail,
+    }
+
+
+def reconciliation_fail_closed(history, row, error):
+    """Keep a conflicting public transaction pending and spend nothing."""
+    detail = f"profile reconciliation failed closed: {error}"
+    row["detail"] = detail[:400]
+    save_history(history)
+    write_status(
+        "fail-closed", detail, role=row.get("role", ""),
+        cycle=row.get("cycle"), slug=row.get("slug", ""))
+    log(detail)
+    return {"outcome": "fail-closed", "reason": detail, "detail": detail}
+
+
 def reconcile(cfg, wcfg, history, ctx=None, health=None):
     """Finish, or clean up after, a cycle that died mid-publish.
 
@@ -3711,15 +5678,71 @@ def reconcile(cfg, wcfg, history, ctx=None, health=None):
     state = strict_load(TRANSACTION_PATH, {}, expect=dict)
     if not state:
         return None
+    submission = state.get("submission") or {}
+    receipt_profile = (
+        ((submission.get("meta") or {}).get("_image_generation") or {})
+        .get("profile")
+        if isinstance(submission, dict) else None)
+    profile_transaction = (
+        state.get("profile_snapshot") is not None
+        or receipt_profile == AZURE_REVIEWED_PNG_PROFILE)
     row_id = state.get("row_id")
     row = next((r for r in history if r.get("id") == row_id), None)
     if row is None:
+        if profile_transaction:
+            detail = (
+                "profile reconciliation failed closed: transaction references "
+                "a history row that does not exist")
+            write_status("fail-closed", detail)
+            log(detail)
+            return {"outcome": "fail-closed", "reason": detail,
+                    "detail": detail}
         log("transaction references a row this ledger does not have — clearing")
         clear_transaction()
         return None
-    if row.get("outcome") != "pending":
+    if (isinstance(submission, dict)
+            and submission.get("kind") == "png"
+            and not profile_transaction):
+        return reconciliation_fail_closed(
+            history, row,
+            "PNG transaction has no reviewed-profile receipt and snapshot")
+    transaction_phase = str(state.get("phase") or "")
+    notification_finalization = (
+        row.get("outcome") == OUTCOME_CONTRIBUTED
+        and transaction_phase in {
+            "platforms-verified",
+            "notification-preparing",
+            "notification-pending",
+            "notification-enqueued",
+            "notification-skipped",
+        }
+    )
+    if row.get("outcome") != "pending" and not notification_finalization:
+        if profile_transaction:
+            return reconciliation_fail_closed(
+                history, row,
+                f"transaction row outcome is {row.get('outcome')!r}, "
+                "expected 'pending'")
         clear_transaction()
         return None
+
+    stored_snapshot = state.get("profile_snapshot")
+    try:
+        current_profile = publication_profile_name(wcfg)
+    except GateError as exc:
+        return reconciliation_fail_closed(history, row, exc)
+    if stored_snapshot is None:
+        if (current_profile == AZURE_REVIEWED_PNG_PROFILE
+                or receipt_profile == AZURE_REVIEWED_PNG_PROFILE):
+            return reconciliation_fail_closed(
+                history, row,
+                "reviewed-PNG transaction has no persisted profile snapshot")
+        profile_snapshot = None
+    else:
+        try:
+            profile_snapshot = validate_profile_snapshot(stored_snapshot)
+        except GateError as exc:
+            return reconciliation_fail_closed(history, row, exc)
 
     pr_number = str(state.get("pr_number") or "")
     slug = state.get("slug") or row.get("slug") or ""
@@ -3740,44 +5763,168 @@ def reconcile(cfg, wcfg, history, ctx=None, health=None):
         clone = workspace / "clone"
         _clone_repo(wcfg, clone, ctx=ctx)
         assert_repo_integrity(clone, wcfg, ctx=ctx)
-        submission = state.get("submission") or {}
-        try:
-            receipts = confirm_merge(clone, submission, wcfg, pr_number,
-                                     sorted(state.get("paths") or []), ctx)
-        except (CommandError, subprocess.TimeoutExpired, json.JSONDecodeError,
-                KeyError, OSError) as e:
-            # Not merged (or not verifiably merged): close it and say so.
-            log(f"interrupted cycle did not land: {type(e).__name__}: {e}")
-            _close_pr(ctx.gh_repo(), pr_number,
-                      int(wcfg.get("gh_timeout_s", 300)), ctx)
-            row["outcome"] = OUTCOME_ABORTED
-            row["detail"] = (f"interrupted at {state.get('phase')}; PR "
-                             f"{pr_number} was not verifiably merged and has "
-                             f"been closed ({type(e).__name__})")
-            save_history(history)
-            clear_transaction()
-            return {"outcome": "reconciled-aborted", "detail": row["detail"]}
+        note = transaction_writer(row["id"], state)
+        paths = sorted(state.get("paths") or [])
+        waiting_for_provenance = (
+            _requires_collective_provenance(profile_snapshot)
+            and transaction_phase in {
+                "pr-open", "checks-pending", "provenance-succeeded", "merging",
+            }
+        )
+        if waiting_for_provenance:
+            try:
+                scope_state = verify_collective_pr_scope(
+                    pr_number, state.get("branch", ""), paths, wcfg, ctx)
+                if scope_state == "merged":
+                    receipts = confirm_merge(
+                        clone, submission, wcfg, pr_number, paths, ctx)
+                else:
+                    wait_for_collective_provenance(
+                        pr_number, wcfg,
+                        state.get("provenance_first_seen_at"), note, ctx,
+                        cancelled_first_seen=state.get(
+                            "provenance_cancelled_first_seen_at"))
+                    merge_state = collective_merge_readiness(
+                        pr_number, wcfg, ctx)
+                    if merge_state == "merged":
+                        receipts = confirm_merge(
+                            clone, submission, wcfg, pr_number, paths, ctx)
+                    else:
+                        receipts = _merge_collective_pr(
+                            clone, submission, wcfg, pr_number, paths, note,
+                            branch=state.get("branch", ""),
+                            commit=state.get("commit", ""),
+                            pr_url=state.get("pr_url", ""), ctx=ctx)
+            except ChecksPending as exc:
+                return collective_checks_pending(
+                    history, row, exc, transaction=note)
+            except ProvenanceCheckFailed as exc:
+                try:
+                    _close_failed_provenance_pr(
+                        clone, submission, wcfg, pr_number, paths, ctx)
+                except ChecksPending as close_error:
+                    return collective_checks_pending(
+                        history, row, close_error, transaction=note)
+                except MergeAmbiguous as close_error:
+                    return canonical_merge_pending(
+                        history, row, close_error, transaction=note)
+                row["outcome"] = OUTCOME_ABORTED
+                row["detail"] = (
+                    f"required provenance check rejected PR {pr_number}: {exc}")
+                save_history(history)
+                clear_transaction()
+                return {"outcome": "reconciled-aborted", "detail": row["detail"]}
+            except MergeAmbiguous as exc:
+                return canonical_merge_pending(
+                    history, row, exc, transaction=note)
+            except GateError as exc:
+                return reconciliation_fail_closed(history, row, exc)
+        else:
+            try:
+                receipts = confirm_merge(clone, submission, wcfg, pr_number,
+                                         paths, ctx)
+            except MergeNotConfirmed as exc:
+                try:
+                    not_merged = prove_non_merge(
+                        clone, submission, wcfg, pr_number, paths, ctx)
+                except (CommandError, subprocess.TimeoutExpired,
+                        json.JSONDecodeError, KeyError, OSError, GateError,
+                        ValueError) as proof_error:
+                    return canonical_merge_pending(
+                        history, row, proof_error, transaction=note)
+                if not not_merged:
+                    return canonical_merge_pending(
+                        history, row, exc, transaction=note)
+                log(f"interrupted cycle did not land: {exc}")
+                row["outcome"] = OUTCOME_ABORTED
+                row["detail"] = (f"interrupted at {state.get('phase')}; PR "
+                                 f"{pr_number} is closed and its paths are absent "
+                                 f"from origin/{wcfg.get('base_branch', 'main')}")
+                save_history(history)
+                clear_transaction()
+                return {"outcome": "reconciled-aborted", "detail": row["detail"]}
+            except GateError as exc:
+                return reconciliation_fail_closed(history, row, exc)
+            except (CommandError, subprocess.TimeoutExpired,
+                    json.JSONDecodeError, KeyError, OSError, ValueError) as exc:
+                return canonical_merge_pending(
+                    history, row, exc, transaction=note)
+
+        if profile_snapshot:
+            try:
+                expected_paths = sorted([
+                    submission["meta_path"], submission["piece_path"]])
+                if sorted(state.get("paths") or []) != expected_paths:
+                    raise GateError(
+                        "profile transaction paths conflict with submission")
+                revalidate_merged_profile_submission(
+                    clone, submission, wcfg, profile_snapshot, ctx)
+            except (GateError, CommandError, KeyError, OSError) as exc:
+                return reconciliation_fail_closed(history, row, exc)
 
         receipts.update({"pr_url": state.get("pr_url", ""),
                          "pr_number": pr_number,
                          "branch": state.get("branch", "")})
-        note = transaction_writer(row["id"], state)
         deployment_wcfg = dict(wcfg)
         if isinstance(state.get("rapp_vision"), dict):
             deployment_wcfg["rapp_vision"] = dict(state["rapp_vision"])
+        if notification_finalization and "deployment_receipts" in state:
+            # Pages/CDN proof already succeeded and was durably bound to this
+            # merge. A notification-only retry must reuse that evidence, not
+            # turn a transient later CDN failure into a second deployment pass.
+            try:
+                receipts = persisted_deployment_receipts(
+                    state, cfg, deployment_wcfg, submission, receipts,
+                    profile_snapshot=profile_snapshot)
+            except GateError as exc:
+                return reconciliation_fail_closed(history, row, exc)
+            try:
+                finalize_success(
+                    cfg, wcfg, history, row, submission, receipts,
+                    state.get("next_state") or {},
+                    int(state.get("cycle") or row.get("cycle") or 1),
+                    transaction=note,
+                    final_notification=state.get("final_notification"))
+            except NotificationPending as exc:
+                return final_notification_pending(history, row, exc)
+            except GateError as exc:
+                return reconciliation_fail_closed(history, row, exc)
+            clear_transaction()
+            log(f"reconciled notification for previously verified {slug}")
+            return {"outcome": "reconciled-contributed", "slug": slug,
+                    "receipts": receipts}
         try:
             clean_interrupted_vision_pr(state, deployment_wcfg)
+            deployment_args = {
+                "health": health,
+                "transaction": note,
+            }
+            if profile_snapshot:
+                deployment_args["profile_snapshot"] = profile_snapshot
             receipts = finish_platform_deployments(
                 cfg, deployment_wcfg, workspace, clone, submission, receipts,
-                health=health, transaction=note)
+                **deployment_args)
+        except GateError as e:
+            if profile_snapshot:
+                return reconciliation_fail_closed(history, row, e)
+            return deployment_pending(
+                history, row, e, transaction=note, wcfg=deployment_wcfg)
         except (DeploymentPending, AbortError, GateError, CommandError,
                 subprocess.TimeoutExpired, json.JSONDecodeError, OSError,
                 ValueError, KeyError) as e:
             return deployment_pending(
                 history, row, e, transaction=note, wcfg=deployment_wcfg)
-        finalize_success(cfg, wcfg, history, row, submission, receipts,
-                         state.get("next_state") or {},
-                         int(state.get("cycle") or row.get("cycle") or 1))
+        try:
+            finalize_success(
+                cfg, wcfg, history, row, submission, receipts,
+                state.get("next_state") or {},
+                int(state.get("cycle") or row.get("cycle") or 1),
+                transaction=note,
+                final_notification=state.get("final_notification"))
+        except NotificationPending as exc:
+            return final_notification_pending(history, row, exc)
+        except GateError as exc:
+            return reconciliation_fail_closed(history, row, exc)
         clear_transaction()
         log(f"reconciled: {slug} was merged before the interruption and is now "
             f"recorded")
@@ -3787,9 +5934,64 @@ def reconcile(cfg, wcfg, history, ctx=None, health=None):
         shutil.rmtree(workspace, ignore_errors=True)
 
 
+def _finish_art_notification(cfg, wcfg, history, row, submission, receipts,
+                             transaction=None, final_notification=None):
+    if receipts.get("collective_url"):
+        view = receipts["collective_url"]
+        kind = "pages"
+        view_note = ""
+    else:
+        view, kind, view_note = verified_view(cfg, wcfg, submission)
+    row["view_url"], row["view_kind"] = view, kind
+    row["vision_url"] = (receipts.get("vision_url")
+                         or (receipts.get("vision") or {}).get(
+                             "watch_url", ""))
+    save_history(history)
+
+    expected = final_notification_record(
+        cfg, wcfg, row, submission, receipts, view, view_note)
+    record = (
+        validate_final_notification(final_notification, expected)
+        if final_notification is not None else expected)
+    enqueue_final_art_notification(cfg, record, transaction)
+    open_final_art(wcfg, receipts)
+    return record
+
+
 def finalize_success(cfg, wcfg, history, row, submission, receipts, next_state,
-                     expected_cycle):
+                     expected_cycle, transaction=None,
+                     final_notification=None):
     """The one place a verified merge becomes ledger, chain, and message."""
+    detail = (
+        f"{submission['title']} ({submission['slug']}) merged as "
+        f"{receipts['merge_commit'][:12]}")
+    if transaction:
+        transaction(
+            phase="notification-preparing",
+            notification_id=final_notification_id(
+                row, submission, receipts))
+    if row.get("outcome") == OUTCOME_CONTRIBUTED:
+        if (row.get("slug") != submission["slug"]
+                or row.get("merge_commit") != receipts["merge_commit"]):
+            raise GateError(
+                "contributed row conflicts with final notification transaction")
+        _finish_art_notification(
+            cfg, wcfg, history, row, submission, receipts,
+            transaction=transaction, final_notification=final_notification)
+        row.pop("notification_error", None)
+        save_history(history)
+        log(f"{row['role']}: {OUTCOME_CONTRIBUTED} — {row['detail'][:200]}")
+        write_status(
+            OUTCOME_CONTRIBUTED, row["detail"], role=row["role"],
+            cycle=row.get("cycle"), children=row.get("children", 0),
+            slug=row.get("slug", ""), pr=receipts.get("pr_url", ""))
+        return {
+            "outcome": OUTCOME_CONTRIBUTED,
+            "role": row["role"],
+            "detail": row["detail"],
+            "receipts": receipts,
+        }
+
     state_path = HOME / str(wcfg["creative_state_file"])
     previous_state = strict_load(state_path, {}, expect=dict)
     atomic_write_json(state_path,
@@ -3797,8 +5999,8 @@ def finalize_success(cfg, wcfg, history, row, submission, receipts, next_state,
                                            expected_cycle, submission["slug"],
                                            receipts, wcfg))
     return _finish(cfg, wcfg, history, row, OUTCOME_CONTRIBUTED,
-                   f"{submission['title']} ({submission['slug']}) merged as "
-                   f"{receipts['merge_commit'][:12]}", receipts, submission)
+                   detail, receipts, submission, transaction=transaction,
+                   final_notification=final_notification)
 
 
 def run_once(cfg=None, health=None, role=None, dry_run=False):
@@ -3820,6 +6022,16 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
     if depth > 0:
         return _skip(f"nested run refused — {SS.DEPTH_ENV}={depth}; "
                      f"sub-sentinels may not run the worker")
+
+    configured_worker = (
+        cfg.get("evolve_worker")
+        if isinstance(cfg.get("evolve_worker"), dict) else {})
+    try:
+        profile_snapshot = publication_profile_snapshot(wcfg)
+        enforce_reviewed_controller_contract(
+            wcfg, profile_snapshot, configured_worker)
+    except (GateError, TypeError, ValueError) as e:
+        return _skip(f"publication profile preflight failed: {e}")
 
     # One validated set of choices for the entire pass: pinned binaries, the
     # sanitized git environment with its generated credential helper, the gh
@@ -3872,12 +6084,15 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
         creative = strict_load(state_path, {}, expect=dict)
         expected_cycle, expected_previous = next_creative_cycle(creative, wcfg)
 
-        fcfg = SS.fanout_config(wcfg)
+        fcfg = profiled_fanout_config(wcfg, profile_snapshot)
         if dry_run:
             specs, note = SS.plan_children(fcfg, history, depth)
             summary = {"outcome": "dry-run", "role": slug_role,
                        "cycle": expected_cycle, "previous_slug": expected_previous,
                        "budget": f"{used}/{cap}", "depth": depth,
+                       "publication_profile": (
+                           profile_snapshot["profile"]
+                           if profile_snapshot else ""),
                        "children": [s["name"] for s in specs], "fanout": note,
                        "maker_argv": maker_argv(
                            wcfg, HOME / "state" / "evolve-workspaces" /
@@ -3973,7 +6188,13 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             save_history(history)
             try:
                 finalists, digest = SS.aggregate(results, fcfg)
-            except SS.FanoutError as e:
+                if profile_snapshot:
+                    _reject_credential_material(
+                        {"finalists": finalists, "digest": digest},
+                        "reviewed-PNG fan-out",
+                        path="fanout",
+                    )
+            except (SS.FanoutError, GateError) as e:
                 return _finish(cfg, wcfg, history, row, OUTCOME_FANOUT, str(e))
             atomic_write_json(staging / "finalists.json",
                               {"finalists": finalists, "digest": digest})
@@ -4017,17 +6238,19 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             # Whole tree first: a draft, a note, a rewritten prior.json or a
             # second copy of the piece anywhere in staging fails the cycle
             # before its output is even read.
-            verify_staging_tree(staging, baseline, wcfg)
+            verify_staging_tree(
+                staging, baseline, wcfg, profile_snapshot=profile_snapshot)
             visual_receipt = materialize_azure_image(staging, wcfg)
             if visual_receipt:
                 log("Azure image accepted by multimodal review — "
-                    f"score {visual_receipt['score']:.1f}, "
+                    f"score {visual_receipt['score']}, "
                     f"attempt {visual_receipt['attempts']}")
             submission = gate_directory(staging / "out", wcfg, expected_cycle,
                                         expected_previous,
                                         SS.expected_round1(finalists)
                                         if finalists else None,
-                                        known_slugs)
+                                        known_slugs,
+                                        profile_snapshot=profile_snapshot)
             install_into_clone(clone, submission)
             verify_clone_scope(clone, submission, wcfg, base_sha, ctx)
         except GateError as e:
@@ -4054,20 +6277,29 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
             # and send the same message the interrupted one would have.
             "submission": {k: submission[k] for k in
                            ("slug", "title", "kind", "meta", "meta_path",
-                            "piece_path", "meta_sha256", "piece_sha256")},
+                            "piece_path", "meta_sha256", "piece_sha256", "image")
+                           if k in submission},
             # (bytes are deliberately not persisted: the digests are the
             # contract, and reconciliation re-reads the merged file anyway)
             "next_state": next_state,
             # A retry must deploy the entry that was gated in this cycle even
             # if the operator changes channel metadata before Pages finishes.
             "rapp_vision": vision_config(wcfg),
+            "profile_snapshot": profile_snapshot,
         })
         row["slug"] = submission["slug"]
         save_history(history)
         note()
         try:
             receipts = publish(clone, submission, wcfg, health,
-                               transaction=note, ctx=ctx)
+                               transaction=note, ctx=ctx,
+                               profile_snapshot=profile_snapshot)
+        except ChecksPending as e:
+            return collective_checks_pending(
+                history, row, e, transaction=note)
+        except MergeAmbiguous as e:
+            return canonical_merge_pending(
+                history, row, e, transaction=note)
         except AbortError as e:
             clear_transaction()
             return _finish(cfg, wcfg, history, row, OUTCOME_ABORTED, str(e))
@@ -4096,8 +6328,12 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
 
         # Only here — both merged, re-read, byte-checked and live on Pages —
         # does the ledger move or a message leave the machine.
-        summary = finalize_success(cfg, wcfg, history, row, submission, receipts,
-                                   next_state, expected_cycle)
+        try:
+            summary = finalize_success(
+                cfg, wcfg, history, row, submission, receipts,
+                next_state, expected_cycle, transaction=note)
+        except NotificationPending as exc:
+            return final_notification_pending(history, row, exc)
         clear_transaction()
         return summary
     except LedgerError as e:
@@ -4135,6 +6371,24 @@ def run_once(cfg=None, health=None, role=None, dry_run=False):
 
 def fanout_situation(cfg, wcfg, role, cycle, previous_slug):
     """The bounded description of the moment, handed to tool-less children."""
+    if publication_profile_snapshot(wcfg):
+        artifact = (
+            "publication profile: azure-reviewed-png\n"
+            "all candidates must be visual image concepts for one generated "
+            "PNG; discuss composition, palette, lighting, texture, focal "
+            "hierarchy, and visible risks only\n"
+            "no SVG, markdown, text, JSON, code, interactive work, or "
+            "nonvisual fallback is permitted\n"
+            "the maker writes a visual piece.prompt; trusted controller code "
+            "alone generates and reviews the PNG"
+        )
+    else:
+        artifact = (
+            f"the piece must be one self-contained file "
+            f"({', '.join(allowed_kinds(wcfg))}) "
+            f"under {int(wcfg.get('max_piece_bytes', 51200)) // 1024} KB, "
+            "CC0-1.0, in submissions/<slug>/"
+        )
     return (f"collective: {sentinel.instance_name(cfg)}\n"
             f"neighbor acting: {role}\n"
             f"cycle: {cycle} (the previous submission was "
@@ -4142,14 +6396,11 @@ def fanout_situation(cfg, wcfg, role, cycle, previous_slug):
             f"commons: {wcfg.get('repo')}\n"
             f"standing directive: "
             f"{sentinel.evolve_brief(cfg) or 'none'}\n"
-            f"the piece must be one self-contained file "
-            f"({', '.join(allowed_kinds(wcfg))}) "
-            f"under {int(wcfg.get('max_piece_bytes', 51200)) // 1024} KB, "
-            f"CC0-1.0, in submissions/<slug>/")
+            f"{artifact}")
 
 
 def _finish(cfg, wcfg, history, row, outcome, detail, receipts=None,
-            submission=None):
+            submission=None, transaction=None, final_notification=None):
     """Close the row out honestly, then chain-frame and notify."""
     row["outcome"] = outcome
     row["detail"] = str(detail)[:400]
@@ -4172,35 +6423,14 @@ def _finish(cfg, wcfg, history, row, outcome, detail, receipts=None,
 
     text = notification_for(outcome, row["role"], str(detail), receipts)
     if outcome == OUTCOME_CONTRIBUTED and submission and receipts:
-        # The one message a human wants: the title, the artwork itself, and
-        # the evidence. Sent HERE and nowhere else, because here is after the
-        # merge commit was fetched back and the merged bytes were compared —
-        # a message that says "merged" for anything less is a lie with a link.
-        #
-        # The View URL is PROBED first (#10): Pages publishes on its own
-        # schedule, and a triumphant 404 teaches the reader to ignore the
-        # next one.
-        #
-        # rebuild=True: the static report attached to this alert renders the
-        # chains this cycle just wrote. Rebuilding first is the difference
-        # between linked evidence and linked yesterday.
-        if receipts.get("collective_url"):
-            view = receipts["collective_url"]
-            kind = "pages"
-            view_note = ""
-        else:
-            view, kind, view_note = verified_view(cfg, wcfg, submission)
-        row["view_url"], row["view_kind"] = view, kind
-        row["vision_url"] = (receipts.get("vision_url")
-                             or (receipts.get("vision") or {}).get(
-                                 "watch_url", ""))
-        save_history(history)
-        sentinel.notify(cfg, art_notification(cfg, wcfg, submission, receipts,
-                                              view, view_note),
-                        to=art_recipient(cfg), kind="art",
-                        attach_report=False)
-        open_final_art(wcfg, receipts)
-    elif text and (outcome != OUTCOME_DECLINED or wcfg.get("notify_declines")):
+        _finish_art_notification(
+            cfg, wcfg, history, row, submission, receipts,
+            transaction=transaction, final_notification=final_notification)
+    elif (text
+          and not (outcome == OUTCOME_REJECTED
+                   and publication_profile_name(wcfg)
+                   == AZURE_REVIEWED_PNG_PROFILE)
+          and (outcome != OUTCOME_DECLINED or wcfg.get("notify_declines"))):
         sentinel.notify(cfg, text)
     log(f"{row['role']}: {outcome} — {row['detail'][:200]}")
     write_status(outcome, row["detail"], role=row["role"],
