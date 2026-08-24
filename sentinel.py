@@ -137,7 +137,7 @@ def notification_allowed(cfg, kind="operational"):
 
 
 def notify(cfg, text, to=None, rebuild=False, kind="operational",
-           attach_report=True):
+           attach_report=True, dedupe_key=None):
     """Queue the alert, then try to deliver it.
 
     Direct osascript hangs under launchd (TCC prompt, background context), so a
@@ -151,10 +151,10 @@ def notify(cfg, text, to=None, rebuild=False, kind="operational",
     today's news is worse than no link.
     """
     if not cfg.get("notify") or not notification_allowed(cfg, kind):
-        return
+        return False
     to = to or cfg.get("notify_handle")
     if not to:
-        return
+        return False
     try:
         import outbox
         payload = text
@@ -169,11 +169,19 @@ def notify(cfg, text, to=None, rebuild=False, kind="operational",
             suffix = ("\n\nStatic HTML report:\n" + "\n".join(urls) if urls
                       else "\n\nStatic HTML report generation failed; alert preserved.")
             payload += suffix
-        outbox.enqueue(payload, to)
-        if not cfg.get("notify_queue_only"):
-            outbox.drain()
+        if dedupe_key is None:
+            outbox.enqueue(payload, to)
+        else:
+            outbox.enqueue(payload, to, dedupe_key=dedupe_key)
     except Exception as e:
         log(f"notify failed: {e}")
+        return False
+    if not cfg.get("notify_queue_only"):
+        try:
+            outbox.drain()
+        except Exception as e:
+            log(f"notify drain failed after durable enqueue: {e}")
+    return True
 
 
 def publish_head_hook(cfg):

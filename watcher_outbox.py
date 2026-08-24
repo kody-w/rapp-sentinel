@@ -55,26 +55,32 @@ def _save_attempts_unlocked(data):
 
 
 def _append_durable(path, payload):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-        handle.flush()
-        os.fsync(handle.fileno())
+    return outbox._append_durable(path, payload)
 
 
 def _claim_head(path):
     expected = (path / "hash").read_text(encoding="utf-8")
+    outbox._recover_terminal_tails_unlocked()
+    outbox._recover_inflight_unlocked()
     lines = outbox._queue_lines_unlocked()
     if not lines:
         raise RuntimeError("outbox changed before claim completion")
     actual = _digest(lines[0])
     if actual != expected:
         raise RuntimeError("outbox head changed before claim completion")
-    return expected, lines, json.loads(lines[0])
+    message = json.loads(lines[0])
+    entry_id = outbox._queue_entry_identity(message, actual)
+    claim_entry = path / "entry_id"
+    if (claim_entry.exists()
+            and claim_entry.read_text(encoding="utf-8") != entry_id):
+        raise RuntimeError("outbox entry changed before claim completion")
+    return expected, lines, message
 
 
 def claim():
     with outbox._locked(outbox.LOCK):
+        outbox._recover_terminal_tails_unlocked()
+        outbox._recover_inflight_unlocked()
         lines = outbox._queue_lines_unlocked()
         if not lines:
             return 3
@@ -83,8 +89,11 @@ def claim():
         if message.get("attachments"):
             return 4
         digest = _digest(raw_line)
+        entry_id = outbox._queue_entry_identity(message, digest)
         attempts = _load_attempts_unlocked()
         retry = attempts.get(digest) or {}
+        if retry.get("entry_id") not in (None, entry_id):
+            raise RuntimeError("attempt ledger identifies a different queue entry")
         if retry.get("next_attempt"):
             try:
                 gate = datetime.fromisoformat(retry["next_attempt"])
@@ -99,6 +108,7 @@ def claim():
             ("text", message["text"]),
             ("to", message["to"]),
             ("hash", digest),
+            ("entry_id", entry_id),
         ):
             target = path / name
             target.write_text(str(value), encoding="utf-8")
@@ -112,7 +122,7 @@ def acknowledge(raw, reason=""):
     path = _validated_claim(raw)
     with outbox._locked(outbox.LOCK):
         expected, lines, message = _claim_head(path)
-        outbox._append_sent(message)
+        outbox._append_sent(message, queue_sha256=expected)
         outbox._rewrite_queue_unlocked(lines[1:])
         attempts = _load_attempts_unlocked()
         attempts.pop(expected, None)
@@ -132,6 +142,8 @@ def uncertain(raw, reason):
         expected, lines, message = _claim_head(path)
         _append_durable(outbox.UNVERIFIED, {
             **message,
+            "entry_id": outbox._queue_entry_identity(message, expected),
+            "queue_sha256": expected,
             "attempted_at": outbox.now(),
             "reason": reason[:240],
         })
@@ -158,6 +170,8 @@ def fail(raw, reason):
         if dead:
             _append_durable(outbox.DEAD_LETTER, {
                 **message,
+                "entry_id": outbox._queue_entry_identity(message, expected),
+                "queue_sha256": expected,
                 "failed_at": outbox.now(),
                 "attempts": count,
                 "reason": reason[:240],
@@ -168,6 +182,7 @@ def fail(raw, reason):
         else:
             delay = BACKOFF_SECONDS[min(count - 1, len(BACKOFF_SECONDS) - 1)]
             attempts[expected] = {
+                "entry_id": outbox._queue_entry_identity(message, expected),
                 "count": count,
                 "last_failure": outbox.now(),
                 "next_attempt": (

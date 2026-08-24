@@ -7,6 +7,7 @@ timeout that texted a paintbrush. Mocks and temp git repos only — nothing here
 touches the live instance, GitHub, or a model.
 """
 
+import copy
 import json
 import hashlib
 import os
@@ -19,6 +20,7 @@ import sys
 import time
 import unittest
 import uuid
+import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
@@ -31,6 +33,7 @@ SCRATCH = Path(__file__).resolve().parent / ".tmp-evolve-worker-tests"
 # Captured before any test patches it: ArtDeliveryTests puts the REAL notify
 # back so it can watch the genuine path reach the genuine queue.
 REAL_NOTIFY = sentinel.notify
+REAL_PNG_PROBE = EW.probe_png_url
 NOW = datetime(2026, 8, 17, 22, 0, tzinfo=timezone.utc)
 
 
@@ -71,9 +74,103 @@ def git_bare(bare, *args):
 
 SVG = ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
        '<circle cx="5" cy="5" r="4"/></svg>')
-PNG = (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR"
-       + struct.pack(">II", 1536, 1024) + b"\x08\x06\x00\x00\x00"
-       + b"\x00\x00\x00\x00")
+
+TRUSTED_COLLECTIVE_VALIDATOR = """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+
+if sys.argv[1:] != ["--validate"]:
+    print("expected --validate", file=sys.stderr)
+    raise SystemExit(2)
+submissions = Path(__file__).resolve().parents[1] / "submissions"
+count = 0
+for directory in sorted(path for path in submissions.iterdir() if path.is_dir()):
+    json.loads(directory.joinpath("meta.json").read_text(encoding="utf-8"))
+    count += 1
+print(f"all submissions valid ({count} submissions)")
+"""
+
+
+def png_chunk(kind, payload, crc=None):
+    body = kind + payload
+    checksum = zlib.crc32(body) & 0xFFFFFFFF if crc is None else crc
+    return struct.pack(">I", len(payload)) + body + struct.pack(">I", checksum)
+
+
+def real_png(width=512, height=512, color_type=6, compressed=None):
+    channels = 3 if color_type == 2 else 4
+    ihdr = struct.pack(
+        ">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    if compressed is None:
+        pixel = b"\x35\x78\xa0" + (b"\xff" if channels == 4 else b"")
+        scanline = b"\x00" + pixel * width
+        compressed = zlib.compress(scanline * height, level=9)
+    return (EW.azure_art.PNG_SIGNATURE
+            + png_chunk(b"IHDR", ihdr)
+            + png_chunk(b"IDAT", compressed)
+            + png_chunk(b"IEND", b""))
+
+
+PNG = real_png()
+
+COLLECTIVE_RECEIPT_FIXTURE = json.loads(
+    Path(__file__).with_name("fixtures")
+    .joinpath("collective-reviewed-png-receipt.json")
+    .read_text(encoding="utf-8"))
+
+COLLECTIVE_CONTROLLER_CONTRACT_FIXTURE = (
+    Path(__file__).with_name("fixtures")
+    .joinpath("collective-reviewed-png-controller-contract.json"))
+
+
+def collective_controller_contract():
+    return json.loads(
+        COLLECTIVE_CONTROLLER_CONTRACT_FIXTURE.read_text(encoding="utf-8"))
+
+
+def collective_verifier_path():
+    worktrees = Path(__file__).resolve().parent.parent
+    preferred = (
+        worktrees / "public-art-png-gate-20260821"
+        / "tools" / "verify_png_attestation.py")
+    candidates = [preferred]
+    candidates.extend(
+        sorted(worktrees.glob("public-art-*/tools/verify_png_attestation.py")))
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def require_collective_verifier(test_case, context):
+    verifier = collective_verifier_path()
+    if verifier is None:
+        test_case.skipTest(
+            "real sibling Collective verify_png_attestation.py is "
+            f"unavailable for {context}"
+        )
+    return verifier
+
+
+def reviewed_png_wcfg(home, explicit=True):
+    block = {
+        "allowed_kinds": ["png"],
+        "max_piece_bytes": 10 * 1024 * 1024,
+        "azure_image": {
+            "enabled": True,
+            "endpoint": "https://dada.example.openai.azure.com",
+            "deployment": "gpt-image-2",
+            "fallback_deployment": "gpt-image-2",
+            "max_attempts": 2,
+            "minimum_review_score": 8,
+            "review_model": "gpt-5.4",
+        },
+        "rapp_vision": {
+            "enabled": True,
+            "repo": str(Path(home) / "vision"),
+        },
+    }
+    if explicit:
+        block["publication_profile"] = EW.AZURE_REVIEWED_PNG_PROFILE
+    return EW.worker_config({"evolve_worker": block})
 
 
 def dada_cycle(slug, cycle=1, previous=None, rounds=1,
@@ -114,6 +211,31 @@ def meta_for(slug, cycle=1, previous=None, round1_records=None, **overrides):
     }
     meta.update(overrides)
     return meta
+
+
+def with_reviewed_png_receipt(meta, image, wcfg):
+    snapshot = EW.publication_profile_snapshot(wcfg)
+    info = EW._check_png(image)
+    result = dict(meta)
+    result["_image_generation"] = {
+        "schema": EW.IMAGE_GENERATION_SCHEMA,
+        "profile": EW.AZURE_REVIEWED_PNG_PROFILE,
+        "provider": EW.IMAGE_PROVIDER,
+        "deployment": snapshot["deployments"][0],
+        "attempts": 1,
+        "image_sha256": hashlib.sha256(image).hexdigest(),
+        "image": {"width": info["width"], "height": info["height"]},
+        "review": {
+            "schema": EW.IMAGE_REVIEW_SCHEMA,
+            "model": snapshot["review_model"],
+            "publish": True,
+            "score": 9,
+            "minimum_score": snapshot["minimum_review_score"],
+            "failures": [],
+            "strengths": ["clear visual hierarchy"],
+        },
+    }
+    return result
 
 
 def write_submission(root, slug, meta=None, piece=SVG, piece_name="piece.svg"):
@@ -169,6 +291,9 @@ class ScratchCase(unittest.TestCase):
             return (self.probe_answer(url), "HTTP 200")
         self.probe_answer = lambda url: True
         p = mock.patch.object(EW, "probe_url", fake_probe)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(EW, "probe_png_url", fake_probe)
         p.start()
         self.addCleanup(p.stop)
         p = mock.patch.object(EW.time, "sleep", lambda *_: None)
@@ -742,6 +867,362 @@ class DadaCycleTests(unittest.TestCase):
             EW.validate_dada_cycle(None, "s", 1, None)
 
 
+class PngValidationTests(unittest.TestCase):
+    def test_real_rgb_and_rgba_pngs_are_fully_validated(self):
+        rgba = EW._check_png(PNG)
+        rgb = EW._check_png(real_png(color_type=2))
+        self.assertEqual((512, 512, 4),
+                         (rgba["width"], rgba["height"], rgba["channels"]))
+        self.assertEqual(3, rgb["channels"])
+
+    def test_header_only_and_missing_idat_pngs_are_rejected(self):
+        header_only = (
+            EW.azure_art.PNG_SIGNATURE + b"\x00\x00\x00\rIHDR"
+            + struct.pack(">II", 512, 512) + b"\x08\x06\x00\x00\x00"
+            + b"\x00\x00\x00\x00")
+        ihdr = struct.pack(">IIBBBBB", 512, 512, 8, 6, 0, 0, 0)
+        missing_idat = (
+            EW.azure_art.PNG_SIGNATURE + png_chunk(b"IHDR", ihdr)
+            + png_chunk(b"IEND", b""))
+        for candidate in (header_only, missing_idat):
+            with self.subTest(size=len(candidate)), \
+                 self.assertRaises(EW.GateError):
+                EW._check_png(candidate)
+
+    def test_bad_crc_truncated_and_oversized_chunks_are_rejected(self):
+        bad_crc = bytearray(PNG)
+        bad_crc[PNG.index(b"IDAT") + 4] ^= 0x01
+        oversized = (
+            EW.azure_art.PNG_SIGNATURE
+            + struct.pack(">I", EW.PNG_MAX_CHUNK_BYTES + 1) + b"IHDR")
+        for candidate in (bytes(bad_crc), PNG[:-3], oversized):
+            with self.subTest(size=len(candidate)), \
+                 self.assertRaises(EW.GateError):
+                EW._check_png(candidate)
+
+    def test_bad_zlib_wrong_scanline_size_and_trailing_bytes_are_rejected(self):
+        pixel = b"\x35\x78\xa0\xff"
+        one_row = zlib.compress(b"\x00" + pixel * 512)
+        for candidate in (
+                real_png(compressed=b"not-zlib"),
+                real_png(compressed=one_row),
+                PNG + b"polyglot"):
+            with self.subTest(size=len(candidate)), \
+                 self.assertRaises(EW.GateError):
+                EW._check_png(candidate)
+
+    def test_invalid_ihdr_format_dimensions_and_iend_are_rejected(self):
+        zero = real_png(width=0)
+        interlaced_ihdr = struct.pack(
+            ">IIBBBBB", 512, 512, 8, 6, 0, 0, 1)
+        interlaced = (
+            EW.azure_art.PNG_SIGNATURE
+            + png_chunk(b"IHDR", interlaced_ihdr)
+            + png_chunk(b"IDAT", zlib.compress(b""))
+            + png_chunk(b"IEND", b""))
+        nonempty_iend = PNG[:-12] + png_chunk(b"IEND", b"x")
+        for candidate in (zero, interlaced, nonempty_iend):
+            with self.subTest(size=len(candidate)), \
+                 self.assertRaises(EW.GateError):
+                EW._check_png(candidate)
+
+    def test_collective_malformed_vectors_are_rejected_identically(self):
+        too_many_pixels_ihdr = struct.pack(
+            ">IIBBBBB", 4096, 4096, 8, 6, 0, 0, 0)
+        too_many_pixels = (
+            EW.azure_art.PNG_SIGNATURE
+            + png_chunk(b"IHDR", too_many_pixels_ihdr)
+            + png_chunk(b"IDAT", zlib.compress(b""))
+            + png_chunk(b"IEND", b""))
+        ihdr_frame_end = len(EW.azure_art.PNG_SIGNATURE) + 25
+        duplicate_plte = (
+            PNG[:ihdr_frame_end]
+            + png_chunk(b"PLTE", b"\x00\x00\x00")
+            + png_chunk(b"PLTE", b"\xff\xff\xff")
+            + PNG[ihdr_frame_end:])
+        vectors = {
+            "pixel-count-over-16000000": (
+                 too_many_pixels, "pixel cap"),
+            "duplicate-PLTE": (
+                 duplicate_plte, "PLTE"),
+        }
+        for label, (candidate, expected) in vectors.items():
+            with self.subTest(vector=label), self.assertRaises(
+                     EW.GateError) as raised:
+                 EW._check_png(candidate)
+            self.assertIn(expected, str(raised.exception))
+
+
+class ReviewedPngProfileTests(ScratchCase):
+    def setUp(self):
+        super().setUp()
+        self.wcfg = reviewed_png_wcfg(self.home)
+
+    def test_explicit_and_legacy_activation_produce_the_same_snapshot(self):
+        explicit = EW.publication_profile_snapshot(self.wcfg)
+        legacy = EW.publication_profile_snapshot(
+            reviewed_png_wcfg(self.home, explicit=False))
+        self.assertEqual(explicit, legacy)
+        self.assertEqual(EW.AZURE_REVIEWED_PNG_PROFILE, explicit["profile"])
+        self.assertEqual(["png"], explicit["allowed_kinds"])
+        self.assertEqual(8, explicit["minimum_review_score"])
+
+    def test_checked_in_collective_controller_contract_matches_source(self):
+        contract = collective_controller_contract()
+        self.assertEqual(
+            {
+                "profile": EW.AZURE_REVIEWED_PNG_PROFILE,
+                "branch_prefix": EW.REVIEWED_PNG_BRANCH_PREFIX,
+                "commit_name": EW.REVIEWED_PNG_COMMIT_NAME,
+                "commit_email": EW.REVIEWED_PNG_COMMIT_EMAIL,
+                "contributor": EW.REVIEWED_PNG_CONTRIBUTOR,
+                "title_max_chars": EW.REVIEWED_PNG_TITLE_MAX_CHARS,
+                "commit_body_template": EW.REVIEWED_PNG_COMMIT_BODY_TEMPLATE,
+                "workflow": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+                "job": EW.COLLECTIVE_PROVENANCE_CHECK,
+                "rollup_json_fields": EW.PROVENANCE_ROLLUP_JSON_FIELDS,
+            },
+            {
+                key: contract[key] for key in (
+                    "profile", "branch_prefix", "commit_name", "commit_email",
+                    "contributor", "title_max_chars", "commit_body_template",
+                    "workflow", "job", "rollup_json_fields",
+                )
+            })
+
+    def test_title_error_matches_checked_in_collective_contract_fixture(self):
+        contract = collective_controller_contract()
+        label = "visual-piece: title"
+        expected = contract["title_error_template"].format(
+            label=label, max_chars=contract["title_max_chars"])
+        with self.assertRaises(EW.GateError) as raised:
+            EW.validate_reviewed_submission_contract(
+                meta_for("visual-piece", kind="png", title=" padded"))
+        self.assertEqual(expected, str(raised.exception))
+
+    def test_title_error_matches_current_collective_verifier_contract(self):
+        contract = collective_controller_contract()
+        label = "visual-piece: title"
+        expected = contract["title_error_template"].format(
+            label=label, max_chars=contract["title_max_chars"])
+        verifier = require_collective_verifier(
+            self, "title-verifier cross-check")
+        script = (
+            "import sys\n"
+            f"sys.path.insert(0, {str(verifier.parent)!r})\n"
+            "import verify_png_attestation as verifier\n"
+            "try:\n"
+            f"    verifier._text(' padded', {label!r}, "
+            f"{contract['title_max_chars']})\n"
+            "except verifier.AttestationError as exc:\n"
+            "    print(str(exc))\n"
+            "    raise SystemExit(7)\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(verifier.parents[1]),
+            env={**EW._minimal_env(), "PYTHONDONTWRITEBYTECODE": "1"},
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        self.assertEqual(7, result.returncode, result.stderr)
+        self.assertEqual(expected, result.stdout.strip())
+
+    def test_title_verifier_cross_check_skips_without_collective_verifier(self):
+        with mock.patch.object(
+                sys.modules[__name__], "collective_verifier_path",
+                return_value=None):
+            with self.assertRaises(unittest.SkipTest) as raised:
+                self.test_title_error_matches_current_collective_verifier_contract()
+        self.assertEqual(
+            "real sibling Collective verify_png_attestation.py is "
+            "unavailable for title-verifier cross-check",
+            str(raised.exception),
+        )
+
+    def test_omitted_reviewed_identity_is_derived_but_conflicts_fail(self):
+        raw = {
+            key: value for key, value in reviewed_png_wcfg(self.home).items()
+            if key not in ("branch_prefix", "git_author_name",
+                           "git_author_email")
+        }
+        wcfg = EW.worker_config({"evolve_worker": raw})
+        snapshot = EW.publication_profile_snapshot(wcfg)
+        contract = EW.enforce_reviewed_controller_contract(
+            wcfg, snapshot, raw)
+        self.assertEqual(EW.REVIEWED_PNG_BRANCH_PREFIX,
+                         contract["branch_prefix"])
+        self.assertEqual(EW.REVIEWED_PNG_COMMIT_NAME,
+                         contract["git_author_name"])
+        self.assertEqual(EW.REVIEWED_PNG_COMMIT_EMAIL,
+                         contract["git_author_email"])
+
+        for field, value in (
+                ("branch_prefix", "art"),
+                ("git_author_name", "Mutable Child"),
+                ("git_author_email", "mutable@example.com")):
+            configured = dict(raw, **{field: value})
+            candidate = EW.worker_config({"evolve_worker": configured})
+            with self.subTest(field=field), self.assertRaises(EW.GateError):
+                EW.enforce_reviewed_controller_contract(
+                    candidate,
+                    EW.publication_profile_snapshot(candidate),
+                    configured)
+
+    def test_every_conflicting_profile_setting_fails(self):
+        mutations = {
+            "allowed kinds": lambda cfg: cfg.update(allowed_kinds=["png", "svg"]),
+            "Azure disabled": lambda cfg: cfg["azure_image"].update(enabled=False),
+            "review below eight": lambda cfg: cfg["azure_image"].update(
+                minimum_review_score=7),
+            "Vision disabled": lambda cfg: cfg["rapp_vision"].update(enabled=False),
+            "piece cap too small": lambda cfg: cfg.update(
+                max_piece_bytes=EW.PROFILE_MIN_PIECE_BYTES - 1),
+            "piece cap unbounded": lambda cfg: cfg.update(
+                max_piece_bytes=EW.PROFILE_MAX_PIECE_BYTES + 1),
+        }
+        for label, mutate in mutations.items():
+            cfg = reviewed_png_wcfg(self.home)
+            mutate(cfg)
+            with self.subTest(label=label), self.assertRaises(EW.GateError):
+                EW.publication_profile_snapshot(cfg)
+
+    def test_deployment_and_review_model_must_be_bounded_identifiers(self):
+        cases = {
+            "deployment with spaces": ("deployment", "gpt image 2"),
+            "review model with spaces": ("review_model", "gpt 5.4"),
+        }
+        for label, (field, value) in cases.items():
+            cfg = reviewed_png_wcfg(self.home)
+            cfg["azure_image"][field] = value
+            with self.subTest(case=label), self.assertRaises(
+                    EW.GateError) as raised:
+                EW.publication_profile_snapshot(cfg)
+            self.assertIn("bounded identifier", str(raised.exception))
+
+    def test_unknown_profile_is_rejected(self):
+        bad = dict(self.wcfg, publication_profile="looks-visual-enough")
+        with self.assertRaises(EW.GateError):
+            EW.publication_profile_snapshot(bad)
+
+    def test_png_is_never_available_outside_the_reviewed_profile(self):
+        self.assertEqual(
+            ("svg", "md", "txt", "json"),
+            EW.allowed_kinds(EW.worker_config({})))
+        for kinds in (["png"], ["svg", "png"], ["png", "json"]):
+            wcfg = EW.worker_config({
+                "evolve_worker": {
+                    "allowed_kinds": kinds,
+                    "azure_image": {"enabled": False},
+                },
+            })
+            with self.subTest(kinds=kinds), self.assertRaises(EW.GateError):
+                EW.publication_profile_snapshot(wcfg)
+
+    def test_unprofiled_png_is_rejected_by_the_gate_itself(self):
+        staging = self.home / "legacy-png"
+        out = EW.prepare_staging(staging)
+        out.joinpath("meta.json").write_text(
+            json.dumps(meta_for("legacy-png", kind="png")),
+            encoding="utf-8")
+        out.joinpath("piece.png").write_bytes(PNG)
+        wcfg = EW.worker_config({
+            "evolve_worker": {"allowed_kinds": ["png"]}})
+        with self.assertRaises(EW.GateError) as raised:
+            EW.gate_directory(
+                staging / "out", wcfg, 1, None, known_slugs=set())
+        self.assertIn("PNG requires", str(raised.exception))
+
+    def test_reviewed_vision_relationships_fail_in_profile_preflight(self):
+        mutations = {
+            "thumb escapes channel": {
+                "media_dir": "other/media",
+            },
+            "registry collides with channel": {
+                "registry_path": "dada/channel.json",
+            },
+            "registry is missing": {
+                "registry_path": "",
+            },
+            "channel is inside media": {
+                "channel_path": "dada/media/channel.json",
+            },
+            "registry is inside media": {
+                "registry_path": "dada/media/channels.json",
+            },
+            "app base already has a fragment": {
+                "collective_viewer_url": (
+                    "https://example.test/view.html#/already"),
+            },
+        }
+        for label, changes in mutations.items():
+            wcfg = reviewed_png_wcfg(self.home)
+            wcfg["rapp_vision"] = {
+                **wcfg["rapp_vision"],
+                **changes,
+            }
+            with self.subTest(case=label), self.assertRaises(EW.GateError):
+                EW.publication_profile_snapshot(wcfg)
+
+    def test_maker_and_child_prompts_are_visual_only(self):
+        self.wcfg["fanout"] = {"enabled": True, "children": 3}
+        role = next(iter(EW.NB.NEIGHBORS))
+        identities = {name: f"rappid:test:{name}" for name in EW.NB.NEIGHBORS}
+        roll = {name: {"alive": True} for name in EW.NB.NEIGHBORS}
+        with mock.patch.object(EW.NB, "identities", return_value=identities), \
+             mock.patch.object(EW.NB, "roll_call", return_value=roll), \
+             mock.patch.object(
+                 EW.NB, "chain_path", return_value=self.home / "chain.jsonl"):
+            prompt = EW.build_prompt(
+                {"instance_name": "Dada"}, self.wcfg, role,
+                self.home / "staging", 1, None, [])
+        self.assertIn("Every candidate, critique, round winner", prompt)
+        self.assertIn("NEVER write piece.png yourself", prompt)
+        self.assertIn("Write meta.json, piece.prompt, and state-out.json only",
+                      prompt)
+        self.assertNotIn("piece.<ext>", prompt)
+
+        fcfg = EW.profiled_fanout_config(
+            self.wcfg, EW.publication_profile_snapshot(self.wcfg))
+        specs, _ = EW.SS.plan_children(fcfg, [], 0, now=NOW)
+        self.assertNotIn("execution-designer", [item["name"] for item in specs])
+        situation = EW.fanout_situation(
+            {"instance_name": "Dada"}, self.wcfg, role, 1, None)
+        child = EW.SS.child_prompt(
+            specs[0], fcfg, 1, "Dada", role, situation, [], [])
+        self.assertIn("visual-only", child)
+        self.assertIn("Never propose SVG, markdown, text, JSON", child)
+        self.assertNotIn("self-contained SVG, markdown, text or json", child)
+        repair = EW.SS.repair_prompt(
+            specs[0], fcfg, 1, "bad JSON", "{}")
+        self.assertIn("visual-only", repair)
+
+    def test_legacy_profiles_keep_the_execution_designer(self):
+        legacy = EW.worker_config({
+            "evolve_worker": {"fanout": {"enabled": True, "children": 3}}})
+        fcfg = EW.profiled_fanout_config(legacy)
+        specs, _ = EW.SS.plan_children(fcfg, [], 0, now=NOW)
+        self.assertIn("execution-designer", [item["name"] for item in specs])
+
+    def test_vision_refuses_unreceipted_png_before_any_repository_work(self):
+        submission = {
+            "slug": "visual-piece",
+            "title": "Visual Piece",
+            "kind": "png",
+            "meta": meta_for("visual-piece", kind="png"),
+            "piece_path": "submissions/visual-piece/piece.png",
+            "piece_sha256": hashlib.sha256(PNG).hexdigest(),
+        }
+        with mock.patch.object(EW, "_clone_repo") as clone, \
+             self.assertRaises(EW.GateError):
+            EW.publish_rapp_vision(
+                self.home / "workspace", submission, PNG, self.wcfg,
+                lambda phase: healthy(),
+                profile_snapshot=EW.publication_profile_snapshot(self.wcfg))
+        clone.assert_not_called()
+
+
 class AzureImagePipelineTests(ScratchCase):
     def setUp(self):
         super().setUp()
@@ -749,8 +1230,13 @@ class AzureImagePipelineTests(ScratchCase):
         self.out = EW.prepare_staging(self.staging)
         self.baseline = EW.staging_manifest(self.staging)
         self.wcfg = EW.worker_config({"evolve_worker": {
+            "publication_profile": EW.AZURE_REVIEWED_PNG_PROFILE,
             "allowed_kinds": ["png"],
             "max_piece_bytes": 10 * 1024 * 1024,
+            "rapp_vision": {
+                "enabled": True,
+                "repo": str(self.home / "vision"),
+            },
             "azure_image": {
                 "enabled": True,
                 "endpoint": "https://dada.example.openai.azure.com",
@@ -793,11 +1279,379 @@ class AzureImagePipelineTests(ScratchCase):
         self.assertEqual(PNG, (self.out / "piece.png").read_bytes())
         self.assertEqual(PNG, (EW.ART_ARCHIVE / "visual-piece.png").read_bytes())
         meta = json.loads((self.out / "meta.json").read_text())
-        self.assertEqual(9, meta["_image_generation"]["review"]["score"])
+        generation = meta["_image_generation"]
+        self.assertEqual(EW.IMAGE_GENERATION_SCHEMA, generation["schema"])
+        self.assertEqual(EW.AZURE_REVIEWED_PNG_PROFILE, generation["profile"])
+        self.assertEqual(
+            hashlib.sha256(PNG).hexdigest(), generation["image_sha256"])
+        self.assertEqual(
+            {"width": 512, "height": 512}, generation["image"])
+        self.assertEqual(EW.IMAGE_REVIEW_SCHEMA,
+                         generation["review"]["schema"])
+        self.assertTrue(generation["review"]["publish"])
+        self.assertEqual(9, generation["review"]["score"])
+        self.assertEqual(8, generation["review"]["minimum_score"])
+        self.assertEqual([], generation["review"]["failures"])
         submission = EW.gate_directory(
             self.staging / "out", self.wcfg, 2, "already-here", None,
             {"already-here"})
         self.assertEqual("png", submission["kind"])
+        self.assertEqual({"width": 512, "height": 512}, submission["image"])
+
+    def test_reviewed_title_and_contributor_fail_before_remote_effects(self):
+        original = json.loads(self.out.joinpath("meta.json").read_text())
+        cases = {
+            "leading whitespace": {"title": " Visual Piece"},
+            "trailing whitespace": {"title": "Visual Piece "},
+            "201 characters": {"title": "x" * 201},
+            "tab": {"title": "Visual\tPiece"},
+            "newline": {"title": "Visual\nPiece"},
+            "control": {"title": "Visual\x1fPiece"},
+            "wrong contributor": {"contributor": "someone-else"},
+        }
+        for label, changes in cases.items():
+            meta = json.loads(json.dumps(original))
+            meta.update(changes)
+            self.out.joinpath("meta.json").write_text(
+                json.dumps(meta), encoding="utf-8")
+            archive = self.home / f"archive-{label.replace(' ', '-')}"
+            generator = mock.Mock(return_value=(PNG, "gpt-image-2"))
+            reviewer = mock.Mock(return_value=self.good_review())
+            with self.subTest(case=label), \
+                    mock.patch.object(EW, "ART_ARCHIVE", archive), \
+                    self.assertRaises(EW.GateError):
+                EW.materialize_azure_image(
+                    self.staging, self.wcfg, generator, reviewer)
+            generator.assert_not_called()
+            reviewer.assert_not_called()
+            self.assertFalse(archive.exists())
+            self.assertFalse(self.out.joinpath("piece.png").exists())
+
+    def test_reviewed_title_boundary_lengths_materialize(self):
+        for length in (1, EW.REVIEWED_PNG_TITLE_MAX_CHARS):
+            staging = self.home / f"title-boundary-{length}" / "staging"
+            out = EW.prepare_staging(staging)
+            prompt = self.prompt
+            out.joinpath("meta.json").write_text(
+                json.dumps(meta_for(
+                    f"title-boundary-{length}",
+                    kind="png",
+                    title="x" * length,
+                    _image_prompt=prompt,
+                )),
+                encoding="utf-8",
+            )
+            out.joinpath("piece.prompt").write_text(
+                prompt, encoding="utf-8")
+            archive = self.home / f"title-boundary-{length}" / "archive"
+            with self.subTest(length=length), \
+                    mock.patch.object(EW, "ART_ARCHIVE", archive):
+                result = EW.materialize_azure_image(
+                    staging,
+                    self.wcfg,
+                    generator=lambda *_: (PNG, "gpt-image-2"),
+                    reviewer=self.good_review,
+                )
+            self.assertEqual(9, result["score"])
+            self.assertEqual(
+                PNG,
+                archive.joinpath(f"title-boundary-{length}.png").read_bytes(),
+            )
+
+    def test_invalid_slug_is_rejected_before_any_filesystem_or_azure_write(self):
+        cases = {
+            "traversal": "../escape",
+            "nested traversal": "valid/../../escape",
+            "absolute": str(self.home / "absolute-escape"),
+            "forward separator": "visual/piece",
+            "back separator": r"visual\piece",
+            "unicode confusable": "visual\u2010piece",
+            "overlength": "a" * (EW.SLUG_MAX + 1),
+        }
+        original = json.loads(self.out.joinpath("meta.json").read_text())
+        for label, slug in cases.items():
+            meta = json.loads(json.dumps(original))
+            meta["slug"] = slug
+            self.out.joinpath("meta.json").write_text(
+                json.dumps(meta), encoding="utf-8")
+            archive = self.home / "archive-zone" / label / "art"
+            before = {
+                path.relative_to(self.home)
+                for path in self.home.rglob("*")
+            }
+            generator = mock.Mock(return_value=(PNG, "gpt-image-2"))
+            reviewer = mock.Mock(return_value=self.good_review())
+            with self.subTest(case=label), \
+                    mock.patch.object(EW, "ART_ARCHIVE", archive), \
+                    self.assertRaises(EW.GateError):
+                EW.materialize_azure_image(
+                    self.staging, self.wcfg, generator, reviewer)
+            after = {
+                path.relative_to(self.home)
+                for path in self.home.rglob("*")
+            }
+            self.assertEqual(before, after)
+            generator.assert_not_called()
+            reviewer.assert_not_called()
+            self.assertFalse(archive.exists())
+            self.assertFalse(any(
+                path.is_file() and path.read_bytes() == PNG
+                for path in self.home.rglob("*")
+            ))
+
+    def test_resolved_archive_destination_must_remain_a_direct_child(self):
+        archive = self.home / "archive"
+        outside = self.home / "outside"
+        archive.mkdir()
+        outside.mkdir()
+        archive.joinpath("visual-piece.png").symlink_to(
+            outside / "escaped.png")
+        generator = mock.Mock(return_value=(PNG, "gpt-image-2"))
+        reviewer = mock.Mock(return_value=self.good_review())
+        with mock.patch.object(EW, "ART_ARCHIVE", archive), \
+                self.assertRaises(EW.GateError) as raised:
+            EW.materialize_azure_image(
+                self.staging, self.wcfg, generator, reviewer)
+        self.assertIn("direct child", str(raised.exception))
+        generator.assert_not_called()
+        reviewer.assert_not_called()
+        self.assertFalse(outside.joinpath("escaped.png").exists())
+
+    def test_reviewed_contract_is_revalidated_by_gate_and_final_receipt(self):
+        EW.materialize_azure_image(
+            self.staging,
+            self.wcfg,
+            generator=lambda *_: (PNG, "gpt-image-2"),
+            reviewer=self.good_review,
+        )
+        valid_meta = json.loads(self.out.joinpath("meta.json").read_text())
+        snapshot = EW.publication_profile_snapshot(self.wcfg)
+        for field, value in (
+                ("title", " Visual Piece"),
+                ("contributor", "not-kody-w")):
+            meta = json.loads(json.dumps(valid_meta))
+            meta[field] = value
+            self.out.joinpath("meta.json").write_text(
+                json.dumps(meta), encoding="utf-8")
+            with self.subTest(boundary="gate", field=field), \
+                    self.assertRaises(EW.GateError):
+                EW.gate_directory(
+                    self.staging / "out",
+                    self.wcfg,
+                    2,
+                    "already-here",
+                    known_slugs={"already-here"},
+                    profile_snapshot=snapshot,
+                )
+            submission = {
+                "slug": "visual-piece",
+                "meta": meta,
+                "meta_sha256": "a" * 64,
+                "piece_sha256": "b" * 64,
+            }
+            with self.subTest(boundary="final receipt", field=field), \
+                    self.assertRaises(EW.GateError):
+                EW.durable_deployment_receipt(
+                    {},
+                    self.wcfg,
+                    submission,
+                    {"merge_commit": "collective-merge"},
+                    {"merge_commit": "vision-merge"},
+                    {},
+                    profile_snapshot=snapshot,
+                )
+        self.out.joinpath("meta.json").write_text(
+            json.dumps(valid_meta), encoding="utf-8")
+
+    def test_reviewer_score_is_integral_and_serializes_as_a_json_integer(self):
+        normalized = EW.normalize_visual_review({
+            **self.good_review(),
+            "score": 9.0,
+        })
+        self.assertIs(type(normalized["score"]), int)
+        self.assertEqual(9, normalized["score"])
+        for score in (8.5, True, False):
+            with self.subTest(score=score), self.assertRaises(EW.GateError):
+                EW.normalize_visual_review({
+                    **self.good_review(),
+                    "score": score,
+                })
+
+        meta = meta_for("visual-piece", kind="png")
+        meta["_image_generation"] = json.loads(json.dumps(
+            COLLECTIVE_RECEIPT_FIXTURE))
+        snapshot = EW.publication_profile_snapshot(self.wcfg)
+        EW.validate_image_generation_receipt(meta, PNG, snapshot)
+        serialized = json.dumps(meta["_image_generation"])
+        decoded = json.loads(serialized)
+        self.assertIs(type(decoded["review"]["score"]), int)
+        self.assertNotIn('"score": 9.0', serialized)
+        self.assertEqual(
+            {
+                "schema", "profile", "provider", "deployment", "attempts",
+                "image_sha256", "image", "review",
+            },
+            set(decoded))
+        self.assertEqual(
+            {
+                "schema", "model", "publish", "score", "minimum_score",
+                "failures", "strengths",
+            },
+            set(decoded["review"]))
+
+    def test_collective_receipt_numeric_fields_require_exact_json_types(self):
+        snapshot = EW.publication_profile_snapshot(self.wcfg)
+
+        def receipt_with(path, value):
+            receipt = json.loads(json.dumps(COLLECTIVE_RECEIPT_FIXTURE))
+            target = receipt
+            for part in path[:-1]:
+                target = target[part]
+            target[path[-1]] = value
+            return {
+                **meta_for("visual-piece", kind="png"),
+                "_image_generation": receipt,
+            }
+
+        cases = {
+            "fractional score": (("review", "score"), 8.5),
+            "integral float score": (("review", "score"), 9.0),
+            "boolean score": (("review", "score"), True),
+            "float minimum": (("review", "minimum_score"), 8.0),
+            "float width": (("image", "width"), 512.0),
+            "boolean attempts": (("attempts",), True),
+        }
+        for label, (path, value) in cases.items():
+            with self.subTest(case=label), self.assertRaises(EW.GateError):
+                EW.validate_image_generation_receipt(
+                    receipt_with(path, value), PNG, snapshot)
+
+    def test_review_strengths_reject_control_and_credential_material(self):
+        snapshot = EW.publication_profile_snapshot(self.wcfg)
+        for strength in (
+                "strong focal hierarchy\x01with hidden control",
+                "password: hunter2"):
+            meta = meta_for("visual-piece", kind="png")
+            receipt = json.loads(json.dumps(COLLECTIVE_RECEIPT_FIXTURE))
+            receipt["review"]["strengths"][0] = strength
+            meta["_image_generation"] = receipt
+            with self.subTest(strength=repr(strength)), self.assertRaises(
+                    EW.GateError):
+                EW.validate_image_generation_receipt(meta, PNG, snapshot)
+
+    def test_maker_credential_metadata_fails_before_azure_generation(self):
+        original = json.loads(self.out.joinpath("meta.json").read_text())
+        cases = {
+            "raw password in child premise": (
+                lambda meta: meta["_dada_cycle"]["rounds"][0][
+                    "candidates"][0].update(
+                        premise="password: hunter2"),
+                self.prompt,
+                "raw credential",
+            ),
+            "raw api key in image prompt": (
+                lambda meta: meta.update(
+                    _image_prompt="api_key=ABCDEFGH12345678"),
+                "api_key=ABCDEFGH12345678",
+                "raw credential",
+            ),
+            "credential-like underscore key": (
+                lambda meta: meta.update(
+                    _azure_api_key="redacted-but-forbidden"),
+                self.prompt,
+                "credential field",
+            ),
+        }
+        for label, (mutate, prompt, expected) in cases.items():
+            meta = json.loads(json.dumps(original))
+            mutate(meta)
+            self.out.joinpath("meta.json").write_text(
+                json.dumps(meta), encoding="utf-8")
+            self.out.joinpath("piece.prompt").write_text(
+                prompt, encoding="utf-8")
+            generator = mock.Mock(return_value=(PNG, "gpt-image-2"))
+            reviewer = mock.Mock(return_value=self.good_review())
+            with self.subTest(case=label), self.assertRaises(
+                    EW.GateError) as raised:
+                EW.materialize_azure_image(
+                    self.staging, self.wcfg, generator, reviewer)
+            self.assertIn(expected, str(raised.exception))
+            generator.assert_not_called()
+            reviewer.assert_not_called()
+
+    def test_direct_png_and_forged_maker_receipt_fail_before_generation(self):
+        self.out.joinpath("piece.prompt").unlink()
+        self.out.joinpath("piece.png").write_bytes(PNG)
+        with self.assertRaises(EW.GateError) as direct:
+            EW.verify_staging_tree(self.staging, self.baseline, self.wcfg)
+        self.assertIn("not part of a submission", str(direct.exception))
+        with self.assertRaises(EW.GateError) as gate:
+            EW.gate_directory(
+                self.staging / "out", self.wcfg, 2, "already-here",
+                known_slugs={"already-here"})
+        self.assertIn("generation receipt", str(gate.exception))
+
+        self.out.joinpath("piece.png").unlink()
+        self.out.joinpath("piece.prompt").write_text(
+            self.prompt, encoding="utf-8")
+        meta = json.loads(self.out.joinpath("meta.json").read_text())
+        meta["_image_generation"] = {"schema": "forged"}
+        self.out.joinpath("meta.json").write_text(
+            json.dumps(meta), encoding="utf-8")
+        generator = mock.Mock(return_value=(PNG, "gpt-image-2"))
+        reviewer = mock.Mock(return_value=self.good_review())
+        with self.assertRaises(EW.GateError) as forged:
+            EW.materialize_azure_image(
+                self.staging, self.wcfg, generator, reviewer)
+        self.assertIn("maker may not supply", str(forged.exception))
+        generator.assert_not_called()
+        reviewer.assert_not_called()
+
+    def test_missing_or_tampered_receipt_fails_closed(self):
+        EW.materialize_azure_image(
+            self.staging, self.wcfg,
+            generator=lambda prompt, cfg: (PNG, "gpt-image-2"),
+            reviewer=self.good_review)
+        meta = json.loads(self.out.joinpath("meta.json").read_text())
+        snapshot = EW.publication_profile_snapshot(self.wcfg)
+
+        def changed(mutator):
+            candidate = json.loads(json.dumps(meta))
+            mutator(candidate)
+            return candidate
+
+        cases = {
+            "missing": changed(lambda doc: doc.pop("_image_generation")),
+            "digest": changed(lambda doc: doc["_image_generation"].update(
+                image_sha256="0" * 64)),
+            "dimensions": changed(lambda doc: doc["_image_generation"]["image"].update(
+                width=513)),
+            "publish": changed(lambda doc: doc["_image_generation"]["review"].update(
+                publish=False)),
+            "score": changed(lambda doc: doc["_image_generation"]["review"].update(
+                score=7)),
+            "minimum": changed(lambda doc: doc["_image_generation"]["review"].update(
+                minimum_score=9)),
+            "failures": changed(lambda doc: doc["_image_generation"]["review"].update(
+                failures=["visible defect"])),
+            "extra field": changed(lambda doc: doc["_image_generation"].update(
+                maker_claim=True)),
+        }
+        for label, candidate in cases.items():
+            with self.subTest(label=label), self.assertRaises(EW.GateError):
+                EW.validate_image_generation_receipt(
+                    candidate, PNG, snapshot)
+
+    def test_malformed_generated_png_never_reaches_the_reviewer(self):
+        reviewer = mock.Mock(return_value=self.good_review())
+        with self.assertRaises(EW.GateError):
+            EW.materialize_azure_image(
+                self.staging, self.wcfg,
+                generator=lambda prompt, cfg: (
+                    PNG + b"trailing", "gpt-image-2"),
+                reviewer=reviewer)
+        reviewer.assert_not_called()
+        self.assertFalse(self.out.joinpath("piece.png").exists())
 
     def test_a_rejected_image_is_regenerated_with_visual_feedback(self):
         prompts = []
@@ -905,6 +1759,17 @@ class FakeGh:
         self.calls = []
         self.extra_file = None      # to fake a PR that touches more than it should
         self.merged = False
+        self.closed = False
+        self.raise_after_merge = None
+        self.provenance_check_sequence = [[{
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+        }]]
+        self.merge_state_status = "CLEAN"
+        self.merge_state_sequence = []
 
     def __call__(self, *args, timeout=None, wcfg=None, ctx=None):
         self.calls.append(args)
@@ -914,6 +1779,7 @@ class FakeGh:
                 raise AssertionError("gh pr view has no `merged` JSON field")
         if args[:2] == ("pr", "create"):
             self.branch = args[args.index("--head") + 1]
+            self.closed = False
             return "https://github.com/kody-w/public-art-collective/pull/7\n"
         if args[:2] == ("pr", "view") and "files" in args[-1]:
             names = [line.split("\t") for line in git_bare(
@@ -928,17 +1794,44 @@ class FakeGh:
                                "baseRefName": self.base,
                                "headRefName": self.branch,
                                "isCrossRepository": False})
+        if (args[:2] == ("pr", "view")
+                and "statusCheckRollup" in args[-1]):
+            result = (
+                self.provenance_check_sequence.pop(0)
+                if len(self.provenance_check_sequence) > 1
+                else self.provenance_check_sequence[0]
+            )
+            if isinstance(result, BaseException):
+                raise result
+            state = "MERGED" if self.merged else "CLOSED" if self.closed else "OPEN"
+            merge_state = (
+                self.merge_state_sequence.pop(0)
+                if len(self.merge_state_sequence) > 1
+                else self.merge_state_sequence[0]
+                if self.merge_state_sequence
+                else self.merge_state_status
+            )
+            return json.dumps({
+                "statusCheckRollup": result,
+                "mergeStateStatus": merge_state,
+                "state": state,
+            })
         if args[:2] == ("pr", "merge"):
             sha = git_bare(self.origin, "rev-parse", self.branch).strip()
             git_bare(self.origin, "update-ref", f"refs/heads/{self.base}", sha)
             self.merge_sha = sha
             self.merged = True
+            if self.raise_after_merge is not None:
+                raise self.raise_after_merge
             return ""
         if args[:2] == ("pr", "view"):
-            return json.dumps({"state": "MERGED" if self.merged else "OPEN",
+            state = "MERGED" if self.merged else "CLOSED" if self.closed else "OPEN"
+            return json.dumps({"state": state,
                                "merged": self.merged,
+                               "mergeStateStatus": self.merge_state_status,
                                "mergeCommit": {"oid": getattr(self, "merge_sha", "")}})
         if args[:2] == ("pr", "close"):
+            self.closed = True
             return ""
         raise AssertionError(f"unexpected gh call: {args}")
 
@@ -953,6 +1846,7 @@ class WorkerEnv(ScratchCase):
         super().setUp()
         self.origin = self.home / "origin.git"
         seed = self.home / "seed"
+        self.seed = seed
         seed.mkdir()
         git(seed, "init", "-b", "main")
         git(seed, "config", "user.email", "t@example.com")
@@ -960,6 +1854,10 @@ class WorkerEnv(ScratchCase):
         write_submission(seed, "already-here")
         (seed / "submissions" / "index.json").write_text('{"submissions": []}',
                                                          encoding="utf-8")
+        validator = seed / EW.COLLECTIVE_VALIDATOR_PATH
+        validator.parent.mkdir(parents=True)
+        validator.write_text(
+            TRUSTED_COLLECTIVE_VALIDATOR, encoding="utf-8")
         git(seed, "add", "-A")
         git(seed, "commit", "-m", "seed")
         git(self.home, "init", "--bare", "-b", "main", str(self.origin))
@@ -983,6 +1881,16 @@ class WorkerEnv(ScratchCase):
             "git_author_name": "test",
             "git_author_email": "t@example.com",
         })
+
+    def replace_collective_validator(self, source):
+        validator = self.seed / EW.COLLECTIVE_VALIDATOR_PATH
+        if source is None:
+            validator.unlink()
+        else:
+            validator.write_text(source, encoding="utf-8")
+        git(self.seed, "add", "-A")
+        git(self.seed, "commit", "-m", "change trusted validator")
+        git(self.seed, "push", "origin", "main")
 
     def model_that_submits(self, slug="new-piece", cycle=1, previous=None,
                            result="CONTRIBUTED it made a thing"):
@@ -1131,6 +2039,19 @@ class WorkerRunTests(WorkerEnv):
         self.assertEqual(["refs/heads/main"], branches.split(),
                          "a pushed branch with no PR must be deleted again")
         self.assertFalse(any(EW.SUCCESS_PREFIX in n for n in self.texts()))
+
+    def test_missing_collective_validator_stops_before_push_or_pr(self):
+        self.replace_collective_validator(None)
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            summary = EW.run_once(
+                cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_REJECTED, summary["outcome"], summary)
+        self.assertIn("missing tools/build_index.py", summary["detail"])
+        self.assertFalse(self.gh.called("pr", "create"))
+        branches = git_bare(
+            self.origin, "for-each-ref", "--format=%(refname)",
+            "refs/heads/")
+        self.assertEqual(["refs/heads/main"], branches.split())
 
     def test_a_timeout_is_recorded_without_a_success_shaped_alert(self):
         def timing_out(staging, prompt, wcfg, depth=0, runtime=None):
@@ -1714,6 +2635,148 @@ class VisionAdapterTests(ScratchCase):
         with self.assertRaises(EW.GateError):
             EW.vision_config(bad)
 
+    def test_png_bytes_and_ihdr_dimensions_reach_vision_exactly(self):
+        image = real_png(width=512, height=640)
+        profile_wcfg = reviewed_png_wcfg(self.home)
+        meta = with_reviewed_png_receipt(
+            {**self.submission["meta"], "kind": "png"},
+            image, profile_wcfg)
+        submission = {
+            **self.submission,
+            "kind": "png",
+            "meta": meta,
+            "piece_path": "submissions/new-piece/piece.png",
+            "piece_sha256": hashlib.sha256(image).hexdigest(),
+        }
+        entry, changed = EW.write_vision_files(
+            self.repo, submission, image, self.vcfg)
+        self.assertIn("dada/media/new-piece.png", changed)
+        self.assertEqual(
+            image, self.repo.joinpath("dada/media/new-piece.png").read_bytes())
+        self.assertEqual((512, 640, "portrait"),
+                         (entry["width"], entry["height"],
+                          entry["orientation"]))
+        self.assertEqual("media/new-piece.png", entry["thumb"])
+        self.assertEqual([], entry["sources"])
+        self.assertTrue(
+            entry["live"]["scenes"][1]["app"].endswith("#/new-piece"))
+
+    def test_thumb_paths_cannot_escape_the_channel_directory(self):
+        unsafe = {**self.vcfg, "media_dir": "other-media"}
+        profile_wcfg = reviewed_png_wcfg(self.home)
+        meta = with_reviewed_png_receipt(
+            {**self.submission["meta"], "kind": "png"},
+            PNG, profile_wcfg)
+        submission = {
+            **self.submission,
+            "kind": "png",
+            "meta": meta,
+            "piece_path": "submissions/new-piece/piece.png",
+            "piece_sha256": hashlib.sha256(PNG).hexdigest(),
+        }
+        with self.assertRaises(EW.GateError):
+            EW.write_vision_files(
+                self.repo, submission, PNG, unsafe)
+
+
+class PngPagesProbeTests(ScratchCase):
+    class Response:
+        def __init__(self, status=200, content_type="image/png",
+                     body=EW.azure_art.PNG_SIGNATURE):
+            self.status = status
+            self.headers = {"Content-Type": content_type}
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            return False
+
+        def getcode(self):
+            return self.status
+
+        def read(self, size=-1):
+            return self.body[:size]
+
+    def test_direct_png_probe_checks_status_type_and_signature(self):
+        cases = {
+            "ok": (self.Response(), True),
+            "status": (self.Response(status=404), False),
+            "type": (self.Response(content_type="text/html"), False),
+            "signature": (self.Response(body=b"<html>no"), False),
+        }
+        for label, (response, expected) in cases.items():
+            with self.subTest(label=label):
+                ok, _ = REAL_PNG_PROBE(
+                    "https://example.test/piece.png",
+                    opener=lambda request, timeout: response)
+                self.assertEqual(expected, ok)
+
+    def test_profile_pages_use_typed_media_probes_and_route_probes(self):
+        wcfg = reviewed_png_wcfg(self.home)
+        wcfg["repo"] = "kody-w/public-art-collective"
+        wcfg["rapp_vision"] = {
+            **wcfg["rapp_vision"],
+            "repo": "kody-w/rapp-vision",
+        }
+        submission = {
+            "slug": "visual-piece",
+            "title": "Visual Piece",
+            "kind": "png",
+            "meta": meta_for("visual-piece", kind="png"),
+            "piece_path": "submissions/visual-piece/piece.png",
+        }
+        vision = EW.vision_urls(EW.vision_config(wcfg), submission)
+        routes, media = [], []
+
+        def route_probe(url, timeout):
+            routes.append(url)
+            return True, "HTTP 200"
+
+        def media_probe(url, timeout):
+            media.append(url)
+            return True, "HTTP 200 image/png PNG"
+
+        result = EW.verify_dual_pages(
+            {"commons_repo": "kody-w/public-art-collective"},
+            wcfg, submission, vision, probe=route_probe,
+            png_probe=media_probe, sleep=lambda _: None,
+            profile_snapshot=EW.publication_profile_snapshot(wcfg))
+        self.assertEqual(
+            {
+                EW.piece_pages_url(
+                    {"commons_repo": "kody-w/public-art-collective"},
+                    wcfg, submission),
+                vision["media_url"],
+            },
+            set(media))
+        self.assertIn(vision["watch_url"], routes)
+        self.assertIn(EW.vision_config(wcfg)["player_url"], routes)
+        self.assertEqual(vision["watch_url"], result["vision_url"])
+
+    def test_wrong_media_response_keeps_profile_deployment_pending(self):
+        wcfg = reviewed_png_wcfg(self.home)
+        wcfg["repo"] = "kody-w/public-art-collective"
+        wcfg["rapp_vision"] = {
+            **wcfg["rapp_vision"], "repo": "kody-w/rapp-vision"}
+        submission = {
+            "slug": "visual-piece", "title": "Visual Piece", "kind": "png",
+            "meta": meta_for("visual-piece", kind="png"),
+            "piece_path": "submissions/visual-piece/piece.png",
+        }
+        vision = EW.vision_urls(EW.vision_config(wcfg), submission)
+        with self.assertRaises(EW.DeploymentPending) as cm:
+            EW.verify_dual_pages(
+                {"commons_repo": "kody-w/public-art-collective"},
+                wcfg, submission, vision,
+                probe=lambda url, timeout: (True, "HTTP 200"),
+                png_probe=lambda url, timeout: (
+                    False, "HTTP 200 Content-Type text/html"),
+                sleep=lambda _: None,
+                profile_snapshot=EW.publication_profile_snapshot(wcfg))
+        self.assertIn("Content-Type text/html", str(cm.exception))
+
 
 class VisionPublisherTests(ScratchCase):
     def setUp(self):
@@ -1905,6 +2968,1295 @@ class DualDeploymentFlowTests(WorkerEnv):
         maker.assert_not_called()
 
 
+class ReviewedPngWorkerFlowTests(WorkerEnv):
+    def visual_config(self):
+        return worker_cfg(
+            notification_mode="art-only",
+            evolve_worker={
+                "repo": str(self.origin),
+                "branch_prefix": EW.REVIEWED_PNG_BRANCH_PREFIX,
+                "git_author_name": EW.REVIEWED_PNG_COMMIT_NAME,
+                "git_author_email": EW.REVIEWED_PNG_COMMIT_EMAIL,
+                "publication_profile": EW.AZURE_REVIEWED_PNG_PROFILE,
+                "allowed_kinds": ["png"],
+                "max_piece_bytes": 10 * 1024 * 1024,
+                "azure_image": {
+                    "enabled": True,
+                    "endpoint": "https://dada.example.openai.azure.com",
+                    "deployment": "gpt-image-2",
+                    "fallback_deployment": "gpt-image-2",
+                    "max_attempts": 2,
+                    "minimum_review_score": 8,
+                    "review_model": "gpt-5.4",
+                },
+                "rapp_vision": {
+                    "enabled": True,
+                    "repo": str(self.origin),
+                },
+            })
+
+    @staticmethod
+    def review():
+        return {
+            "schema": EW.IMAGE_REVIEW_SCHEMA,
+            "score": 9,
+            "publish": True,
+            "failures": [],
+            "strengths": ["strong focal hierarchy"],
+        }
+
+    def visual_model(self, direct_png=False, **meta_overrides):
+        prompt_text = (
+            "A finished surreal museum image with one impossible stone arch, "
+            "cobalt light, deep texture, and no lettering.")
+
+        def fake(staging, prompt, wcfg, depth=0, runtime=None):
+            staging = Path(staging)
+            out = staging / "out" / EW.SUBMISSION_DIR
+            meta = meta_for(
+                "visual-piece", kind="png", _image_prompt=prompt_text,
+                **meta_overrides)
+            out.joinpath("meta.json").write_text(
+                json.dumps(meta), encoding="utf-8")
+            if direct_png:
+                out.joinpath("piece.png").write_bytes(PNG)
+            else:
+                out.joinpath("piece.prompt").write_text(
+                    prompt_text, encoding="utf-8")
+            staging.joinpath("state-out.json").write_text(
+                json.dumps({
+                    "cycle": 1,
+                    "last_slug": "visual-piece",
+                    "notes": "pixels must carry the premise",
+                }),
+                encoding="utf-8")
+            return "ok", "SENTINEL_RESULT: CONTRIBUTED visual concept\n"
+        return fake
+
+    @staticmethod
+    def deployed(receipts):
+        return {
+            **receipts,
+            "collective_url": (
+                "https://kody-w.github.io/public-art-collective/"
+                "view.html#/visual-piece"),
+            "vision_url": (
+                "https://kody-w.github.io/rapp-vision/"
+                "#/watch/visual-piece"),
+            "vision": {
+                "watch_url": (
+                    "https://kody-w.github.io/rapp-vision/"
+                    "#/watch/visual-piece"),
+            },
+        }
+
+    def run_to_pending(self):
+        with mock.patch.object(EW, "assert_publish_auth",
+                               return_value="local test repo"), \
+             mock.patch.object(EW, "assert_visual_pipeline_ready",
+                               return_value="ready"), \
+             mock.patch.object(EW, "run_model", self.visual_model()), \
+             mock.patch.object(EW.azure_art, "generate",
+                               return_value=(PNG, "gpt-image-2")), \
+             mock.patch.object(EW, "review_generated_image",
+                               side_effect=lambda *_: self.review()), \
+             mock.patch.object(
+                 EW, "finish_platform_deployments",
+                 side_effect=EW.DeploymentPending("Pages still building")):
+            result = EW.run_once(
+                cfg=self.visual_config(), health=lambda phase: healthy())
+        self.assertEqual("deployment-pending", result["outcome"], result)
+        return json.loads(EW.TRANSACTION_PATH.read_text())
+
+    def run_visual_with_verified_deployment(self, cfg=None):
+        def finish(cfg, wcfg, workspace, clone, submission, receipts, health,
+                   transaction=None, profile_snapshot=None):
+            return self.deployed(receipts)
+
+        with mock.patch.object(EW, "assert_publish_auth",
+                               return_value="local test repo"), \
+             mock.patch.object(EW, "assert_visual_pipeline_ready",
+                               return_value="ready"), \
+             mock.patch.object(EW, "run_model", self.visual_model()), \
+             mock.patch.object(EW.azure_art, "generate",
+                               return_value=(PNG, "gpt-image-2")), \
+             mock.patch.object(EW, "review_generated_image",
+                               side_effect=lambda *_: self.review()), \
+             mock.patch.object(EW, "finish_platform_deployments", finish):
+            return EW.run_once(
+                cfg=cfg or self.visual_config(),
+                health=lambda phase: healthy())
+
+    def test_profile_conflict_preflight_spends_no_model_or_fanout(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"]["azure_image"]["minimum_review_score"] = 7
+        cfg["evolve_worker"]["fanout"] = {"enabled": True, "children": 3}
+        with mock.patch.object(EW, "assert_publish_auth") as auth, \
+             mock.patch.object(EW, "assert_visual_pipeline_ready") as visual, \
+             mock.patch.object(EW.SS, "run_children") as children, \
+             mock.patch.object(EW, "run_model") as maker, \
+             mock.patch.object(EW.azure_art, "generate") as generator, \
+             mock.patch.object(EW, "review_generated_image") as reviewer:
+            result = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+        self.assertEqual("skipped", result["outcome"])
+        self.assertIn("publication profile preflight failed", result["reason"])
+        auth.assert_not_called()
+        visual.assert_not_called()
+        children.assert_not_called()
+        maker.assert_not_called()
+        generator.assert_not_called()
+        reviewer.assert_not_called()
+        self.assertFalse(EW.HISTORY_PATH.exists())
+
+    def test_identifier_mismatch_preflight_spends_nothing(self):
+        for field, value in (
+                ("deployment", "gpt image 2"),
+                ("review_model", "gpt 5.4")):
+            cfg = self.visual_config()
+            cfg["evolve_worker"]["azure_image"][field] = value
+            cfg["evolve_worker"]["fanout"] = {
+                "enabled": True, "children": 3}
+            with self.subTest(field=field), \
+                 mock.patch.object(EW, "assert_publish_auth") as auth, \
+                 mock.patch.object(
+                     EW, "assert_visual_pipeline_ready") as visual, \
+                 mock.patch.object(EW.SS, "run_children") as children, \
+                 mock.patch.object(EW, "run_model") as maker, \
+                 mock.patch.object(EW.azure_art, "generate") as generator, \
+                 mock.patch.object(
+                     EW, "review_generated_image") as reviewer:
+                result = EW.run_once(
+                    cfg=cfg, health=lambda phase: healthy())
+            self.assertEqual("skipped", result["outcome"], result)
+            self.assertIn(
+                "publication profile preflight failed", result["reason"])
+            auth.assert_not_called()
+            visual.assert_not_called()
+            children.assert_not_called()
+            maker.assert_not_called()
+            generator.assert_not_called()
+            reviewer.assert_not_called()
+        self.assertFalse(EW.HISTORY_PATH.exists())
+        self.assertEqual([], self.gh.calls)
+
+    def test_controller_identity_conflicts_preflight_before_any_spend(self):
+        for field, value in (
+                ("branch_prefix", "art"),
+                ("git_author_name", "Mutable Dada"),
+                ("git_author_email", "mutable@example.com")):
+            cfg = self.visual_config()
+            cfg["evolve_worker"][field] = value
+            cfg["evolve_worker"]["fanout"] = {
+                "enabled": True, "children": 3}
+            with self.subTest(field=field), \
+                 mock.patch.object(EW, "assert_publish_auth") as auth, \
+                 mock.patch.object(EW.SS, "run_children") as children, \
+                 mock.patch.object(EW, "run_model") as maker, \
+                 mock.patch.object(EW.azure_art, "generate") as generator, \
+                 mock.patch.object(
+                     EW, "review_generated_image") as reviewer:
+                result = EW.run_once(
+                    cfg=cfg, health=lambda phase: healthy())
+            self.assertEqual("skipped", result["outcome"], result)
+            self.assertIn(
+                "publication profile preflight failed", result["reason"])
+            auth.assert_not_called()
+            children.assert_not_called()
+            maker.assert_not_called()
+            generator.assert_not_called()
+            reviewer.assert_not_called()
+        self.assertFalse(EW.HISTORY_PATH.exists())
+        self.assertEqual([], self.gh.calls)
+
+    def test_controller_commit_fixture_passes_collective_offline_attestation(self):
+        verifier = require_collective_verifier(
+            self, "cross-repo attestation test")
+        transaction = self.run_to_pending()
+        commit_sha = transaction["commit"]
+        branch = transaction["branch"]
+        parent_sha = git_bare(
+            self.origin, "rev-parse", f"{commit_sha}^").strip()
+
+        candidate = self.home / "attestation-candidate"
+        trusted_base = self.home / "attestation-base"
+        git(self.home, "clone", str(self.origin), str(candidate))
+        git(candidate, "checkout", "--detach", commit_sha)
+        git(self.home, "clone", str(self.origin), str(trusted_base))
+        git(trusted_base, "checkout", "--detach", parent_sha)
+
+        raw_identity = git_bare(
+            self.origin, "show", "-s",
+            "--format=%an%x00%ae%x00%aI%x00%cn%x00%ce%x00%cI%x00%B",
+            commit_sha)
+        (author_name, author_email, author_date, committer_name,
+         committer_email, committer_date, message) = raw_identity.split(
+             "\0", 6)
+        message = message.rstrip("\n")
+        slug = transaction["submission"]["slug"]
+        subject = message.splitlines()[0]
+
+        def api_user(login):
+            return {"login": login, "type": "User"}
+
+        def repository():
+            return {
+                "full_name": "kody-w/public-art-collective",
+                "fork": False,
+                "owner": api_user("kody-w"),
+            }
+
+        repo = repository()
+        pull_request = {
+            "number": 7,
+            "state": "open",
+            "draft": False,
+            "title": subject,
+            "commits": 1,
+            "changed_files": 2,
+            "author_association": "OWNER",
+            "user": api_user("kody-w"),
+            "base": {
+                "ref": "main",
+                "sha": parent_sha,
+                "repo": copy.deepcopy(repo),
+            },
+            "head": {
+                "ref": branch,
+                "sha": commit_sha,
+                "repo": copy.deepcopy(repo),
+            },
+        }
+        commit_record = {
+            "sha": commit_sha,
+            "parents": [{"sha": parent_sha}],
+            "author": api_user("kody-w"),
+            "committer": api_user("kody-w"),
+            "commit": {
+                "author": {
+                    "name": author_name,
+                    "email": author_email,
+                    "date": author_date,
+                },
+                "committer": {
+                    "name": committer_name,
+                    "email": committer_email,
+                    "date": committer_date,
+                },
+                "message": message,
+                "verification": {
+                    "verified": False,
+                    "reason": "unsigned",
+                },
+            },
+        }
+
+        def blob_sha(path):
+            payload = path.read_bytes()
+            prefix = f"blob {len(payload)}\0".encode("ascii")
+            return hashlib.sha1(prefix + payload).hexdigest()
+
+        files = [
+            {
+                "filename": f"submissions/{slug}/meta.json",
+                "status": "added",
+                "sha": blob_sha(
+                    candidate / "submissions" / slug / "meta.json"),
+            },
+            {
+                "filename": f"submissions/{slug}/piece.png",
+                "status": "added",
+                "sha": blob_sha(
+                    candidate / "submissions" / slug / "piece.png"),
+            },
+        ]
+        event = {
+            "action": "opened",
+            "number": 7,
+            "repository": copy.deepcopy(repo),
+            "pull_request": copy.deepcopy(pull_request),
+        }
+        evidence = {
+            "pull_request": copy.deepcopy(pull_request),
+            "commits": [copy.deepcopy(commit_record)],
+            "files": files,
+            "head_commit": copy.deepcopy(commit_record),
+            "pull_request_after": copy.deepcopy(pull_request),
+        }
+        contract = collective_controller_contract()
+        self.assertEqual(contract["branch_prefix"] + "/", branch[:9])
+        self.assertEqual(contract["commit_name"], author_name)
+        self.assertEqual(contract["commit_name"], committer_name)
+        self.assertEqual(contract["commit_email"], author_email)
+        self.assertEqual(contract["commit_email"], committer_email)
+        body_prefix, body_suffix = contract["commit_body_template"].split(
+            "{role}", 1)
+        body_line = message.splitlines()[2]
+        self.assertTrue(body_line.startswith(body_prefix))
+        self.assertTrue(body_line.endswith(body_suffix))
+        role = body_line[
+            len(body_prefix):len(body_line) - len(body_suffix)]
+        self.assertIn(
+            contract["commit_body_template"].format(
+                role=role),
+            message)
+
+        expected_success = (
+            f"reviewed PNG provenance attested for '{slug}' at "
+            f"{commit_sha}\n")
+
+        event_path = self.home / "attestation-event.json"
+        evidence_path = self.home / "attestation-api.json"
+
+        def invoke(event_doc, evidence_doc):
+            event_path.write_text(
+                json.dumps(event_doc), encoding="utf-8")
+            evidence_path.write_text(
+                json.dumps(evidence_doc), encoding="utf-8")
+            environment = EW._minimal_env()
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(verifier),
+                    "--event-path", str(event_path),
+                    "--api-fixture", str(evidence_path),
+                    "--candidate-root", str(candidate),
+                    "--base-root", str(trusted_base),
+                    "--trusted-base-sha", parent_sha,
+                ],
+                cwd=str(verifier.parents[1]),
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            return result.returncode, result.stdout + result.stderr
+
+        code, detail = invoke(event, evidence)
+        self.assertEqual(0, code, detail)
+        self.assertEqual(expected_success, detail)
+
+        def mutate_branch(event_doc, evidence_doc):
+            bad = f"{contract['branch_prefix']}/{slug}-DEADBEEF"
+            event_doc["pull_request"]["head"]["ref"] = bad
+            evidence_doc["pull_request"]["head"]["ref"] = bad
+            evidence_doc["pull_request_after"]["head"]["ref"] = bad
+
+        def mutate_commit(event_doc, evidence_doc, identity, field, value):
+            del event_doc
+            for record in (
+                    evidence_doc["commits"][0],
+                    evidence_doc["head_commit"]):
+                record["commit"][identity][field] = value
+
+        def mutate_body(event_doc, evidence_doc):
+            del event_doc
+            for record in (
+                    evidence_doc["commits"][0],
+                    evidence_doc["head_commit"]):
+                record["commit"]["message"] = (
+                    record["commit"]["message"].replace(
+                        "neighbor of Dada Collective.",
+                        "neighbor of Mutable Collective."))
+
+        mutations = [
+            (
+                "branch",
+                mutate_branch,
+                "reviewed PNG head branch must match "
+                f"'art/dada/{slug}-<8 lowercase hex>'",
+            ),
+            (
+                "author name",
+                lambda event_doc, evidence_doc: mutate_commit(
+                    event_doc, evidence_doc, "author", "name",
+                    "Mutable Dada"),
+                "api.commits[0].commit.author.name must be "
+                f"{contract['commit_name']!r}",
+            ),
+            (
+                "author email",
+                lambda event_doc, evidence_doc: mutate_commit(
+                    event_doc, evidence_doc, "author", "email",
+                    "mutable@example.com"),
+                "api.commits[0].commit.author.email must be "
+                f"{contract['commit_email']!r}",
+            ),
+            (
+                "committer name",
+                lambda event_doc, evidence_doc: mutate_commit(
+                    event_doc, evidence_doc, "committer", "name",
+                    "Mutable Dada"),
+                "api.commits[0].commit.committer.name must be "
+                f"{contract['commit_name']!r}",
+            ),
+            (
+                "committer email",
+                lambda event_doc, evidence_doc: mutate_commit(
+                    event_doc, evidence_doc, "committer", "email",
+                    "mutable@example.com"),
+                "api.commits[0].commit.committer.email must be "
+                f"{contract['commit_email']!r}",
+            ),
+            (
+                "provenance body",
+                mutate_body,
+                "Dada controller commit message has the wrong exact "
+                "provenance form",
+            ),
+        ]
+        for label, mutate, reason in mutations:
+            bad_event = copy.deepcopy(event)
+            bad_evidence = copy.deepcopy(evidence)
+            mutate(bad_event, bad_evidence)
+            code, detail = invoke(bad_event, bad_evidence)
+            with self.subTest(field=label):
+                self.assertEqual(1, code, detail)
+                self.assertEqual(
+                    "error: reviewed PNG provenance rejected: "
+                    f"{reason}\n",
+                    detail,
+                )
+
+    def test_controller_commit_fixture_cross_check_skips_without_collective_verifier(
+            self):
+        with mock.patch.object(
+                sys.modules[__name__], "collective_verifier_path",
+                return_value=None):
+            with self.assertRaises(unittest.SkipTest) as raised:
+                self.test_controller_commit_fixture_passes_collective_offline_attestation()
+        self.assertEqual(
+            "real sibling Collective verify_png_attestation.py is "
+            "unavailable for cross-repo attestation test",
+            str(raised.exception),
+        )
+
+    def test_collective_validator_failure_stops_before_push_or_pr(self):
+        self.replace_collective_validator(
+            "import sys\n"
+            "print('reviewed metadata rejected', file=sys.stderr)\n"
+            "raise SystemExit(9)\n"
+        )
+        with mock.patch.object(
+                EW, "assert_publish_auth",
+                return_value="local test repo"), \
+             mock.patch.object(
+                 EW, "assert_visual_pipeline_ready", return_value="ready"), \
+             mock.patch.object(
+                 EW, "run_model", self.visual_model()), \
+             mock.patch.object(
+                 EW.azure_art, "generate",
+                 return_value=(PNG, "gpt-image-2")) as generator, \
+             mock.patch.object(
+                 EW, "review_generated_image",
+                 side_effect=lambda *_: self.review()) as reviewer:
+            result = EW.run_once(
+                cfg=self.visual_config(), health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_REJECTED, result["outcome"], result)
+        self.assertIn(
+            "canonical Public Art Collective validation rejected",
+            result["detail"])
+        self.assertIn("reviewed metadata rejected", result["detail"])
+        generator.assert_called_once()
+        reviewer.assert_called_once()
+        self.assertFalse(self.gh.called("pr", "create"))
+        branches = git_bare(
+            self.origin, "for-each-ref", "--format=%(refname)",
+            "refs/heads/")
+        self.assertEqual(["refs/heads/main"], branches.split())
+        self.assertEqual([], self.notifications)
+
+    def test_collective_validator_happy_path_uses_python_without_shell(self):
+        calls = []
+        real_run = subprocess.run
+
+        def recording_run(*args, **kwargs):
+            argv = args[0]
+            if (
+                isinstance(argv, list)
+                and len(argv) == 3
+                and str(argv[1]).endswith(EW.COLLECTIVE_VALIDATOR_PATH)
+                and argv[2] == "--validate"
+            ):
+                calls.append((list(argv), dict(kwargs)))
+            return real_run(*args, **kwargs)
+
+        with mock.patch.object(
+                EW.subprocess, "run", side_effect=recording_run):
+            self.run_to_pending()
+        self.assertEqual(1, len(calls))
+        argv, kwargs = calls[0]
+        self.assertEqual(sys.executable, argv[0])
+        self.assertEqual("--validate", argv[-1])
+        self.assertTrue(kwargs["capture_output"])
+        self.assertTrue(kwargs["text"])
+        self.assertEqual(
+            EW.COLLECTIVE_VALIDATOR_TIMEOUT_S, kwargs["timeout"])
+        self.assertNotIn("shell", kwargs)
+
+    def test_png_and_unsafe_vision_configs_stop_before_any_spend(self):
+        mixed = worker_cfg(evolve_worker={
+            "repo": str(self.origin),
+            "allowed_kinds": ["svg", "png"],
+            "fanout": {"enabled": True, "children": 3},
+        })
+        unreviewed = worker_cfg(evolve_worker={
+            "repo": str(self.origin),
+            "allowed_kinds": ["png"],
+            "azure_image": {"enabled": False},
+            "fanout": {"enabled": True, "children": 3},
+        })
+        unsafe_vision = self.visual_config()
+        unsafe_vision["evolve_worker"]["rapp_vision"]["media_dir"] = "other/media"
+        for label, cfg in {
+                "mixed PNG": mixed,
+                "legacy unreviewed PNG": unreviewed,
+                "unsafe reviewed Vision paths": unsafe_vision,
+        }.items():
+            with self.subTest(case=label), \
+                 mock.patch.object(EW, "assert_publish_auth") as auth, \
+                 mock.patch.object(EW, "assert_visual_pipeline_ready") as visual, \
+                 mock.patch.object(EW.SS, "run_children") as children, \
+                 mock.patch.object(EW, "run_model") as maker, \
+                 mock.patch.object(EW.azure_art, "generate") as generator, \
+                 mock.patch.object(EW, "review_generated_image") as reviewer:
+                result = EW.run_once(
+                    cfg=cfg, health=lambda phase: healthy())
+            self.assertEqual("skipped", result["outcome"])
+            self.assertIn("publication profile preflight failed", result["reason"])
+            auth.assert_not_called()
+            visual.assert_not_called()
+            children.assert_not_called()
+            maker.assert_not_called()
+            generator.assert_not_called()
+            reviewer.assert_not_called()
+        self.assertFalse(EW.HISTORY_PATH.exists())
+        self.assertEqual([], self.gh.calls)
+
+    def test_direct_visual_gate_failure_is_silent_and_spends_no_generator(self):
+        with mock.patch.object(EW, "assert_publish_auth",
+                               return_value="local test repo"), \
+             mock.patch.object(EW, "assert_visual_pipeline_ready",
+                               return_value="ready"), \
+             mock.patch.object(EW, "run_model",
+                               self.visual_model(direct_png=True)), \
+             mock.patch.object(EW.azure_art, "generate") as generator, \
+             mock.patch.object(EW, "review_generated_image") as reviewer:
+            result = EW.run_once(
+                cfg=self.visual_config(), health=lambda phase: healthy())
+        self.assertEqual(EW.OUTCOME_REJECTED, result["outcome"], result)
+        generator.assert_not_called()
+        reviewer.assert_not_called()
+        self.assertEqual([], self.notifications)
+
+    def test_invalid_reviewed_identity_stops_after_maker_before_azure_or_publish(self):
+        cases = {
+            "leading title whitespace": {"title": " Visual Piece"},
+            "trailing title whitespace": {"title": "Visual Piece "},
+            "title over limit": {"title": "x" * 201},
+            "tab in title": {"title": "Visual\tPiece"},
+            "newline in title": {"title": "Visual\nPiece"},
+            "control in title": {"title": "Visual\x01Piece"},
+            "wrong contributor": {"contributor": "mutable-maker"},
+        }
+        for label, changes in cases.items():
+            for path in (
+                    EW.HISTORY_PATH, EW.TURN_PATH, EW.ALERT_PATH,
+                    EW.STATUS_PATH, EW.TRANSACTION_PATH):
+                path.unlink(missing_ok=True)
+            self.gh.calls.clear()
+            self.notifications.clear()
+            maker = mock.Mock(side_effect=self.visual_model(**changes))
+            generator = mock.Mock(return_value=(PNG, "gpt-image-2"))
+            reviewer = mock.Mock(side_effect=lambda *_: self.review())
+            with self.subTest(case=label), \
+                    mock.patch.object(
+                        EW, "assert_publish_auth",
+                        return_value="local test repo"), \
+                    mock.patch.object(
+                        EW, "assert_visual_pipeline_ready",
+                        return_value="ready"), \
+                    mock.patch.object(EW, "run_model", maker), \
+                    mock.patch.object(EW.azure_art, "generate", generator), \
+                    mock.patch.object(
+                        EW, "review_generated_image", reviewer):
+                result = EW.run_once(
+                    cfg=self.visual_config(), health=lambda phase: healthy())
+            self.assertEqual(EW.OUTCOME_REJECTED, result["outcome"], result)
+            maker.assert_called_once()
+            generator.assert_not_called()
+            reviewer.assert_not_called()
+            self.assertFalse(EW.ART_ARCHIVE.exists())
+            self.assertFalse(self.gh.called("pr", "create"))
+            self.assertFalse(self.gh.called("pr", "merge"))
+            branches = git_bare(
+                self.origin,
+                "for-each-ref",
+                "--format=%(refname)",
+                "refs/heads/",
+            )
+            self.assertEqual(["refs/heads/main"], branches.split())
+            self.assertEqual([], self.notifications)
+
+    def test_reconciliation_revalidates_without_any_new_ai_or_image_call(self):
+        transaction = self.run_to_pending()
+        snapshot = transaction["profile_snapshot"]
+        self.assertEqual(
+            EW.AZURE_REVIEWED_PNG_PROFILE, snapshot["profile"])
+        self.assertEqual(
+            8, snapshot["minimum_review_score"])
+        self.assertEqual(
+            hashlib.sha256(PNG).hexdigest(),
+            transaction["submission"]["meta"][
+                "_image_generation"]["image_sha256"])
+
+        def finish(cfg, wcfg, workspace, clone, submission, receipts, health,
+                   transaction=None, profile_snapshot=None):
+            self.assertEqual(snapshot, profile_snapshot)
+            return self.deployed(receipts)
+
+        with mock.patch.object(EW, "run_model") as maker, \
+             mock.patch.object(EW.azure_art, "generate") as generator, \
+             mock.patch.object(EW, "materialize_azure_image") as materialize, \
+             mock.patch.object(EW, "review_generated_image") as reviewer, \
+             mock.patch.object(EW, "assert_visual_pipeline_ready") as preflight, \
+             mock.patch.object(
+                 EW, "validate_staged_collective_candidate") as validator, \
+             mock.patch.object(EW, "finish_platform_deployments", finish):
+            result = EW.run_once(
+                cfg=self.visual_config(), health=lambda phase: healthy())
+        self.assertEqual("reconciled-contributed", result["outcome"], result)
+        maker.assert_not_called()
+        generator.assert_not_called()
+        materialize.assert_not_called()
+        reviewer.assert_not_called()
+        preflight.assert_not_called()
+        validator.assert_not_called()
+        self.assertEqual(1, len(self.notifications))
+
+    def test_ambiguous_profile_merge_reconciles_without_any_ai_respend(self):
+        self.gh.raise_after_merge = EW.CommandError(
+            "merge transport ended after main advanced")
+        with mock.patch.object(EW, "assert_publish_auth",
+                               return_value="local test repo"), \
+             mock.patch.object(EW, "assert_visual_pipeline_ready",
+                               return_value="ready"), \
+             mock.patch.object(EW, "run_model", self.visual_model()), \
+             mock.patch.object(EW.azure_art, "generate",
+                               return_value=(PNG, "gpt-image-2")), \
+             mock.patch.object(EW, "review_generated_image",
+                               side_effect=lambda *_: self.review()):
+            first = EW.run_once(
+                cfg=self.visual_config(), health=lambda phase: healthy())
+        self.assertEqual("merge-pending", first["outcome"], first)
+        transaction = json.loads(EW.TRANSACTION_PATH.read_text())
+        self.assertEqual("merge-ambiguous", transaction["phase"])
+        self.assertIs(
+            type(transaction["submission"]["meta"][
+                "_image_generation"]["review"]["score"]),
+            int)
+
+        self.gh.raise_after_merge = None
+
+        def finish(cfg, wcfg, workspace, clone, submission, receipts, health,
+                   transaction=None, profile_snapshot=None):
+            self.assertEqual(
+                transaction_state["profile_snapshot"], profile_snapshot)
+            return self.deployed(receipts)
+
+        transaction_state = transaction
+        with mock.patch.object(EW, "run_model") as maker, \
+             mock.patch.object(EW.azure_art, "generate") as generator, \
+             mock.patch.object(EW, "materialize_azure_image") as materialize, \
+             mock.patch.object(EW, "review_generated_image") as reviewer, \
+             mock.patch.object(EW, "assert_visual_pipeline_ready") as preflight, \
+             mock.patch.object(EW, "finish_platform_deployments", finish):
+            second = EW.run_once(
+                cfg=self.visual_config(), health=lambda phase: healthy())
+        self.assertEqual("reconciled-contributed", second["outcome"], second)
+        maker.assert_not_called()
+        generator.assert_not_called()
+        materialize.assert_not_called()
+        reviewer.assert_not_called()
+        preflight.assert_not_called()
+        self.assertFalse(EW.TRANSACTION_PATH.exists())
+        self.assertEqual(1, len(self.notifications))
+
+    def test_conflicting_profile_snapshot_fails_closed_and_stays_silent(self):
+        transaction = self.run_to_pending()
+        transaction["profile_snapshot"]["minimum_review_score"] = 9
+        EW.atomic_write_json(EW.TRANSACTION_PATH, transaction)
+        with mock.patch.object(EW, "run_model") as maker, \
+             mock.patch.object(EW.azure_art, "generate") as generator, \
+             mock.patch.object(EW, "materialize_azure_image") as materialize, \
+             mock.patch.object(EW, "review_generated_image") as reviewer, \
+             mock.patch.object(EW, "finish_platform_deployments") as finish:
+            result = EW.run_once(
+                cfg=self.visual_config(), health=lambda phase: healthy())
+        self.assertEqual("fail-closed", result["outcome"], result)
+        self.assertIn("captured the wrong minimum", result["reason"])
+        maker.assert_not_called()
+        generator.assert_not_called()
+        materialize.assert_not_called()
+        reviewer.assert_not_called()
+        finish.assert_not_called()
+        self.assertEqual([], self.notifications)
+        self.assertTrue(EW.TRANSACTION_PATH.exists())
+
+    def test_provenance_check_waits_for_delayed_exact_success_before_merge(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"]["view_probe_attempts"] = 2
+        cfg["evolve_worker"]["view_probe_backoff"] = [0]
+        self.gh.provenance_check_sequence = [
+            [{
+                "__typename": "CheckRun",
+                "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+                "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+                "status": "IN_PROGRESS",
+                "conclusion": None,
+            }],
+            [{
+                "__typename": "CheckRun",
+                "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+            }],
+        ]
+
+        summary = self.run_visual_with_verified_deployment(cfg)
+
+        self.assertEqual(EW.OUTCOME_CONTRIBUTED, summary["outcome"], summary)
+        checks = [
+            index for index, call in enumerate(self.gh.calls)
+            if (call[:2] == ("pr", "view")
+                and "statusCheckRollup" in call[-1])
+        ]
+        merge = next(
+            index for index, call in enumerate(self.gh.calls)
+            if call[:2] == ("pr", "merge"))
+        self.assertEqual(3, len(checks))
+        self.assertLess(max(checks), merge)
+        self.assertTrue(all(
+            call[-1] == EW.PROVENANCE_ROLLUP_JSON_FIELDS
+            for call in (self.gh.calls[index] for index in checks)))
+        self.assertFalse(self.gh.called("pr", "checks"))
+
+    def test_real_checkrun_rollup_shapes_are_classified_exactly(self):
+        wcfg = EW.worker_config(self.visual_config())
+
+        def classify(rows):
+            self.gh.provenance_check_sequence = [rows]
+            return EW.collective_provenance_check_state("7", wcfg)
+
+        success = classify([
+            {
+                "__typename": "StatusContext",
+                "context": EW.COLLECTIVE_PROVENANCE_CHECK,
+                "state": "SUCCESS",
+            },
+            {
+                "__typename": "CheckRun",
+                "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+                "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+            },
+        ])
+        self.assertEqual("success", success["classification"])
+        self.assertEqual("OPEN", success["pull_request"]["state"])
+
+        pending = classify([{
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+            "status": "IN_PROGRESS",
+            "conclusion": None,
+        }])
+        self.assertEqual("pending", pending["classification"])
+
+        absent = classify([{
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": "Different workflow",
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+        }])
+        self.assertEqual("absent", absent["classification"])
+        self.assertFalse(absent["present"])
+
+        for conclusion in (
+                "FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STALE"):
+            failed = classify([{
+                "__typename": "CheckRun",
+                "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+                "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+                "status": "COMPLETED",
+                "conclusion": conclusion,
+            }])
+            with self.subTest(conclusion=conclusion):
+                self.assertEqual("failure", failed["classification"])
+
+        cancelled = {
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+            "status": "COMPLETED",
+            "conclusion": "CANCELLED",
+        }
+        self.assertEqual(
+            "cancelled", classify([cancelled])["classification"])
+        self.assertEqual(
+            "pending",
+            classify([
+                cancelled,
+                {
+                    "__typename": "CheckRun",
+                    "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+                    "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+                    "status": "QUEUED",
+                    "conclusion": None,
+                },
+            ])["classification"],
+        )
+
+    def test_rollup_inspection_and_shape_errors_are_not_success(self):
+        wcfg = EW.worker_config(self.visual_config())
+        self.gh.provenance_check_sequence = ["not-an-array"]
+        with self.assertRaises(EW.CommandError):
+            EW.collective_provenance_check_state("7", wcfg)
+
+        self.gh.provenance_check_sequence = [
+            EW.CommandError("gh pr view failed")]
+        with self.assertRaises(EW.CommandError):
+            EW.collective_provenance_check_state("7", wcfg)
+
+        self.gh.provenance_check_sequence = [[{
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+            "status": "COMPLETED",
+            "conclusion": None,
+        }]]
+        with self.assertRaises(EW.CommandError):
+            EW.collective_provenance_check_state("7", wcfg)
+
+    def test_pending_provenance_restarts_then_merges_without_respending(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"]["view_probe_attempts"] = 1
+        cfg["evolve_worker"]["view_probe_backoff"] = [0]
+        self.gh.provenance_check_sequence = [[{
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+            "status": "QUEUED",
+            "conclusion": None,
+        }]]
+
+        first = self.run_visual_with_verified_deployment(cfg)
+
+        self.assertEqual("checks-pending", first["outcome"], first)
+        self.assertFalse(self.gh.called("pr", "merge"))
+        transaction = json.loads(EW.TRANSACTION_PATH.read_text())
+        self.assertEqual("checks-pending", transaction["phase"])
+        self.assertEqual("pending",
+                         json.loads(EW.HISTORY_PATH.read_text())[0]["outcome"])
+
+        self.gh.provenance_check_sequence = [[{
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+        }]]
+
+        def finish(cfg, wcfg, workspace, clone, submission, receipts, health,
+                   transaction=None, profile_snapshot=None):
+            return self.deployed(receipts)
+
+        with mock.patch.object(EW, "run_model") as maker, \
+             mock.patch.object(EW.azure_art, "generate") as generator, \
+             mock.patch.object(EW, "materialize_azure_image") as materialize, \
+             mock.patch.object(EW, "review_generated_image") as reviewer, \
+             mock.patch.object(EW, "assert_visual_pipeline_ready") as preflight, \
+             mock.patch.object(
+                 EW, "validate_staged_collective_candidate") as validator, \
+             mock.patch.object(EW, "finish_platform_deployments", finish):
+            second = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+        self.assertEqual("reconciled-contributed", second["outcome"], second)
+        maker.assert_not_called()
+        generator.assert_not_called()
+        materialize.assert_not_called()
+        reviewer.assert_not_called()
+        preflight.assert_not_called()
+        validator.assert_not_called()
+        self.assertTrue(self.gh.called("pr", "merge"))
+        self.assertFalse(EW.TRANSACTION_PATH.exists())
+
+    def test_explicit_provenance_failure_closes_without_merging(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"]["view_probe_attempts"] = 1
+        self.gh.provenance_check_sequence = [[{
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+            "status": "COMPLETED",
+            "conclusion": "FAILURE",
+        }]]
+
+        result = self.run_visual_with_verified_deployment(cfg)
+
+        self.assertEqual(EW.OUTCOME_ABORTED, result["outcome"], result)
+        self.assertTrue(self.gh.called("pr", "close"))
+        self.assertFalse(self.gh.called("pr", "merge"))
+        self.assertFalse(EW.TRANSACTION_PATH.exists())
+        tree = git_bare(self.origin, "ls-tree", "-r", "--name-only", "main")
+        self.assertNotIn("submissions/visual-piece/piece.png", tree)
+
+    def test_fresh_rollup_failure_after_success_remains_terminal(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"]["view_probe_attempts"] = 1
+        success = {
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+        }
+        self.gh.provenance_check_sequence = [
+            [success],
+            [{**success, "conclusion": "FAILURE"}],
+        ]
+
+        result = self.run_visual_with_verified_deployment(cfg)
+
+        self.assertEqual(EW.OUTCOME_ABORTED, result["outcome"], result)
+        self.assertTrue(self.gh.called("pr", "close"))
+        self.assertFalse(self.gh.called("pr", "merge"))
+
+    def test_stale_provenance_result_remains_terminal(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"]["view_probe_attempts"] = 1
+        self.gh.provenance_check_sequence = [[{
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+            "status": "COMPLETED",
+            "conclusion": "STALE",
+        }]]
+
+        result = self.run_visual_with_verified_deployment(cfg)
+
+        self.assertEqual(EW.OUTCOME_ABORTED, result["outcome"], result)
+        self.assertTrue(self.gh.called("pr", "close"))
+        self.assertFalse(self.gh.called("pr", "merge"))
+
+    def test_cancelled_run_with_pending_replacement_stays_open(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"]["view_probe_attempts"] = 1
+        self.gh.provenance_check_sequence = [[
+            {
+                "__typename": "CheckRun",
+                "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+                "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+                "status": "COMPLETED",
+                "conclusion": "CANCELLED",
+            },
+            {
+                "__typename": "CheckRun",
+                "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+                "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+                "status": "QUEUED",
+                "conclusion": None,
+            },
+        ]]
+
+        result = self.run_visual_with_verified_deployment(cfg)
+
+        self.assertEqual("checks-pending", result["outcome"], result)
+        self.assertFalse(self.gh.called("pr", "close"))
+        self.assertFalse(self.gh.called("pr", "merge"))
+        state = json.loads(EW.TRANSACTION_PATH.read_text())
+        self.assertEqual("pending", state["provenance_check_state"])
+        self.assertEqual("", state["provenance_cancelled_first_seen_at"])
+
+    def test_lone_cancelled_run_gets_bounded_replacement_grace(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"].update({
+            "view_probe_attempts": 1,
+            "view_probe_backoff": [0],
+            "provenance_absent_grace_s": 300,
+        })
+        self.gh.provenance_check_sequence = [[{
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+            "status": "COMPLETED",
+            "conclusion": "CANCELLED",
+        }]]
+
+        first = self.run_visual_with_verified_deployment(cfg)
+
+        self.assertEqual("checks-pending", first["outcome"], first)
+        self.assertFalse(self.gh.called("pr", "close"))
+        state = json.loads(EW.TRANSACTION_PATH.read_text())
+        self.assertTrue(state["provenance_cancelled_first_seen_at"])
+
+        cfg["evolve_worker"]["provenance_absent_grace_s"] = 0
+        with mock.patch.object(EW, "run_model") as maker:
+            second = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+        self.assertEqual("reconciled-aborted", second["outcome"], second)
+        maker.assert_not_called()
+        self.assertTrue(self.gh.called("pr", "close"))
+        self.assertFalse(self.gh.called("pr", "merge"))
+
+    def test_absent_provenance_is_pending_then_bounded_failure_never_success(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"].update({
+            "view_probe_attempts": 1,
+            "view_probe_backoff": [0],
+            "provenance_absent_grace_s": 300,
+        })
+        self.gh.provenance_check_sequence = [[]]
+
+        first = self.run_visual_with_verified_deployment(cfg)
+
+        self.assertEqual("checks-pending", first["outcome"], first)
+        self.assertFalse(self.gh.called("pr", "merge"))
+        self.assertTrue(EW.TRANSACTION_PATH.exists())
+
+        cfg["evolve_worker"]["provenance_absent_grace_s"] = 0
+        with mock.patch.object(EW, "run_model") as maker:
+            second = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+        self.assertEqual("reconciled-aborted", second["outcome"], second)
+        maker.assert_not_called()
+        self.assertTrue(self.gh.called("pr", "close"))
+        self.assertFalse(self.gh.called("pr", "merge"))
+
+    def test_check_state_api_error_stays_pending_without_losing_transaction(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"]["view_probe_attempts"] = 1
+        self.gh.provenance_check_sequence = [
+            EW.CommandError("GitHub check API unavailable")]
+
+        first = self.run_visual_with_verified_deployment(cfg)
+
+        self.assertEqual("checks-pending", first["outcome"], first)
+        transaction = json.loads(EW.TRANSACTION_PATH.read_text())
+        self.assertEqual("checks-pending", transaction["phase"])
+        self.assertFalse(self.gh.called("pr", "merge"))
+
+        with mock.patch.object(EW, "run_model") as maker:
+            second = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+        self.assertEqual("checks-pending", second["outcome"], second)
+        maker.assert_not_called()
+        self.assertTrue(EW.TRANSACTION_PATH.exists())
+        self.assertFalse(self.gh.called("pr", "merge"))
+
+    def test_blocked_required_check_restarts_clean_without_respending(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"]["view_probe_attempts"] = 1
+        self.gh.merge_state_status = "BLOCKED"
+        self.gh.provenance_check_sequence = [[
+            {
+                "__typename": "CheckRun",
+                "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+                "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+            },
+            {
+                "__typename": "CheckRun",
+                "name": "Other required check",
+                "workflowName": "Required checks",
+                "status": "IN_PROGRESS",
+                "conclusion": None,
+            },
+        ]]
+
+        first = self.run_visual_with_verified_deployment(cfg)
+
+        self.assertEqual("checks-pending", first["outcome"], first)
+        self.assertFalse(self.gh.called("pr", "merge"))
+        self.assertFalse(self.gh.called("pr", "close"))
+        transaction = json.loads(EW.TRANSACTION_PATH.read_text())
+        self.assertEqual("checks-pending", transaction["phase"])
+
+        self.gh.merge_state_status = "CLEAN"
+        self.gh.provenance_check_sequence = [[{
+            "__typename": "CheckRun",
+            "name": EW.COLLECTIVE_PROVENANCE_CHECK,
+            "workflowName": EW.COLLECTIVE_PROVENANCE_WORKFLOW,
+            "status": "COMPLETED",
+            "conclusion": "SUCCESS",
+        }]]
+
+        def finish(cfg, wcfg, workspace, clone, submission, receipts, health,
+                   transaction=None, profile_snapshot=None):
+            return self.deployed(receipts)
+
+        with mock.patch.object(EW, "run_model") as maker, \
+             mock.patch.object(EW.azure_art, "generate") as generator, \
+             mock.patch.object(EW, "materialize_azure_image") as materialize, \
+             mock.patch.object(EW, "review_generated_image") as reviewer, \
+             mock.patch.object(EW, "assert_visual_pipeline_ready") as preflight, \
+             mock.patch.object(
+                 EW, "validate_staged_collective_candidate") as validator, \
+             mock.patch.object(EW, "finish_platform_deployments", finish):
+            second = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+
+        self.assertEqual("reconciled-contributed", second["outcome"], second)
+        maker.assert_not_called()
+        generator.assert_not_called()
+        materialize.assert_not_called()
+        reviewer.assert_not_called()
+        preflight.assert_not_called()
+        validator.assert_not_called()
+        self.assertTrue(self.gh.called("pr", "merge"))
+        self.assertFalse(EW.TRANSACTION_PATH.exists())
+
+    def test_behind_merge_state_stays_open_and_pending(self):
+        cfg = self.visual_config()
+        cfg["evolve_worker"]["view_probe_attempts"] = 1
+        self.gh.merge_state_status = "BEHIND"
+
+        result = self.run_visual_with_verified_deployment(cfg)
+
+        self.assertEqual("checks-pending", result["outcome"], result)
+        self.assertFalse(self.gh.called("pr", "merge"))
+        self.assertFalse(self.gh.called("pr", "close"))
+        self.assertTrue(EW.TRANSACTION_PATH.exists())
+
+    def test_only_clean_merge_state_is_ready(self):
+        wcfg = EW.worker_config(self.visual_config())
+        for merge_state in ("DIRTY", "DRAFT", "HAS_HOOKS"):
+            self.gh.merge_state_status = merge_state
+            with self.subTest(merge_state=merge_state), \
+                 self.assertRaises(EW.ProvenanceCheckFailed):
+                EW.collective_merge_readiness("7", wcfg)
+
+    def test_notification_retry_reuses_verified_receipts_without_cdn_probe(self):
+        cfg = self.visual_config()
+
+        def finish(cfg, wcfg, workspace, clone, submission, receipts, health,
+                   transaction=None, profile_snapshot=None):
+            vcfg = EW.vision_config(wcfg)
+            vision = {
+                **EW.vision_urls(vcfg, submission),
+                "merge_commit": "vision-verified-commit",
+            }
+            collective_url, _ = EW.art_urls(cfg, wcfg, submission)
+            deployed = {
+                "collective_url": collective_url,
+                "collective_kind": "pages",
+                "vision_url": vision["watch_url"],
+                "vision_channel_url": vision["channel_url"],
+                "vision_media_url": vision["media_url"],
+                "note": "",
+            }
+            durable = EW.durable_deployment_receipt(
+                cfg, wcfg, submission, receipts, vision, deployed,
+                profile_snapshot=profile_snapshot)
+            result = {**receipts, "vision": vision, **durable}
+            transaction(
+                phase="platforms-verified",
+                vision_receipts=vision,
+                deployment_receipts=durable,
+            )
+            return result
+
+        with mock.patch.object(EW, "assert_publish_auth",
+                               return_value="local test repo"), \
+             mock.patch.object(EW, "assert_visual_pipeline_ready",
+                               return_value="ready"), \
+             mock.patch.object(EW, "run_model", self.visual_model()), \
+             mock.patch.object(EW.azure_art, "generate",
+                               return_value=(PNG, "gpt-image-2")), \
+             mock.patch.object(EW, "review_generated_image",
+                               side_effect=lambda *_: self.review()), \
+             mock.patch.object(EW, "finish_platform_deployments", finish), \
+             mock.patch.object(
+                 EW.sentinel, "notify",
+                 side_effect=KeyboardInterrupt(
+                     "power cut after verified deployment before notification"),
+             ):
+            first = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+        self.assertEqual("interrupted", first["outcome"], first)
+        state = json.loads(EW.TRANSACTION_PATH.read_text())
+        self.assertEqual("notification-pending", state["phase"])
+        self.assertIn("deployment_receipts", state)
+        self.assertEqual([], self.notifications)
+
+        with mock.patch.object(
+                EW, "finish_platform_deployments",
+                side_effect=AssertionError(
+                    "notification retry must not re-probe or redeploy")), \
+             mock.patch.object(
+                 EW, "probe_url",
+                 side_effect=AssertionError(
+                     "a later CDN failure must not affect notification retry")), \
+             mock.patch.object(
+                 EW, "probe_png_url",
+                 side_effect=AssertionError(
+                     "a later media probe must not run")), \
+             mock.patch.object(EW, "run_model") as maker:
+            second = EW.run_once(cfg=cfg, health=lambda phase: healthy())
+
+        self.assertEqual("reconciled-contributed", second["outcome"], second)
+        maker.assert_not_called()
+        self.assertEqual(1, len(self.notifications))
+        self.assertFalse(EW.TRANSACTION_PATH.exists())
+
+    def test_persisted_deployment_receipt_rejects_digest_or_profile_conflict(self):
+        cfg = self.visual_config()
+        wcfg = EW.worker_config(cfg)
+        snapshot = EW.publication_profile_snapshot(wcfg)
+        meta = with_reviewed_png_receipt(
+            meta_for("visual-piece", kind="png"), PNG, wcfg)
+        submission = {
+            "slug": "visual-piece",
+            "title": "Visual Piece",
+            "kind": "png",
+            "meta": meta,
+            "meta_path": "submissions/visual-piece/meta.json",
+            "piece_path": "submissions/visual-piece/piece.png",
+            "meta_sha256": hashlib.sha256(
+                json.dumps(meta, ensure_ascii=False, indent=2).encode()
+            ).hexdigest(),
+            "piece_sha256": hashlib.sha256(PNG).hexdigest(),
+        }
+        collective = {"merge_commit": "collective-verified-commit"}
+        vision = {
+            **EW.vision_urls(EW.vision_config(wcfg), submission),
+            "merge_commit": "vision-verified-commit",
+        }
+        collective_url, _ = EW.art_urls(cfg, wcfg, submission)
+        deployed = {
+            "collective_url": collective_url,
+            "collective_kind": "pages",
+            "vision_url": vision["watch_url"],
+            "vision_channel_url": vision["channel_url"],
+            "vision_media_url": vision["media_url"],
+            "note": "",
+        }
+        receipt = EW.durable_deployment_receipt(
+            cfg, wcfg, submission, collective, vision, deployed,
+            profile_snapshot=snapshot)
+        for field, value in (
+                ("piece_sha256", "0" * 64),
+                ("profile", ""),
+        ):
+            with self.subTest(field=field):
+                bad = dict(receipt, **{field: value})
+                with self.assertRaises(EW.GateError):
+                    EW.persisted_deployment_receipts(
+                        {
+                            "deployment_receipts": bad,
+                            "vision_receipts": vision,
+                        },
+                        cfg, wcfg, submission, collective,
+                        profile_snapshot=snapshot)
+
+
 class ArtDeliveryTests(WorkerEnv):
     """The art text goes through the ordinary outbox — once — and is then the
     delivery layer's business to classify, not this worker's to assert."""
@@ -1915,13 +4267,29 @@ class ArtDeliveryTests(WorkerEnv):
         import standup
         self.outbox = outbox
         self.enqueued = []
+        self.enqueue_attempts = []
+        self.enqueued_ids = set()
+
+        def enqueue_once(text, to, attachments=None, dedupe_key=None):
+            self.enqueue_attempts.append(dedupe_key)
+            if dedupe_key and dedupe_key in self.enqueued_ids:
+                return False
+            if dedupe_key:
+                self.enqueued_ids.add(dedupe_key)
+            self.enqueued.append({
+                "text": text,
+                "to": to,
+                "attachments": attachments,
+                "dedupe_key": dedupe_key,
+            })
+            return True
+
+        self.enqueue_once = enqueue_once
         # sentinel.notify is NOT patched here: the point is to watch the real
         # notify path reach the real queue exactly once.
         for target, name, value in (
                 (EW.sentinel, "notify", REAL_NOTIFY),
-                (outbox, "enqueue", lambda text, to, attachments=None:
-                 self.enqueued.append({"text": text, "to": to,
-                                       "attachments": attachments})),
+                (outbox, "enqueue", enqueue_once),
                 (outbox, "drain", mock.Mock(return_value=(1, 0, "sent"))),
                 (standup, "portable_snapshot", mock.Mock(return_value="snap.html")),
                 (standup, "publish_snapshot",
@@ -1957,6 +4325,59 @@ class ArtDeliveryTests(WorkerEnv):
             EW.run_once(cfg=cfg, health=lambda phase: healthy())
         self.assertEqual(1, len(self.enqueued))
         self.drain.assert_not_called()
+
+    def test_crash_immediately_before_enqueue_resumes_from_contributed_row(self):
+        with mock.patch.object(
+                self.outbox, "enqueue",
+                side_effect=KeyboardInterrupt("power cut before enqueue")), \
+             mock.patch.object(EW, "run_model", self.model_that_submits()):
+            first = EW.run_once(
+                cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("interrupted", first["outcome"], first)
+        self.assertEqual([], self.enqueued)
+        transaction = json.loads(EW.TRANSACTION_PATH.read_text())
+        self.assertEqual("notification-pending", transaction["phase"])
+        self.assertTrue(transaction["notification_id"].startswith("evolve-art:"))
+        self.assertEqual(
+            EW.OUTCOME_CONTRIBUTED,
+            json.loads(EW.HISTORY_PATH.read_text())[0]["outcome"])
+
+        with mock.patch.object(EW, "run_model") as maker:
+            second = EW.run_once(
+                cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("reconciled-contributed", second["outcome"], second)
+        maker.assert_not_called()
+        self.assertEqual(1, len(self.enqueued))
+        self.assertEqual(
+            transaction["notification_id"], self.enqueued[0]["dedupe_key"])
+        self.assertFalse(EW.TRANSACTION_PATH.exists())
+
+    def test_crash_immediately_after_enqueue_dedupes_on_reconciliation(self):
+        def enqueue_then_crash(text, to, attachments=None, dedupe_key=None):
+            self.enqueue_once(text, to, attachments, dedupe_key)
+            raise KeyboardInterrupt("power cut after enqueue")
+
+        with mock.patch.object(
+                self.outbox, "enqueue", side_effect=enqueue_then_crash), \
+             mock.patch.object(EW, "run_model", self.model_that_submits()):
+            first = EW.run_once(
+                cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("interrupted", first["outcome"], first)
+        self.assertEqual(1, len(self.enqueued))
+        identity = self.enqueued[0]["dedupe_key"]
+        self.assertTrue(identity.startswith("evolve-art:"))
+        self.assertEqual(
+            EW.OUTCOME_CONTRIBUTED,
+            json.loads(EW.HISTORY_PATH.read_text())[0]["outcome"])
+
+        with mock.patch.object(EW, "run_model") as maker:
+            second = EW.run_once(
+                cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("reconciled-contributed", second["outcome"], second)
+        maker.assert_not_called()
+        self.assertEqual(1, len(self.enqueued), "stable identity must dedupe")
+        self.assertGreaterEqual(self.enqueue_attempts.count(identity), 2)
+        self.assertFalse(EW.TRANSACTION_PATH.exists())
 
     def test_nothing_is_enqueued_when_the_merge_is_not_verified(self):
         phases = {"start": healthy(), "pre-write": healthy(),
@@ -3237,14 +5658,14 @@ class LiveRetryTests(WorkerEnv):
         real_publish = EW.publish
 
         def dying(clone, submission, wcfg, health, branch=None,
-                  transaction=None, ctx=None):
+                  transaction=None, ctx=None, profile_snapshot=None):
             def note(**fields):
                 state = transaction(**fields) if transaction else {}
                 if fields.get("phase") == "merged":
                     raise KeyboardInterrupt("power cut")
                 return state
             return real_publish(clone, submission, wcfg, health, branch, note,
-                                ctx)
+                                ctx, profile_snapshot)
 
         def maker(staging, prompt, wcfg, depth=0, runtime=None):
             write_submission(Path(staging) / "out", "second-piece",
@@ -3755,14 +6176,14 @@ class ReconciliationTests(WorkerEnv):
         real_publish = EW.publish
 
         def dying(clone, submission, wcfg, health, branch=None,
-                  transaction=None, ctx=None):
+                  transaction=None, ctx=None, profile_snapshot=None):
             def note(**fields):
                 state = transaction(**fields) if transaction else {}
                 if fields.get("phase") == phase:
                     raise KeyboardInterrupt("power cut")
                 return state
             return real_publish(clone, submission, wcfg, health, branch, note,
-                                ctx)
+                                ctx, profile_snapshot)
         return dying
 
     def test_a_merge_that_was_never_recorded_is_finished_on_the_next_pass(self):
@@ -3793,6 +6214,33 @@ class ReconciliationTests(WorkerEnv):
         self.assertIn(EW.SUCCESS_PREFIX, self.texts()[0])
         self.assertFalse(EW.TRANSACTION_PATH.exists())
 
+    def test_main_moves_then_merge_command_raises_without_respending(self):
+        self.gh.raise_after_merge = EW.CommandError(
+            "gh pr merge timed out after server accepted it")
+        with mock.patch.object(EW, "run_model", self.model_that_submits()):
+            first = EW.run_once(
+                cfg=self.cfg, health=lambda phase: healthy())
+
+        self.assertEqual("merge-pending", first["outcome"], first)
+        self.assertIn(
+            "submissions/new-piece/piece.svg",
+            git_bare(self.origin, "ls-tree", "--name-only", "-r", "main"))
+        transaction = json.loads(EW.TRANSACTION_PATH.read_text())
+        self.assertEqual("merge-ambiguous", transaction["phase"])
+        history = json.loads(EW.HISTORY_PATH.read_text())
+        self.assertEqual("pending", history[0]["outcome"])
+        self.assertEqual([], self.notifications)
+
+        self.gh.raise_after_merge = None
+        with mock.patch.object(EW, "run_model") as maker:
+            second = EW.run_once(
+                cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("reconciled-contributed", second["outcome"], second)
+        maker.assert_not_called()
+        self.assertEqual(1, len(json.loads(EW.HISTORY_PATH.read_text())))
+        self.assertEqual(1, len(self.notifications))
+        self.assertFalse(EW.TRANSACTION_PATH.exists())
+
     def test_an_abandoned_pr_is_closed_and_the_row_marked_aborted(self):
         with mock.patch.object(EW, "run_model", self.model_that_submits()), \
              mock.patch.object(EW, "publish", self.crash_after("pr-open")):
@@ -3821,6 +6269,34 @@ class ReconciliationTests(WorkerEnv):
         maker.assert_not_called()
         history = json.loads(EW.HISTORY_PATH.read_text())
         self.assertEqual(EW.OUTCOME_ABORTED, history[0]["outcome"])
+
+    def test_unreceipted_legacy_png_transaction_stays_fail_closed(self):
+        row = {
+            "id": "legacy-png-row",
+            "at": NOW.isoformat(),
+            "mode": "evolve",
+            "role": "openrappter",
+            "cycle": 1,
+            "outcome": "pending",
+        }
+        EW.save_history([row])
+        EW.transaction_writer(row["id"], {
+            "phase": "gated",
+            "slug": "legacy-png",
+            "submission": {
+                "slug": "legacy-png",
+                "kind": "png",
+                "meta": meta_for("legacy-png", kind="png"),
+            },
+            "profile_snapshot": None,
+        })()
+        with mock.patch.object(EW, "run_model") as maker:
+            result = EW.run_once(
+                cfg=self.cfg, health=lambda phase: healthy())
+        self.assertEqual("fail-closed", result["outcome"], result)
+        self.assertIn("no reviewed-profile receipt", result["reason"])
+        maker.assert_not_called()
+        self.assertTrue(EW.TRANSACTION_PATH.exists())
 
     def test_the_next_cycle_number_follows_the_reconciled_ledger(self):
         with mock.patch.object(EW, "run_model", self.model_that_submits()), \
