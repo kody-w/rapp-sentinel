@@ -155,6 +155,42 @@ def notify(cfg, text, to=None, rebuild=False, kind="operational",
     to = to or cfg.get("notify_handle")
     if not to:
         return False
+
+    # ---- THE GATE (added 2026-08-25 from measured field behavior) -------------------
+    # Three questions, in order, before any human is woken. Every answer is recorded as
+    # a rapp/1 frame on the alert ledger, so silence is provable and repeat-noise is
+    # countable. A failure inside the gate must never swallow a real alert: on any
+    # exception we fall through and page, because a missed alarm is worse than a repeat.
+    _fp = None
+    try:
+        import cooldown, alert_ledger
+        _inst = instance_name(cfg)
+        _fp = cooldown.fingerprint(text)
+        _checks = [c for c in _fp[len("checks:"):].split(",") if c] if _fp.startswith("checks:") else []
+
+        # 1. Is this the watcher's own blindness rather than a finding about the world?
+        #    "cannot read the PR queue" is a defect in ME. Record it; never page for it.
+        if kind == "operational" and cooldown.is_self_blindness(text):
+            alert_ledger.record("blind", _inst, _fp, text,
+                                reason="every finding was the watcher failing to observe",
+                                checks=_checks)
+            log(f"gate: blind-only alert suppressed ({_fp[:60]})")
+            return False
+
+        # 2. Have I already reported this exact set of failing checks recently?
+        #    Identity is the CHECK SET, so a re-measured age ("68.6h" -> "69.1h") is the
+        #    same alarm, not new news. This is what ran 69 hours in the wild.
+        if kind == "operational" and not cooldown.should_send(text, to):
+            hist = alert_ledger.history(_fp, _inst)
+            alert_ledger.record("suppressed", _inst, _fp, text,
+                                reason=f"same failing-check set already reported "
+                                       f"(seen {hist['seen']}x, paged {hist['paged']}x)",
+                                checks=_checks)
+            log(f"gate: cooling down ({_fp[:60]})")
+            return False
+    except Exception as e:
+        log(f"gate unavailable, paging anyway: {type(e).__name__}: {e}")
+    # --------------------------------------------------------------------------------
     try:
         import outbox
         payload = text
@@ -173,6 +209,14 @@ def notify(cfg, text, to=None, rebuild=False, kind="operational",
             outbox.enqueue(payload, to)
         else:
             outbox.enqueue(payload, to, dedupe_key=dedupe_key)
+        # The page happened — record WHY it was allowed through, so noise is countable
+        # and silence is provable. Never let a ledger problem break a delivered alert.
+        try:
+            import alert_ledger
+            alert_ledger.record("paged", instance_name(cfg), _fp or "text:?", text,
+                                reason=f"kind={kind}; passed blindness + cooldown gate")
+        except Exception:
+            pass
     except Exception as e:
         log(f"notify failed: {e}")
         return False

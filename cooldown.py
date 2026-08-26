@@ -20,8 +20,15 @@ import re
 import time
 from pathlib import Path
 
-STATE = Path.home() / "rapp-sentinel" / "state" / "cooldown.jsonl"
-SUPPRESSED = Path.home() / "rapp-sentinel" / "state" / "cooldown-suppressed.jsonl"
+# HOME comes from paths.py — the one place it is derived. Hardcoding
+# Path.home()/"rapp-sentinel" here meant the cooldown wrote to a directory that does
+# not exist on any deployed instance (they run from ~/Documents/GitHub/rapp-sentinel),
+# so the suppression state was never read back and EVERY alarm looked new. Measured in
+# the wild 2026-08-25: the same finding re-sent for 69 hours straight.
+from paths import HOME as _HOME
+
+STATE = _HOME / "state" / "cooldown.jsonl"
+SUPPRESSED = _HOME / "state" / "cooldown-suppressed.jsonl"
 
 # Hours a given condition stays quiet after it has been reported once.
 # Override with RAPP_ALERT_COOLDOWN_HOURS.
@@ -31,6 +38,33 @@ DEFAULT_HOURS = 6.0
 _CHECK = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
 # Anything that is only a changing magnitude should not make an alarm look new.
 _NUM = re.compile(r"\d+(?:\.\d+)?")
+
+
+# Phrases that mean "the watcher could not observe", not "the watched thing is broken".
+# Measured in the wild 2026-08-25: the MAJORITY of alert text was this class — "cannot
+# read the PR queue", "cannot read run history", "cannot audit launchd jobs", "unable to
+# tell whether", "/chat unreachable". Paging a human because the watcher is blind trains
+# them to ignore the channel. Blindness is still RECORDED (it is a real defect in the
+# watcher) — it just never pages, and it is surfaced in the digest as a watcher problem.
+_BLINDNESS = (
+    "cannot read", "cannot audit", "could not read", "unable to tell",
+    "unable to read", "cannot reach", "unreachable", "URLError", "ConnectionResetError",
+    "is not a git checkout", "no such file",
+)
+
+
+def is_self_blindness(text: str) -> bool:
+    """True when EVERY finding in this alert is the watcher failing to observe."""
+    low = (text or "").lower()
+    if not any(b.lower() in low for b in _BLINDNESS):
+        return False
+    # If the alert also carries a finding that is NOT a blindness phrase, it still pages.
+    lines = [l.strip() for l in low.replace(";", "\n").splitlines() if l.strip()]
+    substantive = [l for l in lines
+                   if not any(b.lower() in l for b in _BLINDNESS)
+                   and any(c in l for c in ("stale", "ago", "waited", "failed", "starv",
+                                            "reject", "behind", "missing", "down"))]
+    return not substantive
 
 
 def fingerprint(text: str) -> str:

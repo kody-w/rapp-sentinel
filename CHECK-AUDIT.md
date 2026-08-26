@@ -33,3 +33,33 @@ own `prove_*.py`, per house rule. Ids are never renamed.
 | `w_anchor_ledger` | positive external comparison | exemplar | ok |
 | `w_sentinel_fresh` | self-written stamp, judged by peers per design | keep — the peers are the check on it | by design |
 | `w_checks_complete` | positive required-vs-ran comparison | keep; the self-removal limit is documented and held by rapp-overwatch from outside | ok |
+
+## The alert gate (added 2026-08-25 from measured field behavior)
+
+Three watchers ran in the wild for three days and taught us what the design missed.
+Observed: the same findings re-sent for **69+ hours** with only the age counter moving;
+the majority of alert text was the watcher's own blindness ("cannot read the PR queue",
+"cannot audit launchd jobs"); the repair arm wrote no state for six days; and 11 of the
+watchers' own launchd services sat crashed. Nobody could answer *did any of this cause
+an action?* — because alerting left no record.
+
+Every alert now passes one gate in `sentinel.notify()`, and **every decision is a rapp/1
+frame** on `state/alerts.jsonl` (`alert_ledger.py`):
+
+1. **Blindness never pages.** If every finding is the watcher failing to observe, it is
+   recorded as `alert.blind` and no human is woken. That is a defect in the watcher, and
+   it surfaces in the digest as one — where it can actually be fixed.
+2. **Identity is the failing-check SET, not the prose.** A re-measured age (68.6h →
+   69.1h) is the same alarm. Repeats inside the window record `alert.suppressed`.
+3. **A page records why it was allowed** (`alert.paged`), so noise is countable and
+   silence is provable.
+
+Two bugs this fixed, both invisible without the field run:
+- `cooldown.py` wrote its state to `~/rapp-sentinel/state/` — a directory that does not
+  exist on any deployed instance (they run from `~/Documents/GitHub/rapp-sentinel`), so
+  suppression state was never read back and every alarm looked new. It now derives from
+  `paths.HOME`, the one place HOME is supposed to come from.
+- `cooldown` was never wired into `notify()` at all. The module existed; nothing called it.
+
+Ask the ledger anything: `python3 alert_ledger.py <instance>` prints the 24h digest —
+paged / suppressed / blind, and which checks are blind most often.
