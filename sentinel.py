@@ -232,10 +232,13 @@ def notify(cfg, text, to=None, rebuild=False, kind="operational",
             suffix = ("\n\nStatic HTML report:\n" + "\n".join(urls) if urls
                       else "\n\nStatic HTML report generation failed; alert preserved.")
             payload += suffix
+        # already_gated: notify() ran blindness + cooldown above. should_send() RECORDS as
+        # a side effect, so letting enqueue re-gate would suppress the alert this path
+        # just approved.
         if dedupe_key is None:
-            outbox.enqueue(payload, to)
+            outbox.enqueue(payload, to, already_gated=True)
         else:
-            outbox.enqueue(payload, to, dedupe_key=dedupe_key)
+            outbox.enqueue(payload, to, dedupe_key=dedupe_key, already_gated=True)
         # The page happened — record WHY it was allowed through, so noise is countable
         # and silence is provable. Never let a ledger problem break a delivered alert.
         try:
