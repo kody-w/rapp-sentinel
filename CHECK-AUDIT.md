@@ -86,3 +86,19 @@ already verifies under one envelope, so a sentinel frame pools, travels, and gat
 alongside world data, brains, and films with no special case. A private identity scheme
 would need its own tooling forever. Compliance is what makes an instance legible to a
 system it has never met — which is the entire point of running many of them.
+
+### Identity at birth, not on a lucky path (2026-08-25, from the control experiment)
+
+Cloning this repo fresh and running the rapp/1 oracle against it returned **CLEAN** —
+which does not mean "passes". It means *no artifacts, nothing to verify*: the empty-room
+verdict. The organically-grown instances scored identically, for the same reason. So
+"we wrote compliance code" was true and "our instances are compliant" was false.
+
+The fix is where it is minted. `identity.ensure()` now runs inside `config()`, the one
+chokepoint every entry point crosses — including the STOP path, because a stood-down
+sentinel still has to be identifiable. Mint-once per §6.2 means it costs nothing after
+the first tick, and it is never fatal: an instance that cannot write its identity still
+watches.
+
+Result: a fresh install reads **COMPLIANT** on its first tick instead of CLEAN, and
+every alert it ever sends can be traced to a specific instance and commit.

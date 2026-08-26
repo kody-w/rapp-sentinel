@@ -103,7 +103,34 @@ def save_json(path, data):
 def config():
     cfg = dict(DEFAULTS)
     cfg.update(load_json(HOME / "config.json", {}))
+    _ensure_identity(cfg)
     return cfg
+
+
+def _ensure_identity(cfg):
+    """Mint this instance's rapp/1 identity at BIRTH, not on first lucky code path.
+
+    Measured 2026-08-25: a fresh clone of this repo scored CLEAN under the rapp/1 oracle
+    — which does not mean "passes", it means "no artifacts, nothing to verify". An
+    instance that has never minted an identity is invisible to every tool in the estate:
+    you cannot say which box sent an alert, what code it ran, or whether a fix reached
+    it. An estate inventory that day found six installs at five code versions,
+    distinguishable only by a display name typed into a config file.
+
+    Identity therefore cannot live in an optional path. config() is the one chokepoint
+    every entry point crosses — including the STOP path, because a stood-down sentinel
+    still needs to be identifiable. Mint-once per spec 6.2 (uuid entropy, never a
+    name-hash), so this is free on every run after the first.
+
+    Never fatal: a sentinel that cannot write its identity must still watch."""
+    try:
+        import identity
+        identity.ensure(instance_name(cfg))
+    except Exception as e:
+        try:
+            log(f"identity unavailable (watch continues): {type(e).__name__}: {e}")
+        except Exception:
+            pass
 
 
 def instance_name(cfg):
