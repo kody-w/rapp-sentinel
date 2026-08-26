@@ -1055,34 +1055,8 @@ def _rewrite_queue_unlocked(lines):
     _rewrite_lines_unlocked(QUEUE, lines)
 
 
-def enqueue(text, to, attachments=None, dedupe_key=None, already_gated=False):
-    """Durably queue once; keyed effects stop on unresolved terminal ambiguity.
-
-    THE ALERT GATE LIVES HERE because this is the chokepoint every path crosses.
-    sentinel.notify() gates too, but it is not the only sender: nightwatch.py:55 and
-    principal.py:525 call enqueue() directly, so a gate that lives only in notify() covers
-    one path out of several. Measured 2026-08-26 — the local instance's cooldown was working
-    (97 suppressions) while Kody still got spam, because nightwatch bypassed it entirely.
-
-    `already_gated=True` is how notify() says "I ran the gate; do not run it again."
-    cooldown.should_send() RECORDS as a side effect, so calling it twice for one alert would
-    make the second call suppress what the first approved — silencing real pages. Callers
-    that pass a dedupe_key are likewise left alone; keyed delivery has its own semantics."""
-    if not already_gated and dedupe_key is None:
-        try:
-            import cooldown
-            _blind = cooldown.is_self_blindness(text)
-            if _blind or not cooldown.should_send(text, to):
-                try:
-                    import alert_ledger
-                    alert_ledger.record("blind" if _blind else "suppressed", "outbox",
-                                        cooldown.fingerprint(text), text,
-                                        reason="gated at the outbox chokepoint (direct caller)")
-                except Exception:
-                    pass
-                return False
-        except Exception:
-            pass        # a broken gate must NEVER swallow an alert
+def enqueue(text, to, attachments=None, dedupe_key=None):
+    """Durably queue once; keyed effects stop on unresolved terminal ambiguity."""
     if dedupe_key is not None:
         if (not isinstance(dedupe_key, str) or not dedupe_key.strip()
                 or len(dedupe_key) > 240):
