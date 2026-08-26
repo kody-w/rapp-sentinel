@@ -63,3 +63,26 @@ Two bugs this fixed, both invisible without the field run:
 
 Ask the ledger anything: `python3 alert_ledger.py <instance>` prints the 24h digest —
 paged / suppressed / blind, and which checks are blind most often.
+
+## Identity: why a sentinel must be rapp/1 compliant (2026-08-25)
+
+A full inventory of the estate found **six sentinel installs across four devices at five
+different code versions**, and nothing could tell them apart. The alerts carried a
+human-typed display name from a config file — so when three days of noise arrived, nobody
+could answer the three questions that matter: *which instance sent this, what code was it
+running, and had my fix ever reached it?* Two of the noisiest were running code that was
+six days and twenty days stale. That stayed invisible because **a display name is not an
+identity**.
+
+`identity.py` fixes it with the estate's existing standard rather than a private scheme:
+
+- `rappid.json` — minted ONCE per rapp/1 §6.2 (uuid-entropy tail, never a name-hash), so
+  two instances both called "Storykeeper One" on different machines cannot collide.
+- `stamp()` — identity + running commit + host, attached to every alert and every ledger
+  frame, so any message traces back to the exact instance and commit that produced it.
+
+Why the open standard instead of something homegrown: every other chain in this estate
+already verifies under one envelope, so a sentinel frame pools, travels, and gate-checks
+alongside world data, brains, and films with no special case. A private identity scheme
+would need its own tooling forever. Compliance is what makes an instance legible to a
+system it has never met — which is the entire point of running many of them.

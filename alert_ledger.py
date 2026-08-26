@@ -73,9 +73,19 @@ def record(kind: str, instance: str, fingerprint: str, text: str,
         stream = _stream(instance)
         frames = load(instance)
         head = frames[-1] if frames else None
+        try:
+            import identity
+            who = identity.stamp(instance)
+        except Exception:
+            who = {}
         payload = {
             "decision": kind,                    # paged | suppressed | blind | resolved
             "instance": instance,
+            # WHO said it, from WHERE, running WHAT code — the three facts the estate
+            # could not answer during the 2026-08-25 alert-noise incident.
+            "rappid": who.get("rappid"),
+            "host": who.get("host"),
+            "code_version": who.get("code_version"),
             "fingerprint": fingerprint,          # the failing-check SET, not the prose
             "checks": sorted(checks or []),
             "reason": reason,
