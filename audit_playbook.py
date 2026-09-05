@@ -51,6 +51,23 @@ LANG_HINTS = {
     ".sh":  ("Shell", None, None),
 }
 
+# manifest filename -> language it signals. In a large polyglot repo, a real
+# source language's files can be outnumbered by config/data/asset files, so
+# relying only on "top 5 extensions by count" (below) missed Rust/Go entirely
+# on a 608-file repo whose Cargo.toml/go.mod were found just fine by
+# _scan()'s manifest detection — this closes that gap by trusting manifest
+# files as a language signal in their own right, not just extension counts.
+MANIFEST_LANG_HINTS = {
+    "Cargo.toml": "Rust",
+    "go.mod": "Go",
+    "package.json": "JavaScript/TypeScript",
+    "pyproject.toml": "Python",
+    "requirements.txt": "Python",
+    "setup.py": "Python",
+    "Gemfile": "Ruby",
+    "pom.xml": "Java",
+}
+
 BUG_CATEGORIES = [
     "dead code — fields/functions defined but never read or called anywhere",
     "wrong or nonexistent API usage — code reading/writing a field or "
@@ -127,10 +144,17 @@ def _git_remote(root: Path):
 def generate(root: Path) -> str:
     ext_counts, top_dirs, manifest_files = _scan(root)
     total_files = sum(ext_counts.values())
-    primary_exts = [e for e, _ in ext_counts.most_common(5)]
-    languages = sorted({
-        LANG_HINTS[e][0] for e in primary_exts if e in LANG_HINTS
-    })
+    # Extension-based detection alone missed real languages in a large,
+    # messy polyglot repo (608 files; Rust/Go were <5 files each, so they
+    # never made the "top 5 extensions by raw count" cut) even though their
+    # manifest files were sitting right there. Union both signals.
+    primary_exts = [e for e in ext_counts if e in LANG_HINTS]
+    languages = {LANG_HINTS[e][0] for e in primary_exts}
+    for m in manifest_files:
+        base = Path(m).name
+        if base in MANIFEST_LANG_HINTS:
+            languages.add(MANIFEST_LANG_HINTS[base])
+    languages = sorted(languages)
     test_cmd = _detect_test_command(root, manifest_files)
     remote = _git_remote(root)
 
