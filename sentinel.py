@@ -1248,7 +1248,14 @@ def main():
     # re-probe: did the repair actually land?
     if mode == "repair":
         after = run_health()
-        fixed = set(critical) - set(after["failed"])
+        # Absence from after["failed"] alone isn't proof of a fix -- if the
+        # second run is incomplete/malformed and silently omits the original
+        # check entirely, it also won't be in "failed", and every original
+        # critical id would be reported "fixed" with no evidence any of them
+        # actually ran again and passed. Require the check to be present in
+        # this run's results with an explicit ok=True.
+        after_ok = {c.get("id"): c.get("ok") for c in after.get("checks", [])}
+        fixed = {cid for cid in critical if after_ok.get(cid) is True}
         # The re-probe is the only real evidence a fix landed, and it used to be
         # written to a log line and thrown away, leaving the report to INFER
         # repairs from critical->healthy transitions. For an intermittent check

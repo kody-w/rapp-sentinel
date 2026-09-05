@@ -71,8 +71,20 @@ def build(since):
     """Everything that happened after `since`, as a short shift update."""
     name = str(cfg().get("instance_name") or "Neighborhood Watch").strip()
     events = []
+    unreadable = []
     for slug in NB.NEIGHBORS:
-        for f in NB.read_chain(slug):
+        # One neighbor's malformed/truncated chain must not take down the
+        # whole report — that would silently stop nightwatch from ever
+        # texting again, which is exactly the "frozen but looks fine"
+        # failure this tool exists to catch. Skip and keep going.
+        try:
+            chain = NB.read_chain(slug)
+        except Exception as e:
+            unreadable.append(slug)
+            print(f"nightwatch: {slug} chain unreadable: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            continue
+        for f in chain:
             t = parse(f["utc"])
             if t and t > since:
                 events.append({"slug": slug, "kind": f["kind"], "t": t,
@@ -91,7 +103,11 @@ def build(since):
             transitions.append((e["t"], st, e["p"].get("failed") or []))
             prev = st
 
-    roll = NB.roll_call()
+    try:
+        roll = NB.roll_call()
+    except Exception as e:
+        print(f"nightwatch: roll_call failed: {type(e).__name__}: {e}", file=sys.stderr)
+        roll = {}
     anchors = {}
     try:
         anchors = NB.check_anchors()
@@ -136,15 +152,16 @@ def build(since):
     broken = [k for k, v in roll.items() if not v["chain_ok"]]
     cut = [k for k, v in anchors.items() if v.get("truncated")]
     stale = [k for k, v in roll.items() if not v["alive"] and v["frames"]]
-    if broken or cut:
+    if broken or cut or unreadable:
         lines.append("")
         lines.append(f"⚠️ INTEGRITY: chains broken {broken or 'none'}, "
-                     f"truncated {cut or 'none'}. This is the one that matters.")
+                     f"truncated {cut or 'none'}, "
+                     f"unreadable {unreadable or 'none'}. This is the one that matters.")
     elif stale:
         lines.append("")
         lines.append(f"Stale watcher: {', '.join(stale)} — not reporting.")
 
-    return "\n".join(lines), bool(broken or cut or not events)
+    return "\n".join(lines), bool(broken or cut or unreadable or not events)
 
 
 def main():

@@ -921,8 +921,25 @@ def main():
     # every line in the verdict traceable, and gives the duplicate-id guard
     # below something real to compare.
     # Hub sentinels (HOME/hub/): additive, never raising, tagged hub:<name>.
-    results.extend(HUB.run_all())
-    watcher_results, disabled_by_config = probe_watchers()
+    try:
+        results.extend(HUB.run_all())
+    except Exception as e:
+        results.append(C.fail("hub_run_all", f"HUB.run_all() raised {type(e).__name__}: {e}",
+                               critical=False))
+    # probe_watchers() runs several unguarded sub-probes internally
+    # (_spinning_openrappter_jobs, _deployed_code_is_current, etc). Unlike the
+    # per-check loop above, an exception here previously propagated all the way
+    # out of build_verdict(), aborting check_outsider_coverage/
+    # check_freshness_pairing/check_completeness and the verdict itself --
+    # exactly the "watcher dies quietly" failure this function's own docstring
+    # warns about, just one level up the call stack from where it was guarded.
+    try:
+        watcher_results, disabled_by_config = probe_watchers()
+    except Exception as e:
+        watcher_results, disabled_by_config = [], []
+        results.append(C.fail("probe_watchers",
+                               f"probe_watchers() raised {type(e).__name__}: {e}",
+                               critical=True))
     for r in watcher_results:
         r.setdefault("produced_by", "probe_watchers")
         results.append(r)
