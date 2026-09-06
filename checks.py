@@ -671,8 +671,16 @@ def ecosystem_not_silently_broken():
     _write_coverage_receipt(declared, repos, unreachable)
     note = f"{len(repos)} additional repositories swept, none on a red streak"
     if unreachable:
+        # An unreachable repo is exactly the "blind, not clear" case the
+        # no_history and all-unreachable branches above already fail on --
+        # this was the one path where partial unreachability still fell
+        # through to ok()=True, contradicting its own detail string
+        # admitting N repos couldn't be read. A GitHub API call raising for
+        # one declared repo cannot support a "swept clean" verdict for the
+        # whole set.
         note += f" ({len(unreachable)} unreachable: " + \
                 ", ".join(r.split("/")[-1] for r in unreachable) + ")"
+        return fail("eco_sweep", note, critical=False)
     return ok("eco_sweep", note)
 
 
@@ -1546,8 +1554,16 @@ def rails_report(registry_doc, fetch):
         rid = str(rail.get("id") or "?")
         if not rail.get("rejection_ledger"):
             unmeasured += 1
-        stamp = rail.get("last_reviewed") or rail.get("written")
-        age = months_since(stamp)
+        # The docstring promises age since max(written, last_reviewed) --
+        # last_reviewed=null means "never reviewed", judged from written,
+        # but `last_reviewed or written` picked last_reviewed whenever it
+        # was merely present, even when it predates written (e.g. a rail
+        # reviewed once long ago, then rewritten more recently: the newer
+        # `written` stamp should win and give it credit for that update).
+        # Take whichever parses to the SMALLER age (= the more recent date).
+        ages = [a for a in (months_since(rail.get("last_reviewed")),
+                            months_since(rail.get("written"))) if a is not None]
+        age = min(ages) if ages else None
         if age is None:
             findings.append(f"{rid} carries no parseable written/"
                             f"last_reviewed date - age unknown")

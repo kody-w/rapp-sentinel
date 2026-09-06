@@ -318,7 +318,14 @@ def roll_call(stale_minutes=90):
                 "chain_ok": ok,
                 "chain_detail": detail,
                 "age_minutes": None if age_m is None else round(age_m, 1),
-                "alive": age_m is not None and age_m < stale_minutes,
+                # This function's own docstring promises "alive AND its
+                # record is intact" -- but `alive` here used to depend only
+                # on heartbeat age, so a neighbor with a fresh timestamp but
+                # a corrupted/tampered chain (chain_ok=False) still read as
+                # alive everywhere that consumes it (nightwatch.py's stale
+                # detection, sentinel.py's dead detection, standup.py's
+                # dashboard pill) with nothing cross-checking chain_ok too.
+                "alive": ok and age_m is not None and age_m < stale_minutes,
                 "role": NEIGHBORS[slug],
             }
         except Exception as e:
