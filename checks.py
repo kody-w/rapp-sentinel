@@ -1142,15 +1142,28 @@ def rb_derived_state_tells_the_truth():
                     f"cannot read {', '.join(unreadable)}: {errors[:160]}",
                     critical=False)
 
-    reported_posts = int(stats.get("total_posts") or 0)
-    analyzed_posts = real_posts_analyzed(trending.get("_meta") or {})
-    summary = analytics.get("summary") or {}
-    total_comments = int(summary.get("total_comments") or 0)
-    reply_rate = float(summary.get("reply_rate_pct") or 0)
-    thread_depth = float(summary.get("avg_thread_depth") or 0)
-    recent_posts = posted.get("posts") or []
-    commented_posts = sum(
-        1 for post in recent_posts if int(post.get("commentCount") or 0) > 0)
+    # Each of these four documents is only guaranteed to be *parseable*
+    # JSON, not shaped the way this function assumes (a dict with these
+    # particular numeric fields) -- a malformed value anywhere in this
+    # chain (e.g. "total_posts": "unknown", or a document that serialized
+    # as a JSON list instead of an object) previously raised TypeError/
+    # ValueError/AttributeError straight out of this check instead of the
+    # fail() verdict its own purpose (catching mutually-impossible or
+    # malformed derived state) is supposed to produce for exactly this case.
+    try:
+        reported_posts = int(stats.get("total_posts") or 0)
+        analyzed_posts = real_posts_analyzed(trending.get("_meta") or {})
+        summary = analytics.get("summary") or {}
+        total_comments = int(summary.get("total_comments") or 0)
+        reply_rate = float(summary.get("reply_rate_pct") or 0)
+        thread_depth = float(summary.get("avg_thread_depth") or 0)
+        recent_posts = posted.get("posts") or []
+        commented_posts = sum(
+            1 for post in recent_posts if int(post.get("commentCount") or 0) > 0)
+    except (TypeError, ValueError, AttributeError) as exc:
+        return fail("rb_derived_truth",
+                    f"malformed derived-state document: {type(exc).__name__}: {exc}",
+                    critical=True)
 
     findings = []
     if analyzed_posts and reported_posts < analyzed_posts * 0.9:
@@ -1281,7 +1294,19 @@ def rb_rollup_covers_corpus():
         return fail("rb_rollup_coverage",
                     f"cannot read roll-up state after 3 attempts: {err[:60]}",
                     critical=False)
-    analyzed = real_posts_analyzed(doc.get("_meta") or {})
+    # A served-but-malformed document (wrong top-level type, or a non-numeric
+    # counter) is the same "we could not make this read" case as doc is None
+    # two lines up -- this check's whole documented purpose is refusing to
+    # let an unreadable answer masquerade as a real coverage shortfall
+    # (pct would silently become 0% and page the repair arm for nothing it
+    # can fix), so it gets the identical non-critical "unknown" treatment.
+    try:
+        analyzed = real_posts_analyzed(doc.get("_meta") or {})
+    except (TypeError, ValueError, AttributeError) as exc:
+        return fail("rb_rollup_coverage",
+                    f"roll-up state is malformed, not a coverage shortfall: "
+                    f"{type(exc).__name__}: {exc}",
+                    critical=False)
     q = ('{repository(owner:"%s",name:"%s")'
          '{discussions{totalCount}}}' % tuple(RB.split("/")))
     data = gh(["api", "graphql", "-f", f"query={q}"], default=UNREADABLE)
@@ -2047,7 +2072,13 @@ def evolve_worker_is_alive():
                     f"heartbeat unreadable: {type(e).__name__}: {e}",
                     critical=False)
 
-    interval_m = float(block.get("interval_minutes", 30))
+    try:
+        interval_m = float(block.get("interval_minutes", 30))
+    except (TypeError, ValueError):
+        return fail("w_evolve_worker",
+                    f"config interval_minutes is not a number: "
+                    f"{block.get('interval_minutes')!r}",
+                    critical=False)
     stale_after = interval_m * 3
     try:
         age_m = (datetime.now(timezone.utc)
@@ -2067,7 +2098,10 @@ def evolve_worker_is_alive():
                     f"{str(status.get('reason'))[:120]}",
                     critical=False)
     if outcome == "deployment-pending":
-        attempts = int(status.get("deployment_attempts") or 1)
+        try:
+            attempts = int(status.get("deployment_attempts") or 1)
+        except (TypeError, ValueError):
+            attempts = 1
         pending_age = 0.0
         try:
             pending_age = (datetime.now(timezone.utc)

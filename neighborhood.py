@@ -298,21 +298,38 @@ def roll_call(stale_minutes=90):
     out = {}
     now = datetime.now(timezone.utc)
     for slug in NEIGHBORS:
-        chain = read_chain(slug)
-        ok, detail = verify(slug)
-        age_m = None
-        if chain:
-            last = datetime.strptime(chain[-1]["utc"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
-                tzinfo=timezone.utc)
-            age_m = (now - last).total_seconds() / 60
-        out[slug] = {
-            "frames": len(chain),
-            "chain_ok": ok,
-            "chain_detail": detail,
-            "age_minutes": None if age_m is None else round(age_m, 1),
-            "alive": age_m is not None and age_m < stale_minutes,
-            "role": NEIGHBORS[slug],
-        }
+        # A single neighbor's corrupt/truncated chain (a bad JSONL line, or a
+        # frame missing/malforming its "utc" field) previously raised straight
+        # out of this loop, aborting the roll call for every OTHER neighbor
+        # too -- and unlike nightwatch.py (which wraps its own read_chain/
+        # roll_call calls), sentinel.py calls roll_call() directly in two
+        # places with no such protection, so this was reachable from the
+        # repair arm's own tick cycle, not just the nightly report.
+        try:
+            chain = read_chain(slug)
+            ok, detail = verify(slug)
+            age_m = None
+            if chain:
+                last = datetime.strptime(chain[-1]["utc"], "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+                    tzinfo=timezone.utc)
+                age_m = (now - last).total_seconds() / 60
+            out[slug] = {
+                "frames": len(chain),
+                "chain_ok": ok,
+                "chain_detail": detail,
+                "age_minutes": None if age_m is None else round(age_m, 1),
+                "alive": age_m is not None and age_m < stale_minutes,
+                "role": NEIGHBORS[slug],
+            }
+        except Exception as e:
+            out[slug] = {
+                "frames": 0,
+                "chain_ok": False,
+                "chain_detail": f"{type(e).__name__}: {e}",
+                "age_minutes": None,
+                "alive": False,
+                "role": NEIGHBORS[slug],
+            }
     return out
 
 
