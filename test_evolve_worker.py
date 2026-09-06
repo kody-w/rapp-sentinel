@@ -4265,6 +4265,8 @@ class ArtDeliveryTests(WorkerEnv):
         super().setUp()
         import outbox
         import standup
+        import cooldown
+        import alert_ledger
         self.outbox = outbox
         self.enqueued = []
         self.enqueue_attempts = []
@@ -4294,6 +4296,22 @@ class ArtDeliveryTests(WorkerEnv):
                 (standup, "portable_snapshot", mock.Mock(return_value="snap.html")),
                 (standup, "publish_snapshot",
                  mock.Mock(return_value=["http://192.0.2.9:9797/share/x.html"])),
+                # sentinel.notify's real path imports cooldown/alert_ledger
+                # directly and reads/writes their module-level STATE/LEDGER
+                # paths, which are derived from paths.HOME (the repo's own
+                # checkout dir when SENTINEL_HOME is unset) -- NOT from
+                # ScratchCase's EW.HOME patch above. Left unpatched, every
+                # test in this class writes real fingerprint/cooldown rows
+                # into this checkout's actual state/cooldown.jsonl and
+                # state/alerts.jsonl, which (a) leaks test data into real
+                # instance state and (b) makes a later test's identical
+                # "checks:<name>" fingerprint get silently suppressed by an
+                # earlier test's leftover cooldown row, failing with "the
+                # abort is reported" seeing 0 enqueued instead of 1. Route
+                # both at this class's own scratch dir instead.
+                (cooldown, "STATE", self.state / "test-cooldown.jsonl"),
+                (cooldown, "SUPPRESSED", self.state / "test-cooldown-suppressed.jsonl"),
+                (alert_ledger, "LEDGER", self.state / "test-alerts.jsonl"),
         ):
             p = mock.patch.object(target, name, value)
             p.start()
