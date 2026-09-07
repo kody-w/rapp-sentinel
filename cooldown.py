@@ -83,13 +83,22 @@ def _load():
     if not STATE.exists():
         return {}
     out = {}
-    try:
-        for line in STATE.read_text(errors="ignore").splitlines():
-            if line.strip():
-                d = json.loads(line)
-                out[d["key"]] = d["at"]
-    except Exception:
-        return out
+    # Deliberately does NOT catch a mid-parse failure. should_send()'s caller
+    # (sentinel.py's notify() gate) wraps this in a try/except whose own comment
+    # states the rule plainly: "A failure inside the gate must never swallow a
+    # real alert: on any exception we fall through and page." Catching here and
+    # returning whatever was parsed before the failure did the opposite of that
+    # for THIS state file specifically: a malformed line (or any line after it)
+    # silently vanished from `out`, so should_send() read a previously-recorded
+    # key as "never sent" and re-sent it -- the exact fail-OPEN incident this
+    # file's own docstring documents ("the SAME message 60 times... measured
+    # 2026-08-25"). Let it propagate so the existing outer handler pages once
+    # (a duplicate is recoverable) instead of silently resetting cooldown state
+    # and risking the flapping-alarm storm all over again.
+    for line in STATE.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            d = json.loads(line)
+            out[d["key"]] = d["at"]
     return out
 
 

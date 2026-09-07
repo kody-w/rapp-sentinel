@@ -55,7 +55,12 @@ def load(instance: str = "sentinel") -> list[dict]:
     """Read the chain, verifying every frame. A broken chain raises — never pretend."""
     if not LEDGER.exists():
         return []
-    frames = [json.loads(l) for l in LEDGER.read_text(errors="ignore").splitlines() if l.strip()]
+    # errors="ignore" silently drops invalid bytes instead of raising -- directly
+    # contradicting this function's own docstring ("a broken chain raises — never
+    # pretend"). A truncated/corrupted write (e.g. a crash mid-append) could leave
+    # invalid UTF-8 that this then quietly repaired into different bytes before
+    # JSON parsing ever saw it, rather than surfacing the corruption.
+    frames = [json.loads(l) for l in LEDGER.read_text(encoding="utf-8").splitlines() if l.strip()]
     head = None
     for f in frames:
         ok, step, why = R.verify_frame(f, head=head, stream_id_of_record=f.get("stream_id"))
@@ -107,12 +112,23 @@ def record(kind: str, instance: str, fingerprint: str, text: str,
 
 def history(fingerprint: str, instance: str = "sentinel") -> dict:
     """What this exact condition has done before — the question the wild run could not
-    answer. Used to decide whether a repeat deserves a human at all."""
-    try:
-        frames = load(instance)
-    except Exception:
-        return {"seen": 0, "paged": 0, "suppressed": 0, "blind": 0, "first_at": None, "last_at": None}
-    mine = [f["payload"] for f in frames if f["payload"].get("fingerprint") == fingerprint]
+    answer. Used to decide whether a repeat deserves a human at all.
+
+    Deliberately does NOT catch a load() failure. sentinel.py's notify() gate wraps
+    this call in a try/except whose own comment states the rule plainly: "A failure
+    inside the gate must never swallow a real alert: on any exception we fall through
+    and page, because a missed alarm is worse than a repeat." This function used to
+    catch the failure itself and return a fake "seen 0x, paged 0x" result -- which
+    looked exactly like the condition had never fired before, silently defeating that
+    already-correct outer fail-safe and embedding a misleading claim into the very
+    audit record this module exists to keep honest. Let it propagate."""
+    frames = load(instance)
+    # `record()` writes each frame's own `instance`, so scope by both fields -- not
+    # fingerprint alone, which would credit this instance with another instance's
+    # prior alert if they ever shared one physical ledger file.
+    mine = [f["payload"] for f in frames
+            if f["payload"].get("instance") == instance
+            and f["payload"].get("fingerprint") == fingerprint]
     return {
         "seen": len(mine),
         "paged": sum(1 for p in mine if p["decision"] == "paged"),
