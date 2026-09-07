@@ -41,6 +41,7 @@ create it empty, that is undone on exit.
 """
 import importlib.util
 import json
+import re
 import shutil
 import sys
 import tempfile
@@ -154,12 +155,28 @@ if MARKER in mutated:
 # The mutant models PRE-fix code, and pre-fix code derived HOME from
 # __file__ rather than importing the shared paths.py — which is also what
 # keeps every mutant path under TMP instead of on the real instance.
-HOME_MARKER = "from paths import HOME"
-if HOME_MARKER not in mutated:
-    harness_error(f"mutation anchor {HOME_MARKER!r} not found — cannot pin "
-                  "the mutant's HOME inside the sandbox")
-mutated = mutated.replace(
-    HOME_MARKER, "HOME = Path(__file__).resolve().parent", 1)
+#
+# A plain substring replace of "from paths import HOME" assumed that was
+# the WHOLE import line. neighborhood.py's real line is
+# "from paths import HOME, app_support" -- the substring replace fired
+# anyway (it's a prefix match) and left ", app_support" dangling after the
+# replacement text, producing a syntactically-valid but broken tuple
+# assignment (`HOME = Path(...).resolve().parent, app_support`) that raised
+# NameError at import time, well before any of S1-S5 could run. This
+# silently broke the ENTIRE proof, every run, since whenever that import
+# line last gained a second name. Match the real import line with a regex
+# instead so any other names imported alongside HOME survive as a real
+# import from the genuine paths.py, and the mutant only overrides HOME
+# itself.
+HOME_IMPORT_RE = re.compile(r'^from paths import HOME(,\s*(.+))?$', re.MULTILINE)
+home_match = HOME_IMPORT_RE.search(mutated)
+if not home_match:
+    harness_error("mutation anchor 'from paths import HOME(...)' not found — "
+                  "cannot pin the mutant's HOME inside the sandbox")
+replacement = "HOME = Path(__file__).resolve().parent"
+if home_match.group(2):
+    replacement += "\nfrom paths import " + home_match.group(2)
+mutated = mutated[:home_match.start()] + replacement + mutated[home_match.end():]
 mut_path = MUT_HOME / "neighborhood_prefix_mutant.py"
 mut_path.write_text(mutated, encoding="utf-8")
 
