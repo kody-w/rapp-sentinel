@@ -141,10 +141,23 @@ def verify():
             if len(matches) == 1:
                 row_id, delta = matches[0]
                 used_row_ids.add(row_id)
-                verified[raw_line] = {
+                # A list per raw_line, not a single dict: two IDENTICAL
+                # unverified records (same to/text/attachments/attempted_at,
+                # e.g. from a crash-recovery re-append) each get their OWN
+                # row_id here (used_row_ids prevents reusing one), but a
+                # dict keyed by the raw line content would let the second
+                # occurrence's write silently overwrite -- or, since both
+                # writes are content-identical, appear to duplicate -- the
+                # first's entry. The real bug this caused: the commit pass
+                # below did `verified.get(raw_line)` for EVERY occurrence of
+                # that content in `current`, so one real matching Messages
+                # row got attached as "delivery evidence" to every duplicate
+                # occurrence, not just the one it was actually matched
+                # against -- committing N verifications from 1 real match.
+                verified.setdefault(raw_line, []).append({
                     "message_rowid": row_id,
                     "delta_seconds": round(delta, 3),
-                }
+                })
     finally:
         connection.close()
 
@@ -159,10 +172,15 @@ def verify():
         kept = []
         committed = 0
         for raw_line in current:
-            evidence = verified.get(raw_line)
-            if evidence is None:
+            evidences = verified.get(raw_line)
+            # Consume one occurrence's worth of evidence per matching line --
+            # once a content's evidence list is exhausted, any FURTHER
+            # occurrence of that same raw_line is correctly kept unverified
+            # instead of reusing another occurrence's row match.
+            if not evidences:
                 kept.append(raw_line)
                 continue
+            evidence = evidences.pop(0)
             message = json.loads(raw_line)
             outbox._append_sent({
                 **message,
