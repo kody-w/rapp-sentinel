@@ -159,6 +159,16 @@ def scan_repo(owner, repo, patterns, allow, workdir, slow=SLOW_CLONE_SECONDS):
             g = subprocess.run(
                 ["grep", "-rlF", "--exclude-dir=.git", "-i", pat, str(dest)],
                 capture_output=True, text=True, timeout=180)
+            # grep exits 0 (matches found) or 1 (no matches) on a completed
+            # search; any other code is a real execution failure (I/O error,
+            # OOM, etc.) that still returns without raising. Left unchecked,
+            # that failure's empty/partial stdout was silently treated as
+            # "searched this repo, found nothing" -- exactly the "REFUSED but
+            # reported as fine" blindness this codebase's fail-closed
+            # convention exists to catch everywhere else.
+            if g.returncode not in (0, 1):
+                return [], (f"grep exited {g.returncode} on pattern search: "
+                           f"{(g.stderr or '').strip()[:120]}")
             for line in (g.stdout or "").splitlines():
                 rel = str(Path(line).relative_to(dest))
                 if _allowed(allow, repo, rel, pat):

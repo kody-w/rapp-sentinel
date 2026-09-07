@@ -1500,8 +1500,18 @@ def acquire_lock(path=None):
             "at": sentinel.now().isoformat(timespec="seconds"),
         }).encode("utf-8") + b"\n")
         os.fsync(fd)
-    except OSError:
-        pass
+    except OSError as e:
+        # The flock itself is already held at this point (kernel-level,
+        # unaffected by this write) -- this is only the informational pid/
+        # timestamp breadcrumb, so a write failure here (e.g. a full disk)
+        # shouldn't force releasing a validly-held lock. But silently
+        # swallowing it entirely hid a real operational problem (a
+        # subsequent crash would show a truncated/stale/empty lock record
+        # with nothing pointing at why) -- log it visibly instead, matching
+        # this file's own established `log()` convention for non-fatal
+        # warnings elsewhere.
+        log(f"acquire_lock: could not write lock metadata "
+            f"({type(e).__name__}: {e}) -- lock is still held")
     return fd
 
 
