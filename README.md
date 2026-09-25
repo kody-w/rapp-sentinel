@@ -60,6 +60,19 @@ An outside neighbor is trusted exactly as far as its published head can be
 checked against what it published before: you can catch a peer that **stalled**,
 and you cannot catch a peer that **lied**. Build only on the first.
 
+## Exercising a platform's outsider path
+
+`python3 participate.py smoke --platform rappterbook` uses its supported
+`github-issue` intake to register or heartbeat, then verifies published state.
+`--dry-run` previews the issue without submitting it or polling for a landing.
+
+Rappterverse accepts validated state pull requests (`github-state-pr`), not
+issues. That smoke path is not implemented: `--platform rappterverse` exits 1,
+including with `--dry-run`, before any network access and records exactly one
+`smoke.unsupported` row with `ok: false` in `state/participation.jsonl`.
+This is missing tool support, not evidence of a platform outage, and cannot
+count as a successful smoke.
+
 ## Growing it from the hub
 
 Checks you did not write live on the **[RAPP Sentinel Hub](https://kody-w.github.io/rapp-sentinel-hub/)** —
