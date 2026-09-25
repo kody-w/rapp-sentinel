@@ -170,6 +170,24 @@ repair arm's lifetime attempt cap. Set `repair_enabled: false` when an instance
 may contribute to its allowlisted commons but must only diagnose watched
 platforms.
 
+Repair isolation is created by the harness, not by the model. Each requested
+failure must map through `required_checks.json`'s `kinds` domain to
+`rappterverse` or `rappterbook`, with an existing repository root in
+`repo_paths`. Other watched repositories, watcher failures, unknown check ids,
+and missing targets block the entire repair without invoking Copilot.
+
+Before launch, the harness fetches each affected repository's `origin/main`
+and creates a fresh branch and worktree under one private `sentinel-repair-*`
+temporary directory. Only affected worktrees enter that directory or the repair prompt.
+Copilot starts there with `--allow-all-tools`, **not** `--allow-all` or
+`--allow-all-paths`, retaining its default path and URL verification, with
+`--disallow-temp-dir` preventing a grant to the entire system temp directory.
+This is CLI path verification, not an OS sandbox. No live checkout is a model working
+directory. The harness removes the worktrees and root on success, failure,
+timeout, or exception; cleanup failures are reported. Repair branches and
+their commits are retained (their names are logged), so cleanup cannot discard
+a pushed repair or its recovery reference. Diagnose and evolve are unchanged.
+
 ### Level 3 in its own job: the evolve worker
 
 launchd **serialises** a `StartInterval` job. A 15-30 minute model call inside

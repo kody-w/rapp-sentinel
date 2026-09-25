@@ -50,12 +50,12 @@ scenario("attempt 2 with no recorded result: block absent rather than vacuous",
 
 # The block actually reaches the prompt: build via escalate()'s own assembly
 # by inspecting the source contract — the f-string embeds
-# method_change_block(attempt, last_result). Assert the call site exists so a
+# method_change_block(attempt, last_result, ...). Assert the call site exists so a
 # refactor cannot silently orphan the block.
 import inspect
 src = inspect.getsource(S.escalate)
 scenario("escalate() embeds method_change_block in the prompt",
-         "method_change_block(attempt, last_result)" in src,
+         "method_change_block(attempt, last_result," in src,
          "call site present" if "method_change_block" in src else "MISSING")
 
 src_main = inspect.getsource(S.main)

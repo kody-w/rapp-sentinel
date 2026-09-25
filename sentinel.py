@@ -21,14 +21,17 @@ GUARDRAILS (all enforced before a model is ever invoked):
   * attempt cap      an issue that resists N repairs is escalated to a human
   * worktree only    repairs never run in a working tree you might be using
 
-State lives in state/. Nothing here writes to the platform repos directly —
-Copilot does that, under the constraints in the prompt it is handed.
+State lives in state/. The harness prepares fresh repair worktrees before
+Copilot starts, retaining the CLI's path verification at their common root.
 """
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -495,9 +498,10 @@ platforms. You were woken because a health check failed. Fix it or explain
 precisely why it cannot be fixed safely.
 
 HARD CONSTRAINTS — these are not suggestions:
-1. NEVER work in an existing checkout. Create a fresh `git worktree` off
-   origin/main, work there, and remove it when done. The user keeps thousands
-   of uncommitted files in their working trees; touching them is destructive.
+1. Work ONLY in the harness-provided worktrees listed below. The harness has
+   fetched origin/main and created a fresh repair branch in each worktree.
+   Do not create or remove worktrees or access existing live checkouts.
+   The harness removes these worktrees after you exit, retaining the branches.
 2. Verify before you claim. Reproduce the failure, apply the fix, and prove it
    with a real run (CI, a test, or a scratch repro). Do not report success off
    a plausible-looking diff.
@@ -509,10 +513,9 @@ HARD CONSTRAINTS — these are not suggestions:
    product direction, STOP and report instead of guessing.
 6. Never commit secrets. Never rewrite history. Never force-push main.
 7. When two inferences about the same cause have failed, stop inferring and
-   measure. Build or run the smallest thing that reports ground truth
-   (`python3 diagnose.py` prints the identity, scope and reachability of
-   every credential and endpoint, values never printed). An unverified
-   diagnosis is a guess wearing a lab coat.
+   measure with the smallest read-only probe inside the supplied worktrees.
+   If diagnosis or repair needs access outside these paths, report BLOCKED.
+   An unverified diagnosis is a guess wearing a lab coat.
 """
 
 DIAGNOSE_RULES = """
@@ -526,7 +529,7 @@ of every credential and endpoint this loop depends on, values never printed.
 """
 
 
-def method_change_block(attempt, last_result):
+def method_change_block(attempt, last_result, *, isolated=False):
     """The paragraph that breaks a repair out of a wrong-diagnosis loop (#4).
 
     Three fixes landed in modules that were never on the call path because
@@ -540,12 +543,13 @@ def method_change_block(attempt, last_result):
     """
     if attempt < 2 or not last_result:
         return ""
+    measure = ("use read-only probes inside the supplied worktrees" if isolated
+               else "run\n`python3 diagnose.py`")
     return f"""
 THIS IS ATTEMPT {attempt}. {attempt - 1} PRIOR ATTEMPT(S) DID NOT CLEAR IT.
 The previous attempt ended: {last_result[:300]}
 Repeated failure of the same repair is evidence the DIAGNOSIS is wrong — do
-NOT retry the previous method. Before proposing anything, measure: run
-`python3 diagnose.py` and reproduce the failure with the smallest direct
+NOT retry the previous method. Before proposing anything, measure: {measure} and reproduce the failure with the smallest direct
 probe you can build. If your new diagnosis matches the failed attempt's,
 that is a finding to report, not a fix to repeat.
 """
@@ -588,6 +592,85 @@ def github_degraded():
             and c.get("status") in ("major_outage", "partial_outage")]
 
 
+class RepairScopeError(RuntimeError):
+    """Repair cannot be isolated or its disposable paths could not be cleaned."""
+
+
+@contextmanager
+def repair_worktrees(cfg, failing, *, run=None):
+    """Yield only affected, fresh worktrees; retain branches when removing them."""
+    run = subprocess.run if run is None else run
+    try:
+        manifest = json.loads((CODE / "required_checks.json").read_text(encoding="utf-8"))
+        kinds = manifest.get("kinds") if isinstance(manifest, dict) else None
+        if not isinstance(kinds, dict) or not failing:
+            raise RepairScopeError("no registered repair targets")
+        names = set()
+        for check_id in failing:
+            spec = kinds.get(check_id) if isinstance(check_id, str) else None
+            name = spec.get("domain") if isinstance(spec, dict) else None
+            if name not in ("rappterverse", "rappterbook"):
+                raise RepairScopeError(f"no writable repair target for {check_id!r}")
+            names.add(name)
+        configured = cfg.get("repo_paths")
+        sources = {}
+        for name in sorted(names):
+            raw = configured.get(name) if isinstance(configured, dict) else None
+            if not isinstance(raw, str) or not raw.strip():
+                raise RepairScopeError(f"missing repo_paths entry for {name}")
+            source = Path(raw).expanduser().resolve(strict=True)
+            if not source.is_dir():
+                raise RepairScopeError(f"{name} is not a repository directory")
+            if source in sources.values():
+                raise RepairScopeError("repair targets resolve to the same repository")
+            sources[name] = source
+        root = Path(tempfile.mkdtemp(prefix="sentinel-repair-")).resolve()
+    except (OSError, ValueError) as exc:
+        raise RepairScopeError(f"cannot prepare repair scope: {exc}") from exc
+
+    def git(source, *args):
+        return run(["git", "-C", str(source), *args], check=True,
+                   capture_output=True, text=True, timeout=120)
+
+    worktrees = []
+    try:
+        paths = {}
+        try:
+            for name, source in sources.items():
+                top = git(source, "rev-parse", "--show-toplevel").stdout.strip()
+                if not top or Path(top).resolve() != source:
+                    raise RepairScopeError(f"{name} must name a repository root")
+                git(source, "fetch", "--no-tags", "origin",
+                    "+refs/heads/main:refs/remotes/origin/main")
+                base = git(source, "rev-parse", "--verify",
+                           "refs/remotes/origin/main^{commit}").stdout.strip()
+                if len(base) not in (40, 64) or any(c not in "0123456789abcdef" for c in base):
+                    raise RepairScopeError(f"{name} has no verified origin/main commit")
+                path = root / name
+                branch = f"sentinel/{root.name}-{name}"
+                # Track before add: even a partially failed checkout needs cleanup.
+                worktrees.append((source, path))
+                log(f"repair worktree: {path} (retained branch {branch})")
+                git(source, "worktree", "add", "-b", branch, str(path), base)
+                paths[name] = path
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RepairScopeError(f"cannot isolate repair worktree: {exc}") from exc
+        yield root, paths
+    finally:
+        errors = []
+        for source, path in reversed(worktrees):
+            try:
+                git(source, "worktree", "remove", "--force", str(path))
+            except (OSError, subprocess.SubprocessError) as exc:
+                errors.append(f"{path}: {exc}")
+        try:
+            shutil.rmtree(root)
+        except OSError as exc:
+            errors.append(f"{root}: {exc}")
+        if errors:
+            raise RepairScopeError("repair cleanup failed: " + "; ".join(errors))
+
+
 def escalate(cfg, verdict, failing, mode, attempt=1, last_result=None):
     """Hand the failure to Copilot. Returns (ok, output).
 
@@ -596,19 +679,32 @@ def escalate(cfg, verdict, failing, mode, attempt=1, last_result=None):
     byte-identical on attempts 1 through 3, which is how the same wrong
     diagnosis got three confident retries (#4).
     """
-    rules = REPAIR_RULES if mode == "repair" else DIAGNOSE_RULES
-    detail = "\n".join(
-        f"  - {c['id']} [{c['severity']}]: {c['detail']}"
-        for c in verdict["checks"] if not c["ok"]
-    )
-    prompt = f"""{rules}
-{method_change_block(attempt, last_result)}
+    output = ""
+    try:
+        scope = (repair_worktrees(cfg, failing) if mode == "repair"
+                 else nullcontext((HOME, cfg["repo_paths"])))
+        with scope as (cwd, repo_paths):
+            rules = REPAIR_RULES if mode == "repair" else DIAGNOSE_RULES
+            detail = "\n".join(
+                f"  - {c['id']} [{c['severity']}]: {c['detail']}"
+                for c in verdict["checks"]
+                if not c["ok"] and (mode != "repair" or c["id"] in failing)
+            )
+            if mode == "repair":
+                repo_context = (
+                    f"Repair root: {cwd}\n"
+                    "Only these harness-created worktrees are writable:\n"
+                    + "\n".join(f"  {name}: {path}" for name, path in repo_paths.items()))
+            else:
+                repo_context = f"""Repo checkouts (may be stale — always fetch origin/main before reading):
+  rappterverse: {repo_paths['rappterverse']}
+  rappterbook:  {repo_paths['rappterbook']}"""
+            prompt = f"""{rules}
+{method_change_block(attempt, last_result, isolated=mode == "repair")}
 FAILING HEALTH CHECKS ({verdict['status']}):
 {detail}
 
-Repo checkouts (may be stale — always fetch origin/main before reading):
-  rappterverse: {cfg['repo_paths']['rappterverse']}
-  rappterbook:  {cfg['repo_paths']['rappterbook']}
+{repo_context}
 
 Check id meanings:
   rv_world_merging  rappterverse stopped merging [state] apply PR commits
@@ -624,13 +720,18 @@ Check id meanings:
 Finish with a single line starting exactly `SENTINEL_RESULT:` followed by
 FIXED, PARTIAL, NO_ACTION or BLOCKED, then a one sentence reason.
 """
-    cmd = ["copilot", "-p", prompt, "--allow-all", "--model", cfg["copilot_model"]]
-    log(f"escalating ({mode}) to copilot for: {', '.join(failing)}")
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True,
-                           timeout=cfg["copilot_timeout_s"], cwd=str(HOME))
-        out = (r.stdout or "") + (r.stderr or "")
-        return r.returncode == 0, out
+            permissions = (["--allow-all-tools", "--disallow-temp-dir"] if mode == "repair"
+                           else ["--allow-all"])
+            cmd = ["copilot", "-p", prompt, *permissions, "--model", cfg["copilot_model"]]
+            log(f"escalating ({mode}) to copilot for: {', '.join(failing)}")
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=cfg["copilot_timeout_s"], cwd=str(cwd))
+            output = (r.stdout or "") + (r.stderr or "")
+            return r.returncode == 0, output
+    except RepairScopeError as exc:
+        message = f"SENTINEL_RESULT: BLOCKED {exc}"
+        log(message)
+        return False, (output + "\n" if output else "") + message
     except subprocess.TimeoutExpired:
         return False, f"copilot timed out after {cfg['copilot_timeout_s']}s"
     except FileNotFoundError:
