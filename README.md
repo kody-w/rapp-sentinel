@@ -299,7 +299,37 @@ RAPP Vision: https://kody-w.github.io/rapp-vision/#/watch/nine-sworn-assurances
   behalf, because a summary nobody wrote is a claim nobody made.
 - `notification_mode: "art-only"` suppresses nightwatch, health transitions,
   diagnostics, and private static-report links while retaining this one final
-  deployment receipt.
+  deployment receipt. It does **not** suppress the silence breaker: quiet mode
+  may hide calm, never trouble.
+
+#### The silence breaker
+
+The tick normally notifies only on status change, because a watcher that texts
+every tick gets muted. A live Dada Collective incident proved the missing case:
+`notification_mode: "art-only"` plus `notify_queue_only: true` produced 36 days
+without an operator-visible message while 3,016/3,484 verdicts were critical,
+"needs a human" was logged 2,903 times, diagnose found root causes, and two
+checks were blind. Silence was not provable because mode-muted operational
+messages never reached the alert ledger.
+
+`silence_breaker_hours` (default `24`, `0` disables) runs every tick after the
+ordinary state-change notice. It measures silence from `state/outbox-sent.jsonl`
+(`sent_at`, the same ledger used by the external watcher acknowledger); if an
+instance has never delivered anything, it starts the grace clock at the first
+copilot neighbor chain frame, falling back to persisted run/verdict timestamps.
+It pages after that many quiet hours of `critical`, or 3× that many hours of
+`degraded`. Healthy does nothing.
+
+Breakers are compact plain text and never attach a static report. They pass in
+`notification_mode: "all"` and `"art-only"`; `"off"` remains an explicit owner
+choice and records `alert.muted`. Repeats use a persisted
+`state/silence-breaker.json` cadence: one page per window, doubling while the
+failing check set is unchanged (`24h → 48h → 96h`, capped at 7 days) and
+resetting when the set changes. If a prior silence breaker is still pending in
+the outbox, no duplicate is queued. To acknowledge a known outage without
+turning the guard off, set `silence_ack_until` to an ISO date/datetime and
+optionally `silence_ack_reason`; suppression is logged and ledgered until that
+time, then reminders resume automatically.
 
 Nothing else sends it. `SENTINEL_RESULT: CONTRIBUTED` does not; a PR that was
 opened does not; an abort after the PR does not. The message is built inside

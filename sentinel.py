@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import hashlib
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -57,6 +58,7 @@ DEFAULTS = {
     # all: existing operational alerts + reports; art-only: only a fully
     # deployed art receipt; off: no outbound messages.
     "notification_mode": "all",
+    "silence_breaker_hours": 24,
     "copilot_model": "claude-sonnet-4.6",
     "copilot_timeout_s": 900,
     # Outsider smoke (#5 ask 2): a smoke test is a WRITE (it files a real
@@ -163,7 +165,18 @@ def notification_allowed(cfg, kind="operational"):
         return False
     if mode == "off":
         return False
-    return mode == "all" or kind == "art"
+    return mode == "all" or kind in ("art", "silence")
+
+
+def _record_muted_alert(cfg, text, kind, reason):
+    try:
+        import cooldown, alert_ledger
+        fp = cooldown.fingerprint(text)
+        checks = [c for c in fp[len("checks:"):].split(",") if c] if fp.startswith("checks:") else []
+        alert_ledger.record("muted", instance_name(cfg), fp, text,
+                            reason=reason, checks=checks)
+    except Exception:
+        pass
 
 
 def notify(cfg, text, to=None, rebuild=False, kind="operational",
@@ -180,7 +193,14 @@ def notify(cfg, text, to=None, rebuild=False, kind="operational",
     record the report renders — a link to yesterday's evidence attached to
     today's news is worse than no link.
     """
-    if not cfg.get("notify") or not notification_allowed(cfg, kind):
+    allowed = notification_allowed(cfg, kind)
+    if not allowed:
+        mode = str(cfg.get("notification_mode") or "all").strip().lower()
+        _record_muted_alert(
+            cfg, text, kind,
+            f"notification_mode={mode} rejected kind={kind}")
+        return False
+    if not cfg.get("notify"):
         return False
     to = to or cfg.get("notify_handle")
     if not to:
@@ -243,8 +263,13 @@ def notify(cfg, text, to=None, rebuild=False, kind="operational",
         # and silence is provable. Never let a ledger problem break a delivered alert.
         try:
             import alert_ledger
+            checks = ([c for c in _fp[len("checks:"):].split(",") if c]
+                      if _fp and _fp.startswith("checks:") else [])
+            reason = (f"silence breaker paged: kind={kind}; quiet mode cannot hide trouble"
+                      if kind == "silence"
+                      else f"kind={kind}; passed blindness + cooldown gate")
             alert_ledger.record("paged", instance_name(cfg), _fp or "text:?", text,
-                                reason=f"kind={kind}; passed blindness + cooldown gate")
+                                reason=reason, checks=checks)
         except Exception:
             pass
     except Exception as e:
@@ -348,6 +373,320 @@ def run_health(receipts=False):
             "critical": [],
             "summary": "health_runtime: health run exceeded its time budget",
         }
+
+
+SILENCE_BREAKER_STATE = STATE / "silence-breaker.json"
+SILENCE_BREAKER_MAX_WINDOW_HOURS = 24 * 7
+
+
+def _parse_time(value):
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), timezone.utc)
+        except Exception:
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _jsonl_records(path):
+    try:
+        return [json.loads(line) for line in Path(path).read_text(
+            encoding="utf-8").splitlines() if line.strip()]
+    except FileNotFoundError:
+        return []
+    except Exception as exc:
+        log(f"silence breaker could not read {Path(path).name}: {type(exc).__name__}: {exc}")
+        return []
+
+
+def _last_delivered_at():
+    """Last operator delivery from outbox.SENT.
+
+    `outbox._append_sent()` writes one terminal JSONL record with the original
+    queue fields (`entry_id`, `at`, `to`, `text`, `attachments`, optional
+    `dedupe_key`) plus `sent_at`. `watcher_outbox.acknowledge()` uses that same
+    helper, so Aqua-session deliveries count without a second ledger. We do not
+    read chat.db here; the sent ledger is the durable delivery source of truth.
+    """
+    try:
+        import outbox
+        records = _jsonl_records(outbox.SENT)
+    except Exception as exc:
+        log(f"silence breaker could not open sent ledger: {type(exc).__name__}: {exc}")
+        return None
+    times = [_parse_time(r.get("sent_at")) for r in records]
+    times = [t for t in times if t is not None]
+    return max(times) if times else None
+
+
+def _first_reliable_instance_at():
+    """Earliest reliable instance timestamp when no delivery has ever happened.
+
+    Preferred source: the copilot neighbor's first hash-chained frame (`utc`).
+    That chain is append-only and verified by the normal tick, so it is more
+    trustworthy than filesystem mtimes. Fallbacks are persisted state fields
+    (`last_run.at`, `last_verdict.generated`) and finally "now", which gives a
+    fresh instance its full grace window instead of paging on first boot.
+    """
+    candidates = []
+    for record in _jsonl_records(HOME / "neighborhood" / "copilot" / "chain.jsonl"):
+        t = _parse_time(record.get("utc"))
+        if t:
+            candidates.append(t)
+            break
+    for path, keys in ((STATE / "last_run.json", ("at",)),
+                       (STATE / "last_verdict.json", ("generated", "at"))):
+        data = load_json(path, {})
+        for key in keys:
+            t = _parse_time(data.get(key))
+            if t:
+                candidates.append(t)
+    return min(candidates) if candidates else now()
+
+
+def _silence_reference_at():
+    delivered = _last_delivered_at()
+    return delivered if delivered else _first_reliable_instance_at()
+
+
+def _failing_checks(verdict):
+    checks = verdict.get("checks") or []
+    failed = []
+    for check in checks:
+        if check.get("ok") is not True:
+            cid = str(check.get("id") or "").strip()
+            if cid:
+                failed.append(check)
+    if failed:
+        return failed
+    ids = verdict.get("failed") or verdict.get("critical") or []
+    return [{"id": str(cid), "detail": ""} for cid in ids]
+
+
+def _silence_fingerprint(verdict):
+    return ",".join(sorted({str(c.get("id")) for c in _failing_checks(verdict)
+                            if c.get("id")}))
+
+
+def _pending_silence_breaker():
+    try:
+        import outbox
+        records = _jsonl_records(outbox.QUEUE)
+    except Exception:
+        return False
+    for record in records:
+        if str(record.get("dedupe_key") or "").startswith("silence-breaker:"):
+            return True
+    return False
+
+
+def _status_since(verdict):
+    status = verdict.get("status")
+    if not status:
+        return None
+    chain = _jsonl_records(HOME / "neighborhood" / "copilot" / "chain.jsonl")
+    since = None
+    for frame in reversed(chain):
+        payload = frame.get("payload") or {}
+        if payload.get("status") != status:
+            break
+        t = _parse_time(frame.get("utc"))
+        if t:
+            since = t
+    return since
+
+
+def _hours_words(hours):
+    days = int(hours // 24)
+    if days >= 2:
+        return f"{days} days"
+    if days == 1:
+        return "1 day"
+    return f"{hours:.0f}h"
+
+
+def _compact_detail(check, limit=86):
+    cid = str(check.get("id") or "").strip()
+    detail = str(check.get("detail") or "").strip().replace("\n", " ")
+    text = f"{cid} ({detail})" if detail else cid
+    return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def _own_machinery_id(cid):
+    return (cid.startswith("w_") or cid in {
+        "alert_delivery", "health_runtime", "sentinel_tick",
+        "w_sentinel_fresh", "w_checks_complete",
+    })
+
+
+def _group_failing_checks(checks):
+    import cooldown
+    groups = {"platform": [], "blind": [], "own": []}
+    for check in checks:
+        cid = str(check.get("id") or "")
+        line = _compact_detail(check)
+        detail = str(check.get("detail") or "")
+        if cooldown.is_self_blindness(f"{cid}: {detail}"):
+            groups["blind"].append(line)
+        elif _own_machinery_id(cid):
+            groups["own"].append(line)
+        else:
+            groups["platform"].append(line)
+    return groups
+
+
+def _join_limited(items, limit=230):
+    out = []
+    used = 0
+    for item in items:
+        extra = len(item) + (2 if out else 0)
+        if used + extra > limit:
+            out.append("…")
+            break
+        out.append(item)
+        used += extra
+    return "; ".join(out)
+
+
+def _silence_message(cfg, verdict, silence_hours, next_window):
+    status = str(verdict.get("status") or "unknown")
+    lines = [f"🔕 {instance_name(cfg)}: {_hours_words(silence_hours)} without a message, and things are not fine."]
+    since = _status_since(verdict)
+    if since:
+        age = max(0.0, (now() - since).total_seconds() / 3600)
+        lines.append(f"Status: {status} for {age:.0f}h.")
+    else:
+        lines.append(f"Status: {status}.")
+    groups = _group_failing_checks(_failing_checks(verdict))
+    if groups["platform"]:
+        lines.append("Platforms: " + _join_limited(groups["platform"]) + ".")
+    if groups["blind"]:
+        lines.append("I can't see: " + _join_limited(groups["blind"]) + ".")
+    if groups["own"]:
+        lines.append("My own arms: " + _join_limited(groups["own"]) + ".")
+    mode = str(cfg.get("notification_mode") or "all").strip().lower()
+    why = []
+    if mode != "all":
+        why.append(f"notification_mode={mode} suppresses operational alerts")
+    if cfg.get("notify_queue_only"):
+        why.append("notify_queue_only leaves delivery to the outbox watcher")
+    if why:
+        lines.append("Why you haven't heard: " + "; ".join(why) + ".")
+    lines.append(f"Next reminder in {int(next_window)}h if nothing changes.")
+    text = "\n".join(lines)
+    return text if len(text) <= 700 else text[:699].rstrip() + "…"
+
+
+def _record_silence_suppressed(cfg, verdict, kind, reason):
+    try:
+        import alert_ledger
+        fp = "checks:" + _silence_fingerprint(verdict)
+        alert_ledger.record(kind, instance_name(cfg), fp, reason,
+                            reason=reason,
+                            checks=[c.get("id") for c in _failing_checks(verdict)])
+    except Exception:
+        pass
+
+
+def silence_breaker(cfg, verdict):
+    """Break quiet-mode silence when the estate is in trouble.
+
+    Field incident this proves against (Dada Collective, 2026-08/09): 3,484
+    verdicts, 3,016 critical; notification_mode=art-only and notify_queue_only
+    meant operational alerts were dropped before the ledger, while the tick only
+    texted on status change. The result was 36 days of no operator-visible
+    message while rappterverse froze, 2,903 "needs a human" events accumulated,
+    the diagnose arm found root causes, and two checks stayed blind. Quiet mode
+    may hide calm; it must never hide trouble.
+    """
+    try:
+        base = float(cfg.get("silence_breaker_hours", 24))
+    except (TypeError, ValueError):
+        base = 24.0
+    if base <= 0:
+        log("silence breaker disabled by silence_breaker_hours=0")
+        return False
+
+    status = str(verdict.get("status") or "").lower()
+    multiplier = 1 if status == "critical" else 3 if status == "degraded" else None
+    if multiplier is None:
+        return False
+
+    ack_until = _parse_time(cfg.get("silence_ack_until"))
+    if ack_until and now() < ack_until:
+        reason = (f"silence breaker acknowledged until {ack_until.isoformat()}"
+                  f": {str(cfg.get('silence_ack_reason') or '').strip()[:160]}")
+        log(reason)
+        _record_silence_suppressed(cfg, verdict, "suppressed", reason)
+        return False
+
+    ref = _silence_reference_at()
+    silence_hours = max(0.0, (now() - ref).total_seconds() / 3600)
+    threshold = base * multiplier
+    if silence_hours < threshold:
+        return False
+
+    fp = _silence_fingerprint(verdict)
+    if not fp:
+        return False
+    if _pending_silence_breaker():
+        log("silence breaker pending in outbox; not enqueueing another")
+        return False
+
+    mode = str(cfg.get("notification_mode") or "all").strip().lower()
+    if mode == "off":
+        text = _silence_message(cfg, verdict, silence_hours, base)
+        _record_muted_alert(
+            cfg, text, "silence",
+            "notification_mode=off disabled the silence breaker by explicit owner choice")
+        log("silence breaker muted by notification_mode=off")
+        return False
+
+    state = load_json(SILENCE_BREAKER_STATE, {})
+    last_sent = _parse_time(state.get("last_sent_at"))
+    prior_fp = str(state.get("fingerprint") or "")
+    try:
+        stored_window = float(state.get("window_hours") or base)
+    except (TypeError, ValueError):
+        stored_window = base
+    window = min(max(stored_window, base), SILENCE_BREAKER_MAX_WINDOW_HOURS)
+    due_window = base if prior_fp and prior_fp != fp else window
+    if last_sent and (now() - last_sent).total_seconds() < due_window * 3600:
+        return False
+
+    unchanged = bool(prior_fp and prior_fp == fp)
+    count = int(state.get("count") or 0) + 1
+    next_window = min((window * 2 if unchanged or not prior_fp else base * 2),
+                      SILENCE_BREAKER_MAX_WINDOW_HOURS)
+    text = _silence_message(cfg, verdict, silence_hours, next_window)
+    digest = hashlib.sha256(fp.encode("utf-8")).hexdigest()[:24]
+    ok = notify(cfg, text, kind="silence", attach_report=False,
+                dedupe_key=f"silence-breaker:{digest}:{count}")
+    if ok:
+        save_json(SILENCE_BREAKER_STATE, {
+            "last_sent_at": now().isoformat(timespec="seconds"),
+            "fingerprint": fp,
+            "window_hours": next_window,
+            "count": count,
+        })
+        log(f"silence breaker queued ({fp}; next {next_window:.0f}h)")
+    return ok
 
 
 # ── guardrails ──────────────────────────────────────────────────────────────
@@ -1217,6 +1556,11 @@ def main():
         emoji = {"healthy": "✅", "degraded": "⚠️", "critical": "🔴"}.get(status, "•")
         notify(cfg, f"{emoji} {instance_name(cfg)}: {prev_status or 'unknown'} → {status}\n"
                     f"{verdict['summary'][:600]}")
+
+    try:
+        silence_breaker(cfg, verdict)
+    except Exception as e:
+        log(f"silence breaker failed (tick continues): {type(e).__name__}: {e}")
 
     level = int(cfg["level"])
     # Smoke on any NON-CRITICAL tick, not only on healthy ones. The original
