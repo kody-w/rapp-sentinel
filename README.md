@@ -623,13 +623,29 @@ All enforced **before** a model is invoked.
 |---|---|
 | kill switch (`touch STOP`) | not being able to stop a runaway loop fast enough |
 | daily budget (rolling 24h) | a flapping check burning credits all night |
-| per-issue cooldown | re-attacking the same failure every tick |
-| attempt cap → escalate to human | infinite retry on something unfixable |
+| per-check cooldown | re-attacking the same failure by changing its failing companions |
+| per-check attempt cap → escalate to human | infinite retry or repeated cap alerts on something unfixable |
 | worktree isolation | destroying a working tree with uncommitted work |
 | notify on **state change only** | alert fatigue — a muted watcher is no watcher |
 | **re-probe after repair** | believing a fix landed when it didn't |
 
 That last one is the difference between self-healing and self-reporting. It re-runs the *same* check and only claims `verified fixed` when what failed now passes.
+
+Repair and diagnose share `check:<id>` records in `state/issues.json`.
+`issue_cooldown_hours` and `max_attempts_per_issue` apply to **every** included
+check: if any is blocked, the whole batch waits and the log names each blocker.
+One escalation charges each included check once, but still uses only one daily
+budget slot. Retry prompts use the highest attempt count, then the most recent
+history on a tie. Human cap alerts are deduped per check, and a repair re-probe
+resets only checks explicitly observed `ok=True`; missing or unresolved checks
+keep their history.
+
+Legacy single-check or comma-separated records migrate once on the next repair/diagnose
+decision. Each record's attempts count against every member, overlapping counts
+add together, and the newest attempt timestamp and result survive.
+Existing `check:` records are not re-migrated; `smoke:` and `evolve:` records stay untouched.
+Sorted batch keys remain in logs and events for correlation, not throttling.
+Offline proof: `python3 prove_per_check_throttle.py`.
 
 ---
 
