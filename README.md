@@ -1,5 +1,9 @@
 # rapp-sentinel
 
+<!-- rapp1:network-header:start -->
+[![RAPP/1](https://kody-w.github.io/rapp-hive-public/portfolio/badges/rapp-sentinel.svg)](https://github.com/kody-w/rapp-hive-public/blob/main/portfolio/repos/rapp-sentinel.md) · **New to RAPP?** [Start here: get your Brainstem →](https://github.com/kody-w/rapp-installer#start-here)
+<!-- rapp1:network-header:end -->
+
 > **Why this exists:** [RAPP and the new way of working: above AI, not beside it](https://kody-w.github.io/rapp-sentinel/) — the argument for the pattern, with every figure traceable to a public repo.
 
 **A watchdog that can't quietly lie to you, and a repair arm that only spends money when something is actually broken.**
