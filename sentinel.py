@@ -17,8 +17,8 @@ FREEDOM LADDER — set "level" in config.json, raise it as trust grows:
 GUARDRAILS (all enforced before a model is ever invoked):
   * kill switch      touch ~/rapp-sentinel/STOP  → next tick exits immediately
   * daily budget     max escalations per rolling 24h
-  * per-issue cooldown  the same broken check will not be re-attacked for N hours
-  * attempt cap      an issue that resists N repairs is escalated to a human
+  * per-check cooldown  the same broken check will not be re-attacked for N hours
+  * attempt cap      a check that resists N repairs is escalated to a human
   * worktree only    repairs never run in a working tree you might be using
 
 State lives in state/. The harness prepares fresh repair worktrees before
@@ -383,6 +383,43 @@ def issue_allowed(issues, key, cfg):
     if age_h < cfg["issue_cooldown_hours"]:
         return False, f"cooling down ({age_h:.1f}h of {cfg['issue_cooldown_hours']}h)"
     return True, f"retry {rec['attempts'] + 1}"
+
+
+def migrate_repair_issues(issues, escalated_human=None):
+    """Fold legacy repair keys into check:<id>; return whether state changed."""
+    changed = False
+    for key in sorted(issues):
+        if key.startswith(("check:", "smoke:", "evolve:")):
+            continue
+        rec = issues.pop(key)
+        for cid in sorted(set(key.split(","))):
+            check_key = f"check:{cid}"
+            prior = issues.get(check_key)
+            if prior is None:
+                issues[check_key] = dict(rec)
+                continue
+            older, newer = prior, rec
+            if (datetime.fromisoformat(prior["last_attempt"])
+                    > datetime.fromisoformat(rec["last_attempt"])):
+                older, newer = rec, prior
+            # Every legacy batch was a separate spend against ALL its members.
+            merged = {**older, **newer,
+                      "attempts": prior["attempts"] + rec["attempts"]}
+            if prior.get("human_notified") or rec.get("human_notified"):
+                merged["human_notified"] = True
+            issues[check_key] = merged
+        changed = True
+
+    # Older ticks kept this latch on the (overwritten) heartbeat, not the issue.
+    if escalated_human and not escalated_human.startswith(("smoke:", "evolve:")):
+        for cid in set(escalated_human.split(",")):
+            if cid.startswith(("smoke:", "evolve:")):
+                continue
+            rec = issues.get(f"check:{cid}")
+            if rec is not None and not rec.get("human_notified"):
+                rec["human_notified"] = True
+                changed = True
+    return changed
 
 
 def evolution_allowed(history, cfg):
@@ -1266,7 +1303,7 @@ def main():
         return 0
 
     # only escalate on critical; warn-level noise does not deserve a model
-    critical = verdict["critical"]
+    critical = sorted(set(verdict["critical"]))
     if not critical:
         log(f"degraded but no critical checks ({failing}) — observing")
         return 0
@@ -1302,32 +1339,47 @@ def main():
         return 0
 
     issues = load_json(STATE / "issues.json", {})
-    key = ",".join(sorted(critical))
-    allowed, why = issue_allowed(issues, key, cfg)
-    if not allowed:
+    if migrate_repair_issues(issues, prev.get("escalated_human")):
+        save_json(STATE / "issues.json", issues)
+    key = ",".join(critical)
+    blocked = {}
+    for cid in critical:
+        allowed, why = issue_allowed(issues, f"check:{cid}", cfg)
+        if not allowed:
+            blocked[cid] = why
+    if blocked:
+        why = "; ".join(f"{cid}: {reason}" for cid, reason in blocked.items())
         log(f"skipping '{key}': {why}")
-        if "attempt cap" in why and prev.get("escalated_human") != key:
-            notify(cfg, f"🔴 {instance_name(cfg)} needs you.\n'{key}' survived "
-                        f"{cfg['max_attempts_per_issue']} automated repairs.\n"
+        newly_capped = [cid for cid in blocked
+                        if issues[f"check:{cid}"]["attempts"] >= cfg["max_attempts_per_issue"]
+                        and not issues[f"check:{cid}"].get("human_notified")]
+        if newly_capped:
+            notify(cfg, f"🔴 {instance_name(cfg)} needs you.\n"
+                        f"'{','.join(newly_capped)}' survived "
+                        f"{cfg['max_attempts_per_issue']} automated attempts.\n"
                         f"{verdict['summary'][:400]}")
-            prev["escalated_human"] = key
-            save_json(STATE / "last_run.json", {**prev, "escalated_human": key})
+            for cid in newly_capped:
+                issues[f"check:{cid}"]["human_notified"] = True
+            save_json(STATE / "issues.json", issues)
         return 0
 
     mode = escalation_mode(cfg, level)
-    # Read the record BEFORE escalating so the prompt carries its own attempt
-    # history (#4); the bookkeeping below stays where it was, so attempt
-    # accounting cannot double-count.
-    rec = issues.get(key, {"attempts": 0})
+    # Use the most advanced history, then the most recent, without summing
+    # attempts across checks that may have shared the same model call.
+    rec = max((issues[f"check:{cid}"] for cid in critical if f"check:{cid}" in issues),
+              key=lambda r: (r["attempts"], datetime.fromisoformat(r["last_attempt"])),
+              default={"attempts": 0}).copy()
     ok, output = escalate(cfg, verdict, critical, mode,
                           attempt=rec["attempts"] + 1,
                           last_result=rec.get("last_result"))
     verdict_line = result_line(output)
 
-    rec["attempts"] += 1
-    rec["last_attempt"] = now().isoformat(timespec="seconds")
-    rec["last_result"] = verdict_line
-    issues[key] = rec
+    last_attempt = now().isoformat(timespec="seconds")
+    for cid in critical:
+        check_key = f"check:{cid}"
+        check_rec = issues.get(check_key, {"attempts": 0})
+        issues[check_key] = {**check_rec, "attempts": check_rec["attempts"] + 1,
+                            "last_attempt": last_attempt, "last_result": verdict_line}
     save_json(STATE / "issues.json", issues)
 
     hist.append({"at": now().isoformat(timespec="seconds"), "key": key,
@@ -1345,7 +1397,7 @@ def main():
     # a tamper-evident chain.
     NB.emit("copilot", "neighbor.acted", {
         "act": mode, "issue": key, "result": verdict_line[:400],
-        "exit_ok": bool(ok), "attempt": rec["attempts"],
+        "exit_ok": bool(ok), "attempt": rec["attempts"] + 1,
     })
 
     # re-probe: did the repair actually land?
@@ -1375,7 +1427,8 @@ def main():
             log(f"verified fixed: {sorted(fixed)}")
             notify(cfg, f"✅ {instance_name(cfg)} repaired: "
                         f"{', '.join(sorted(fixed))}\n{verdict_line[:300]}")
-            issues.pop(key, None)
+            for cid in fixed:
+                issues.pop(f"check:{cid}", None)
             save_json(STATE / "issues.json", issues)
         else:
             log("repair did not clear the failing checks")
