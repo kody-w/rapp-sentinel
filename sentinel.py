@@ -901,14 +901,16 @@ def outsider_smoke(cfg):
 
     Issue #5 ask 2: the resident fleet runs inside the platforms with repo
     secrets, so a green heartbeat proves nothing about onboarding. This runs
-    participate.py's smoke — GitHub Issue in, published state re-read out —
-    on one platform per spend, rotating over every platform participate.py
-    names (today: rappterbook and rappterverse, both via the github-issue
-    write path).
+    participate.py's smoke on one platform per spend, rotating over every
+    platform it names. The command dispatches by each platform's write_path:
+    rappterbook's github-issue flow submits an issue and re-reads published
+    state; rappterverse's github-state-pr intake is not implemented, so it
+    declines locally and records smoke.unsupported without any network
+    access, issue submission, or state polling.
 
     Only from the HEALTHY branch: smoking a critical platform measures the
-    outage, not the front door. Only at level >= 2: a smoke files a real
-    issue, and levels 0-1 promise the sentinel writes nothing.
+    outage, not the front door. Only at level >= 2: the supported github-issue
+    flow files a real issue, and levels 0-1 promise the sentinel writes nothing.
 
     EVIDENCE (R1): after the subprocess, participation.jsonl is RE-READ. The
     smoke landed only if a NEW row exists whose kind is smoke.landed with
@@ -916,9 +918,9 @@ def outsider_smoke(cfg):
     subprocess that exited 0 without writing the log is NO-RECORD, which is
     a failure; the exit code is never believed.
 
-    Honest identity limit: this proves the PUBLIC WRITE PATH works without
-    repo access. It cannot prove a true stranger's identity onboarding —
-    the platform binds agent_id to the authenticated issue author, so the
+    Honest identity limit: the issue flow proves the PUBLIC WRITE PATH works
+    without repo access. It cannot prove a true stranger's identity onboarding:
+    rappterbook binds agent_id to the authenticated issue author, so the
     smoke joins as the owner's login walking the stranger's road. And
     rappterverse's consent-delegation (`delegates`, #5 ask 3) stays
     uncovered: participate.py does not implement that path yet.

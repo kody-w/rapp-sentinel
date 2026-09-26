@@ -2,7 +2,11 @@
 """prove_outsider_smoke.py — the front door is exercised from the tick, and
 only the evidence file is ever believed (#5 ask 2, R1 from #2).
 
-Two halves, because the loop has two halves:
+Three layers, from the command to its evidence consumers:
+
+  the command participate.cmd_smoke uses the declared write_path, never an
+              issue-shaped fallback. Unsupported paths decline before any
+              network access and write one explicit evidence row (#100).
 
   the check   w_outsider_smoke (checks.py) reads participation.jsonl and
               pages, at warn, on absence, on a failed newest smoke, and on
@@ -22,12 +26,16 @@ and no real GitHub issue is filed.
 Run: python3 prove_outsider_smoke.py   (exit 0 only on all-behaved)
 """
 
+import argparse
+import io
 import json
 import subprocess
 import sys
 import tempfile
+from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import checks as C
 import participate as P
@@ -50,6 +58,115 @@ def utc(hours_ago=0.0):
 
 PLATFORMS = sorted(P.PLATFORMS)
 BAR = 2 * C._smoke_interval_hours() + 24
+
+
+def smoke_command(platform, dry_run=False, registered=False):
+    """Run the real command and recorder with only network seams stubbed."""
+    published = {"agents": {"proof-outsider": {
+        "status": "active", "joined": "2026-08-16"}}}
+    with tempfile.TemporaryDirectory(prefix="prove-smoke-command-") as tmp:
+        state_dir = Path(tmp) / "state"
+        log = state_dir / "participation.jsonl"
+        output = io.StringIO()
+        with (
+            patch.multiple(P, STATE=state_dir, LOG=log),
+            patch.object(P, "fetch_json", return_value=(
+                published if registered else {"agents": {}})) as read,
+            patch.object(P, "gh", side_effect=[
+                (0, "proof-outsider", ""),
+                (0, "https://github.com/example/platform/issues/1", ""),
+            ]) as github,
+            patch.object(P, "open_delta_issue", wraps=P.open_delta_issue) as submit,
+            patch.object(P, "wait_for_state", side_effect=(
+                lambda url, predicate: predicate(published))) as wait,
+            redirect_stdout(output),
+        ):
+            rc = P.cmd_smoke(argparse.Namespace(
+                platform=platform, dry_run=dry_run))
+        rows = ([json.loads(line) for line in
+                 log.read_text(encoding="utf-8").splitlines()]
+                if log.exists() else [])
+        return {"rc": rc, "rows": rows, "output": output.getvalue(),
+                "read": read, "gh": github, "submit": submit, "wait": wait}
+
+
+scenario("rappterverse declares its validated state-PR intake, not issues",
+         P.PLATFORMS["rappterverse"]["write_path"] == "github-state-pr",
+         f"write_path={P.PLATFORMS['rappterverse']['write_path']}")
+
+for dry_run in (False, True):
+    result = smoke_command("rappterverse", dry_run=dry_run)
+    calls = {name: result[name].call_count
+             for name in ("read", "gh", "submit", "wait")}
+    scenario(f"unsupported rappterverse (dry_run={dry_run}) -> exit 1 "
+             "without reading state, resolving identity, submitting, or polling",
+             result["rc"] == 1 and not any(calls.values()),
+             f"rc={result['rc']} calls={calls}")
+    rows = result["rows"]
+    scenario(f"unsupported rappterverse (dry_run={dry_run}) -> exactly one "
+             "explicit smoke.unsupported evidence row and a clear decline",
+             len(rows) == 1 and rows[0]["kind"] == "smoke.unsupported"
+             and rows[0]["platform"] == "rappterverse"
+             and rows[0]["ok"] is False
+             and rows[0].get("write_path") == "github-state-pr"
+             and "github-state-pr" in rows[0]["detail"]
+             and "not implemented" in rows[0]["detail"]
+             and "declined" in result["output"]
+             and "unsupported" in result["output"],
+             f"rows={rows} output={result['output'].strip()!r}")
+    if not dry_run:
+        UNSUPPORTED_ROWS = rows
+
+with patch.dict(P.PLATFORMS["rappterbook"],
+                {"write_path": "synthetic-unimplemented-path"}):
+    result = smoke_command("rappterbook")
+rows = result["rows"]
+scenario("write_path is load-bearing even on rappterbook: an unknown path "
+         "declines rather than falling back to an issue",
+         result["rc"] == 1
+         and all(result[name].call_count == 0
+                 for name in ("read", "gh", "submit", "wait"))
+         and len(rows) == 1 and rows[0]["kind"] == "smoke.unsupported"
+         and rows[0]["ok"] is False
+         and rows[0].get("write_path") == "synthetic-unimplemented-path"
+         and "synthetic-unimplemented-path" in rows[0]["detail"],
+         f"rc={result['rc']} rows={rows}")
+
+for registered in (False, True):
+    action = "heartbeat" if registered else "register_agent"
+    result = smoke_command("rappterbook", registered=registered)
+    rows = result["rows"]
+    scenario(f"rappterbook github-issue {action} still submits and verifies "
+             "published state",
+             P.PLATFORMS["rappterbook"]["write_path"] == "github-issue"
+             and result["rc"] == 0
+             and [r["kind"] for r in rows] == [
+                 "smoke.read", f"smoke.{action}", "smoke.landed"]
+             and all(r["ok"] is True for r in rows)
+             and result["read"].call_count == 1
+             and result["submit"].call_count == 1
+             and result["submit"].call_args.args[:2] == (
+                 P.PLATFORMS["rappterbook"]["repo"], action)
+             and result["submit"].call_args.args[3:] == (
+                 False, "proof-outsider")
+             and [c.args[0][:2] for c in result["gh"].call_args_list] == [
+                 ["api", "user"], ["issue", "create"]]
+             and result["wait"].call_count == 1,
+             f"rc={result['rc']} rows={rows}")
+
+result = smoke_command("rappterbook", dry_run=True)
+scenario("rappterbook dry run still previews the issue without submitting "
+         "or polling; its evidence never claims a landing",
+         result["rc"] == 0
+         and [r["kind"] for r in result["rows"]] == [
+             "smoke.read", "smoke.register_agent"]
+         and result["submit"].call_count == 1
+         and result["submit"].call_args.args[3] is True
+         and [c.args[0] for c in result["gh"].call_args_list] == [
+             ["api", "user", "--jq", ".login"]]
+         and result["wait"].call_count == 0
+         and "DRY RUN" in result["output"],
+         f"rc={result['rc']} rows={result['rows']}")
 
 # ════════════════════════════════════════════════════════════════════════════
 # Half 1 — the read-only check, against a synthetic participation.jsonl
@@ -104,6 +221,18 @@ try:
     scenario("newest smoke FAILED -> fires quoting the recorded detail",
              (not r["ok"]) and r["severity"] == C.WARN
              and "issue create failed: HTTP 403" in r["detail"],
+             r["detail"])
+
+    write_log([landed_row(p) for p in PLATFORMS] + UNSUPPORTED_ROWS)
+    r = C.outsider_smoke_exercised()
+    scenario("unsupported command evidence supersedes an old landing: "
+             "the check names the unimplemented intake, not a timeout",
+             (not r["ok"]) and r["severity"] == C.WARN
+             and "rappterverse: newest smoke failed" in r["detail"]
+             and "smoke.unsupported" in r["detail"]
+             and "github-state-pr" in r["detail"]
+             and "not implemented" in r["detail"]
+             and "timed out" not in r["detail"],
              r["detail"])
 
     write_log([landed_row(p, hours_ago=BAR + 10) for p in PLATFORMS])
@@ -219,6 +348,30 @@ try:
              and EMITS[0][2].get("landed") is True
              and EMITS[0][2].get("act") == "smoke",
              f"emits={EMITS}")
+
+    # The receipt deliberately says exit 0; the command's rows decide.
+    fresh_state()
+    (S.STATE / "smoke_turn.json").write_text(
+        json.dumps({"i": PLATFORMS.index("rappterverse")}), encoding="utf-8")
+    subprocess.run = stub_run(UNSUPPORTED_ROWS)
+    try:
+        S.outsider_smoke(CFG)
+    finally:
+        subprocess.run = REAL["run"]
+    hist = state("escalations.json", [])
+    issues = state("issues.json", {})
+    scenario("parent loop learns the unsupported path from participation.jsonl "
+             "even with an exit-zero receipt",
+             len(SPAWNS) == 1 and len(hist) == 1
+             and hist[0]["key"] == "smoke:rappterverse"
+             and hist[0]["result"].startswith("FAILED")
+             and "smoke.unsupported" in hist[0]["result"]
+             and "github-state-pr" in hist[0]["result"]
+             and "not implemented" in hist[0]["result"]
+             and "timed out" not in hist[0]["result"]
+             and issues.get("smoke:rappterverse", {}).get("attempts") == 1
+             and len(EMITS) == 1 and EMITS[0][2].get("landed") is False,
+             f"hist={hist} issues={issues} emits={EMITS}")
 
     # ── exit 0, wrote NOTHING: the exit code is never believed (R1) ─────────
     fresh_state()

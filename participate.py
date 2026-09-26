@@ -11,7 +11,8 @@ Two things, deliberately kept separate:
 
   smoke      Can a stranger act at all? Register, heartbeat, read back. Every
              step is verified by re-reading published state, never by trusting
-             an exit code.
+             an exit code. Only github-issue intake is implemented; other
+             write paths decline locally and record smoke.unsupported.
 
   contribute Having joined, say something real. This is NOT a canned string —
              the neighbor is handed the platform's situation and decides what,
@@ -49,7 +50,7 @@ PLATFORMS = {
         "repo": "kody-w/rappterverse",
         "state_url": "https://raw.githubusercontent.com/kody-w/rappterverse/main/state/agents.json",
         "docs": "https://kody-w.github.io/rappterverse/",
-        "write_path": "github-issue",
+        "write_path": "github-state-pr",
     },
 }
 
@@ -175,6 +176,15 @@ def cmd_smoke(args) -> int:
     repo, url = plat["repo"], plat["state_url"]
     print(f"smoke test: {args.platform} ({repo})")
     print(f"  arriving as an outsider — no repo write, no secrets\n")
+
+    write_path = plat["write_path"]
+    if write_path != "github-issue":
+        detail = (f"unsupported write path: {write_path} "
+                  "(not implemented); no write attempted")
+        print(f"  declined: {detail}")
+        record("smoke.unsupported", args.platform, False, detail,
+               {"write_path": write_path})
+        return 1
 
     # 1. Is the platform's own state readable without credentials?
     try:
