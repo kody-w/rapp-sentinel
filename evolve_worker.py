@@ -5459,12 +5459,28 @@ def write_status(outcome, reason="", **extra):
 
     A job that runs and skips and a job launchd never loaded look identical
     from outside — both produce no art and no log line anybody reads. This
-    file is what lets w_evolve_worker tell those two apart (#6).
+    file is what lets w_evolve_worker tell those two apart (#6). The `since`
+    field is the first time the current (outcome, reason) pair was written
+    consecutively; it is what lets health tell a normal skip from weeks of the
+    same broken preflight.
     """
+    at = sentinel.now().isoformat(timespec="seconds")
+    reason_text = str(reason)[:400]
+    since = at
+    try:
+        previous = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+        if (previous.get("outcome") == outcome
+                and str(previous.get("reason") or "") == reason_text
+                and isinstance(previous.get("since"), str)
+                and previous.get("since")):
+            since = previous["since"]
+    except Exception:
+        pass
     payload = {
-        "at": sentinel.now().isoformat(timespec="seconds"),
+        "at": at,
+        "since": since,
         "outcome": outcome,
-        "reason": str(reason)[:400],
+        "reason": reason_text,
         "pid": os.getpid(),
         "depth": SS.current_depth(),
         **extra,

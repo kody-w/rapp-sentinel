@@ -182,6 +182,16 @@ def url_check(cid, url, critical=False):
     return ok(cid, url) if s == 200 else fail(cid, f"HTTP {s} — {url}", critical)
 
 
+def _iso_age_hours(iso):
+    try:
+        stamp = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - stamp).total_seconds() / 3600
+    except Exception:
+        return None
+
+
 class _Sentinel:
     def __init__(self, name):
         self._name = name
@@ -2051,6 +2061,52 @@ def channel_serving():
     )) or ok("channel", "serving")
 
 
+def _evolve_skip_is_by_design(reason):
+    text = str(reason or "")
+    prefixes = (
+        "STOP file present",
+        "evolve_worker.enabled is false",
+        "level ",
+        "evolve budget spent ",
+        "creative cadence ",
+        "another worker holds the lock",
+        "nested run refused",
+        "critical checks failing at ",
+        "health at ",
+        "health verdict at ",
+        "degraded at ",
+    )
+    fragments = (
+        "shape unknown, not healthy",
+        "which this worker does not understand",
+        "cannot be allowlisted",
+        "a loop that cannot report must not publish",
+    )
+    return text.startswith(prefixes) or any(f in text for f in fragments)
+
+
+def _last_evolve_contribution_detail():
+    try:
+        rows = json.loads((HOME / "state" / "evolve-worker-history.json"
+                           ).read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(rows, list):
+        return ""
+    for row in reversed(rows):
+        if isinstance(row, dict) and row.get("outcome") == "contributed":
+            when = str(row.get("at") or row.get("merged_at") or "").strip()
+            slug = str(row.get("slug") or "").strip()
+            if when and slug:
+                return f"; last contribution {when} ({slug})"
+            if when:
+                return f"; last contribution {when}"
+            if slug:
+                return f"; last contribution {slug}"
+            return "; last contribution recorded without timestamp"
+    return "; no prior contribution in history"
+
+
 @check
 def evolve_worker_is_alive():
     """The art arm is a SEPARATE launchd job, so its silence is invisible here.
@@ -2097,6 +2153,11 @@ def evolve_worker_is_alive():
                     critical=False)
     stale_after = interval_m * 3
     try:
+        stall_h = float(block.get("stall_hours", 6))
+    except (TypeError, ValueError):
+        stall_h = 6.0
+    stall_bar_h = max(stale_after / 60.0, stall_h)
+    try:
         age_m = (datetime.now(timezone.utc)
                  - datetime.fromisoformat(status["at"])).total_seconds() / 60
     except Exception:
@@ -2135,6 +2196,21 @@ def evolve_worker_is_alive():
         return ok("w_evolve_worker",
                   f"dual deployment pending, attempt {attempts} "
                   f"({pending_age:.0f}m)")
+    reason = str(status.get("reason") or "")
+    if outcome == "skipped" and not _evolve_skip_is_by_design(reason):
+        since = status.get("since")
+        stall_age_h = _iso_age_hours(since) if since else None
+        if stall_age_h is not None and stall_age_h > stall_bar_h:
+            days = stall_age_h / 24.0
+            return fail(
+                "w_evolve_worker",
+                f"art arm stalled for {days:.1f}d: {reason[:160]}"
+                f"{_last_evolve_contribution_detail()}",
+                critical=False)
+        if stall_age_h is None:
+            return ok("w_evolve_worker",
+                      f"skipped {age_m:.0f}m ago (broken-skip reason has no "
+                      "since yet; duration unknown)")
     return ok("w_evolve_worker",
               f"{outcome} {age_m:.0f}m ago"
               + (f" (cycle {status['cycle']})" if status.get("cycle") else ""))
