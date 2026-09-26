@@ -18,6 +18,7 @@ all dashboard, log, and public-head routes still reject non-loopback clients.
 
 import http.server
 import ipaddress
+import os
 import socketserver
 import subprocess
 import sys
@@ -34,6 +35,10 @@ PORT = 9797
 MIN_REBUILD_INTERVAL = 20
 _last_build = 0.0
 _lock = threading.Lock()
+
+
+def bind_address():
+    return os.environ.get("SENTINEL_DASH_BIND", "127.0.0.1")
 
 
 def rebuild(hours=14):
@@ -152,6 +157,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = PORT
+    bind = bind_address()
     for a in sys.argv[1:]:
         if a.startswith("--port"):
             port = int(a.split("=")[1] if "=" in a else sys.argv[sys.argv.index(a) + 1])
@@ -162,6 +168,7 @@ if __name__ == "__main__":
                        capture_output=True, timeout=180, cwd=str(HOME))
     rebuild()
     socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer(("0.0.0.0", port), Handler) as httpd:
-        print(f"neighborhood watch → http://localhost:{port}")
+    with socketserver.TCPServer((bind, port), Handler) as httpd:
+        host, actual_port = httpd.server_address[:2]
+        print(f"neighborhood watch → http://{host}:{actual_port}")
         httpd.serve_forever()
