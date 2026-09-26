@@ -516,6 +516,85 @@ DEEPLY_CHECKED = {RV, RB}
 CHANNEL = "https://kody-w.github.io/rappvision-field-notes"
 
 
+class _JsonPairs(list):
+    pass
+
+
+def _plain_json_value(value):
+    if isinstance(value, _JsonPairs):
+        out = {}
+        for k, v in value:
+            out[k] = _plain_json_value(v)
+        return out
+    if isinstance(value, list):
+        return [_plain_json_value(v) for v in value]
+    return value
+
+
+def _short_json_value(value):
+    try:
+        text = json.dumps(_plain_json_value(value), sort_keys=True)
+    except Exception:
+        text = repr(value)
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
+def _duplicate_json_keys(value, path=""):
+    duplicates = []
+    if isinstance(value, _JsonPairs):
+        seen = {}
+        for key, child in value:
+            here = f"{path}.{key}" if path else str(key)
+            if key in seen:
+                duplicates.append(
+                    (here, _short_json_value(seen[key]),
+                     _short_json_value(child)))
+            seen[key] = child
+            duplicates.extend(_duplicate_json_keys(child, here))
+    elif isinstance(value, list):
+        for i, child in enumerate(value):
+            duplicates.extend(_duplicate_json_keys(child, f"{path}[{i}]"))
+    return duplicates
+
+
+@check
+def config_integrity():
+    """The sentinel must not silently lie about the config it is obeying.
+
+    Field incident, 2026-08-22 through 2026-09-26: Dada Collective's art arm
+    skipped every pass because config.json contained
+    evolve_worker.max_piece_bytes twice. json.loads kept the later 51200,
+    hiding the earlier valid 10485760 and making the azure-reviewed-png
+    preflight fail for weeks while w_evolve_worker stayed green. Warn, not
+    critical: a malformed config can blind or disable checks, but the repair
+    arm cannot safely rewrite an operator's configuration.
+    """
+    path = HOME / "config.json"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ok("config_integrity", "config.json absent; defaults only")
+    except OSError as exc:
+        return fail("config_integrity",
+                    f"cannot read config.json ({type(exc).__name__}: {exc})",
+                    critical=False)
+    try:
+        doc = json.loads(raw, object_pairs_hook=_JsonPairs)
+    except Exception as exc:
+        return fail("config_integrity",
+                    f"config.json is invalid JSON ({type(exc).__name__}: {exc})",
+                    critical=False)
+    duplicates = _duplicate_json_keys(doc)
+    if duplicates:
+        name, first, second = duplicates[0]
+        return fail(
+            "config_integrity",
+            f"{name} appears twice ({first}, then {second} — JSON silently "
+            "keeps the last)",
+            critical=False)
+    return ok("config_integrity", "config.json parses with no duplicate keys")
+
+
 def public_json(repo, path, attempts=2):
     """Read public state with a short retry; return (document, error)."""
     import time
