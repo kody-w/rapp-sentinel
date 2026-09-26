@@ -34,6 +34,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import checks as C
+
 TOKEN_ENVS = ("GITHUB_TOKEN", "GH_TOKEN", "GH_PAT", "COPILOT_GITHUB_TOKEN")
 
 _SECRETS = []
@@ -76,7 +78,13 @@ def _http(url, headers=None, method="GET", data=None, timeout=15):
 
 def _run(cmd, timeout=20):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        env = None
+        if cmd and cmd[0] == "gh":
+            env, cause = C.gh_environment()
+            if cause:
+                return None, cause
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+                           env=env)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except Exception:
         return None, ""

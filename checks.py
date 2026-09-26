@@ -145,6 +145,77 @@ def http_status(url):
 # single-threaded, so outsider_check() can snapshot this around a check to
 # prove the execution never touched the owner's credentials.
 _GH_CALLS = 0
+_GH_LAST_FAILURE = ""
+_GH_TOKEN_CACHE = {"user": None, "token": None, "cause": None, "loaded": False}
+
+
+def _configured_gh_user():
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        user = cfg.get("gh_user")
+        return user.strip() if isinstance(user, str) else ""
+    except Exception:
+        return ""
+
+
+def _classify_gh_failure(returncode=None, output="", exc=None):
+    if isinstance(exc, FileNotFoundError):
+        return "gh binary not found"
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "timeout"
+    if exc is not None:
+        return type(exc).__name__
+    text = str(output or "").lower()
+    if "rate limit" in text or "secondary rate" in text:
+        return "rate limited"
+    if any(w in text for w in ("auth", "authentication", "credential",
+                               "login", "forbidden", "unauthorized")):
+        return "auth"
+    return f"exit {returncode}"
+
+
+def _resolve_gh_token():
+    user = _configured_gh_user()
+    if not user:
+        return None, None
+    if _GH_TOKEN_CACHE.get("loaded") and _GH_TOKEN_CACHE.get("user") == user:
+        return _GH_TOKEN_CACHE.get("token"), _GH_TOKEN_CACHE.get("cause")
+    _GH_TOKEN_CACHE.update(
+        {"user": user, "token": None, "cause": None, "loaded": True})
+    try:
+        r = subprocess.run(["gh", "auth", "token", "--user", user],
+                           capture_output=True, text=True, timeout=TIMEOUT)
+    except Exception as exc:
+        _GH_TOKEN_CACHE["cause"] = _classify_gh_failure(exc=exc)
+        return None, _GH_TOKEN_CACHE["cause"]
+    token = (r.stdout or "").strip()
+    if r.returncode != 0 or not token:
+        _GH_TOKEN_CACHE["cause"] = _classify_gh_failure(
+            r.returncode, (r.stdout or "") + (r.stderr or ""))
+        return None, _GH_TOKEN_CACHE["cause"]
+    _GH_TOKEN_CACHE["token"] = token
+    return token, None
+
+
+def gh_environment():
+    """Environment for direct gh subprocesses, honoring config gh_user.
+
+    Returns (env, failure_cause). A cause means the configured identity could
+    not be resolved and the caller should treat the gh read as blind rather
+    than silently falling back to the machine's active account.
+    """
+    token, cause = _resolve_gh_token()
+    if cause:
+        return None, cause
+    if token:
+        env = os.environ.copy()
+        env["GH_TOKEN"] = token
+        return env, None
+    return None, None
+
+
+def gh_failure_cause():
+    return _GH_LAST_FAILURE or str(_GH_TOKEN_CACHE.get("cause") or "")
 
 
 def gh(args, default=None):
@@ -155,15 +226,29 @@ def gh(args, default=None):
     so even a failed or timed-out gh call counts as having reached for the
     owner's credentials.
     """
-    global _GH_CALLS
+    global _GH_CALLS, _GH_LAST_FAILURE
     _GH_CALLS += 1
+    _GH_LAST_FAILURE = ""
+    env, cause = gh_environment()
+    if cause:
+        _GH_LAST_FAILURE = cause
+        return default
     try:
         r = subprocess.run(["gh"] + args, capture_output=True,
-                           text=True, timeout=TIMEOUT)
+                           text=True, timeout=TIMEOUT, env=env)
         if r.returncode != 0:
+            _GH_LAST_FAILURE = _classify_gh_failure(
+                r.returncode, (r.stdout or "") + (r.stderr or ""))
             return default
-        return json.loads(r.stdout) if r.stdout.strip() else default
-    except Exception:
+        try:
+            value = json.loads(r.stdout) if r.stdout.strip() else default
+        except Exception as exc:
+            _GH_LAST_FAILURE = _classify_gh_failure(exc=exc)
+            return default
+        _GH_LAST_FAILURE = ""
+        return value
+    except Exception as exc:
+        _GH_LAST_FAILURE = _classify_gh_failure(exc=exc)
         return default
 
 
@@ -595,6 +680,62 @@ def config_integrity():
     return ok("config_integrity", "config.json parses with no duplicate keys")
 
 
+@check
+def gh_identity():
+    """The GitHub CLI identity is part of the instrument, so measure it.
+
+    Field incident, Dada Collective 2026-09: GraphQL-backed checks were blind
+    3,101 times each because the machine's active gh account had
+    resources.graphql.limit == 0, while another account in the same keyring had
+    quota. Warn, not critical: quota/account selection is operator action and
+    the repair arm cannot mint or choose credentials safely, but a watchdog
+    must not report GraphQL-backed checks as meaningful when the account has no
+    GraphQL budget.
+    """
+    rate = gh(["api", "rate_limit"], default=UNREADABLE)
+    if rate is UNREADABLE:
+        cause = gh_failure_cause()
+        return fail("gh_identity",
+                    "cannot read gh rate_limit"
+                    + (f" ({cause})" if cause else ""),
+                    critical=False)
+    user = gh(["api", "user"], default=UNREADABLE)
+    if user is UNREADABLE:
+        cause = gh_failure_cause()
+        return fail("gh_identity",
+                    "cannot read gh user"
+                    + (f" ({cause})" if cause else ""),
+                    critical=False)
+    login = str(user.get("login") or "unknown") if isinstance(user, dict) else "unknown"
+    try:
+        graphql = (rate.get("resources") or {}).get("graphql") or {}
+        limit = int(graphql.get("limit"))
+        remaining = int(graphql.get("remaining"))
+    except Exception as exc:
+        return fail("gh_identity",
+                    f"gh rate_limit response has no GraphQL quota "
+                    f"({type(exc).__name__}: {exc})",
+                    critical=False)
+    if limit == 0:
+        return fail(
+            "gh_identity",
+            f"gh identity {login} has a GraphQL quota of 0: "
+            "GraphQL-backed checks are blind (e.g. rv_pr_queue, "
+            "rb_rollup_coverage). Set gh_user in config.json to an account "
+            "with quota.",
+            critical=False)
+    if remaining == 0:
+        return fail(
+            "gh_identity",
+            f"gh identity {login} has no remaining GraphQL quota: "
+            "GraphQL-backed checks are blind (e.g. rv_pr_queue, "
+            "rb_rollup_coverage). Set gh_user in config.json to an account "
+            "with quota.",
+            critical=False)
+    return ok("gh_identity",
+              f"gh identity {login}, GraphQL remaining {remaining}/{limit}")
+
+
 def public_json(repo, path, attempts=2):
     """Read public state with a short retry; return (document, error)."""
     import time
@@ -992,7 +1133,11 @@ def queue_draining():
     if not isinstance(prs, list):
         # default=0 made a dead API indistinguishable from an empty queue, and
         # an empty queue is the healthiest possible reading (#45).
-        return fail("rv_pr_queue", "cannot read the PR queue", critical=False)
+        cause = gh_failure_cause()
+        return fail("rv_pr_queue",
+                    "cannot read the PR queue"
+                    + (f" ({cause})" if cause else ""),
+                    critical=False)
     n = len(prs)
     if not prs:
         return ok("rv_pr_queue", "empty")
@@ -1410,8 +1555,10 @@ def rb_rollup_covers_corpus():
     if data is UNREADABLE:
         # gh() returns its default on ANY failure, so `None` made a dead
         # subprocess and a real answer the same value. Say blind, not broken.
+        cause = gh_failure_cause()
         return fail("rb_rollup_coverage",
-                    "cannot read corpus size (gh graphql read failed)",
+                    "cannot read corpus size (gh graphql read failed"
+                    + (f": {cause}" if cause else "") + ")",
                     critical=False)
     try:
         actual = int(data["data"]["repository"]["discussions"]["totalCount"])

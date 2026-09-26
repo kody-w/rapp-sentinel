@@ -17,6 +17,8 @@
   "_report_number_why": "iMessage/SMS destination for reports: nightwatch's play-by-play, and the evolve worker's one-text-per-verified-merge art update (title, tappable Pages URL, source, PR, one sentence). Falls back to notify_handle when unset.",
   "report_number": "",
   "notify_queue_only": false,
+  "_gh_user_why": "Optional GitHub CLI account name for read-only checks. When set, checks resolve `gh auth token --user <gh_user>` once per process and pass it as GH_TOKEN to every gh subprocess, so GraphQL-backed checks do not silently run as the machine's active account.",
+  "gh_user": "",
   "copilot_model": "claude-opus-5",
   "copilot_timeout_s": 900,
   "evolve_timeout_s": 1800,
@@ -29,6 +31,8 @@
   "_evolve_worker_fanout_why": "fanout spawns bounded read-only sub-sentinels before the maker runs: separate copilot processes, each with its own temp workspace, no git clone, no GitHub token in its environment, a hard timeout, its own process group, and RAPP_SENTINEL_DEPTH set so a child can never spawn children (max_depth 1). Each child returns one strict JSON report (rapp-subsentinel-report/1.0); the parent parses it deterministically, applies high-severity critiques as vetoes, and aggregates EXACTLY 10 finalists - which then must be round 1 of the submission's _dada_cycle. Fewer than 10 survivors, or fewer than min_healthy_children, fails the cycle out loud; a failed child is never an empty success. children is the cast size (max_children caps it, max_processes_per_cycle counts the maker too, daily_child_budget is a rolling 24h credit cap). Roles are configurable; wave 2 sees wave 1's candidates, which is what makes the adversarial verifier more than decoration. format_repair_attempts is 0 or 1 and nothing else: a child that answers with unparseable JSON gets at most one more process, and a config asking for more is rejected rather than quietly clamped.",
   "evolve_worker": {
     "enabled": false,
+    "_stall_hours_why": "w_evolve_worker fails at warn when the worker keeps writing the same broken skipped outcome/reason longer than max(three intervals, stall_hours). Health-gate, budget, STOP, cadence and cooldown skips are by-design and do not count as a stall.",
+    "stall_hours": 6,
     "repo": "kody-w/public-art-collective",
     "_repo_why": "owner/name, or a full https URL, or either with a .git suffix - normalised once into a transport URL for git and OWNER/REPO for gh, so the two never disagree.",
     "_publication_profile_why": "azure-reviewed-png is the source-enforced Dada visual profile. It fails preflight before fanout/model spend unless allowed_kinds is exactly [\"png\"], Azure and RAPP Vision are enabled, deployment and review_model are bounded identifiers, minimum_review_score is at least 8, and max_piece_bytes is between 4 MiB and 32 MiB. Reviewed metadata recursively rejects credential-like fields/values, and canonical target-main tools/build_index.py --validate must accept the staged candidate before commit or push. For compatibility, an omitted profile activates the same contract when deployed config already has exactly [\"png\"] plus azure_image.enabled=true. Omit/empty the profile and do not use that legacy activation pair to retain the ordinary multi-kind worker.",

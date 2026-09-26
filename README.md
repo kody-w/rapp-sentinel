@@ -105,6 +105,12 @@ cp config.example.json config.json    # start at level 0
 ./morning                             # read the overnight shift report
 ```
 
+If GitHub reads should run as a specific account from the local `gh` keyring,
+set `"gh_user": "account-name"`. The checks resolve
+`gh auth token --user <account-name>` once per process and pass only `GH_TOKEN`
+to `gh`, so GraphQL-backed checks do not silently use the machine's active
+account.
+
 The installer also loads an Aqua-session outbox drainer every five minutes.
 Background reporters remain queue-only; the drainer is the single serialized
 process allowed to drive Messages, so reports survive both producer failures
@@ -252,7 +258,7 @@ The worker (`evolve_worker.py`, `com.rapp.evolve-worker`, every 30 min):
 | protected reviewed-PNG provenance | an `azure-reviewed-png` PR persists its URL/number before reading exit-zero `gh pr view --json statusCheckRollup,mergeStateStatus,state`; only the exact CheckRun job `Verify controller provenance` from workflow `Reviewed PNG provenance` is classified. After exact success the complete rollup is read again, and only `CLEAN` permits `gh pr merge`; `BLOCKED`, `BEHIND`, pending checks, and inspection/non-JSON failure durably retain the PR in `checks-pending`. Absence is never success; a lone `CANCELLED` gets the same bounded grace for a cancel-in-progress replacement, while a pending exact replacement remains pending. Expired absence/cancellation and explicit failure/timed-out/action-required/stale results abort only after non-merge is proved |
 | reconciliation | a cycle killed between `gh pr merge` and the ledger write is finished (or its PR closed) on the next pass, from the PR and `origin/main` |
 | continuity that migrates | the creative ledger's current cycle is read canonically — `cycle`, else `last_cycle`, else a validated `cycles[]` — and fields that disagree fail closed rather than guessing. History is a strictly ordered contiguous run: a prefix from cycle 1, or a bounded tail that must carry an explicit counter, be exactly `creative_history_limit` long and end at that counter. Reader and writer share one constant, so the state written after cycle 50 is state the worker can still read. A rejected attempt is a failed spend that leaves public continuity alone |
-| liveness | every pass writes a heartbeat, and `w_evolve_worker` reports enabled-but-never-loaded or stale |
+| liveness | every pass writes a heartbeat, and `w_evolve_worker` reports enabled-but-never-loaded or stale; broken repeated skips fail after `max(three intervals, evolve_worker.stall_hours)` while health-gate/budget/STOP/cadence skips remain by-design |
 | bounded sub-sentinel fan-out | optional: 3-5 read-only children in separate processes with no repo, no token and no ability to spawn children, aggregated deterministically into exactly 10 finalists — see below |
 | deterministic gate | exactly **two root-level regular files** (`lstat`: no symlink, no hardlink, no fifo, not executable, nothing nested) in one new `submissions/<slug>/`, valid slug/schema/kind/extension/license, piece within the configured bounded cap (50 KB by default), SVG parses with no script, no `on*` handler and no external reference (including CSS), and `_dada_cycle` proving 1-5 rounds of **exactly 10** scored candidates whose round one reproduces the finalist records by digest |
 | one repository, two names | the configured `repo` is normalised once: a validated transport URL for git, and `[HOST/]OWNER/REPO` for gh. `owner/name`, a full `https://` URL and a `.git` suffix all describe the same repository — before this, a URL config passed the auth preflight and then died at `gh pr create --repo https://…` |

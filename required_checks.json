@@ -8,6 +8,7 @@
     "channel",
     "config_integrity",
     "eco_sweep",
+    "gh_identity",
     "gh_status",
     "ip_hygiene",
     "page_fetch",
@@ -187,6 +188,10 @@
     },
     "config_integrity": {
       "domain": "self",
+      "kind": "consistency"
+    },
+    "gh_identity": {
+      "domain": "github",
       "kind": "consistency"
     }
   },
