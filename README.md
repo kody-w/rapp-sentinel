@@ -111,6 +111,11 @@ set `"gh_user": "account-name"`. The checks resolve
 to `gh`, so GraphQL-backed checks do not silently use the machine's active
 account.
 
+`"current_grace_hours"` (default 72) controls `w_sentinel_current`: ahead and
+freshly-diverged local work stay ok, but a running checkout that lacks older
+commits already merged to `origin/main` warns that repairs are not reaching the
+process.
+
 The installer also loads an Aqua-session outbox drainer every five minutes.
 Background reporters remain queue-only; the drainer is the single serialized
 process allowed to drive Messages, so reports survive both producer failures
