@@ -183,7 +183,7 @@ class SilenceBreakerProof(unittest.TestCase):
         self.assertIn("notification_mode=art-only", text)
         self.assertIn("Next reminder in 48h", text)
         self.assertLessEqual(len(text), 700)
-        self.assertEqual("silence-breaker", q[0]["dedupe_key"].split(":")[0])
+        self.assertNotIn("dedupe_key", q[0])
         self.assertEqual(48, self.state()["window_hours"])
         self.assertEqual("paged", self.alerts()[-1]["decision"])
         self.assertIn("silence breaker", self.alerts()[-1]["reason"])
@@ -250,12 +250,165 @@ class SilenceBreakerProof(unittest.TestCase):
         disabled = dict(self.cfg, silence_breaker_hours=0)
         self.assertFalse(S.silence_breaker(disabled, self.verdict()))
 
+    def test_quiet_switches_are_ledgered_once_per_window_not_every_tick(self):
+        off = dict(self.cfg, notification_mode="off")
+        for _ in range(4):
+            self.assertFalse(S.silence_breaker(off, self.verdict()))
+            self.current += timedelta(minutes=15)
+        decisions = lambda: [a["decision"] for a in self.alerts()]
+        self.assertEqual(1, decisions().count("muted"))
+        self.current += timedelta(hours=24)
+        self.assertFalse(S.silence_breaker(off, self.verdict()))
+        self.assertEqual(2, decisions().count("muted"))
+        self.assertEqual([], self.queue())
+
+        ack = dict(self.cfg, silence_ack_reason="known outage",
+                   silence_ack_until=(self.current + timedelta(days=3)).isoformat())
+        for _ in range(4):
+            self.assertFalse(S.silence_breaker(ack, self.verdict()))
+            self.current += timedelta(minutes=15)
+        self.assertEqual(1, decisions().count("suppressed"))
+        # An acknowledgement records nothing while no breaker would be due.
+        (STATE / "silence-breaker.json").unlink()
+        self.write_sent(self.current - timedelta(hours=2), "recent")
+        before = len(self.alerts())
+        self.assertFalse(S.silence_breaker(ack, self.verdict()))
+        self.assertEqual(before, len(self.alerts()))
+
     def test_never_delivered_gets_first_instance_grace(self):
         (STATE / "outbox-sent.jsonl").unlink()
         self.write_chain(hours=(2,), statuses=("critical",))
         self.assertFalse(S.silence_breaker(self.cfg, self.verdict()))
         self.write_chain(hours=(30,), statuses=("critical",))
         self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))
+
+    def test_lost_state_file_cannot_swallow_a_breaker(self):
+        # Review repro: keys were `silence-breaker:<digest>:<count>`; losing
+        # the state file restarted the count, enqueue() refused the key a
+        # dead-lettered breaker already held, notify() still said True, and
+        # ~13 days went silent.
+        for _ in range(3):
+            self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))
+            self.dead_letter_queue()
+            (STATE / "silence-breaker.json").unlink()
+        self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))
+        self.assertEqual(1, len(self.queue()))
+
+    def dead_letter_queue(self):
+        """Move queued entries to the dead-letter ledger exactly as
+        watcher_outbox.fail() does after its final attempt."""
+        import outbox
+        import watcher_outbox as W
+        lines = (STATE / "outbox.jsonl").read_text(encoding="utf-8").splitlines()
+        for raw in [line for line in lines if line.strip()]:
+            message = json.loads(raw)
+            digest = W._digest(raw)
+            W._append_durable(outbox.DEAD_LETTER, {
+                **message,
+                "entry_id": outbox._queue_entry_identity(message, digest),
+                "queue_sha256": digest,
+                "failed_at": outbox.now(),
+                "attempts": W.MAX_ATTEMPTS,
+                "reason": "fixture: Messages did not confirm delivery"})
+        (STATE / "outbox.jsonl").unlink()
+
+    def test_outbox_quarantine_incident_does_not_block_the_breaker(self):
+        # Review repro: one malformed terminal-ledger line is an incident that
+        # blocks every dedupe-keyed enqueue until an operator resolves it.
+        import outbox
+        with (STATE / "outbox-sent.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write('{"torn": \n')
+        with self.assertRaises(outbox.DedupeAmbiguityError):
+            outbox.enqueue("keyed probe", self.cfg["notify_handle"],
+                           dedupe_key="probe:1")
+        self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))
+        texts = [m["text"] for m in self.queue()]
+        self.assertEqual(1, len(texts), texts)
+        self.assertIn("36 days without a message", texts[0])
+
+    def test_unreadable_ledger_line_does_not_erase_proven_deliveries(self):
+        with (STATE / "outbox-sent.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write('{"torn": \n["not a record"]\n')
+        self.assertEqual(self.current - timedelta(days=36),
+                         S._last_delivered_at(self.cfg["notify_handle"]))
+
+    def test_only_sends_to_the_operator_count_and_unverified_ones_do(self):
+        other = "+15555550199"
+        self.write_jsonl(STATE / "outbox-sent.jsonl", [
+            {"entry_id": "1" * 32, "to": self.cfg["notify_handle"], "text": "old",
+             "sent_at": (self.current - timedelta(days=36)).isoformat(timespec="seconds")},
+            {"entry_id": "3" * 32, "to": other, "text": "nightwatch report",
+             "sent_at": (self.current - timedelta(hours=2)).isoformat(timespec="seconds")},
+        ])
+        self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))
+        (STATE / "outbox.jsonl").unlink()
+        (STATE / "silence-breaker.json").unlink()
+        # Messages accepted it but chat.db could not confirm: the operator was
+        # most likely told, and alert_delivery reports the unverified send.
+        self.write_jsonl(STATE / "outbox-unverified.jsonl", [{
+            "entry_id": "4" * 32, "to": self.cfg["notify_handle"], "text": "🔕 breaker",
+            "attempted_at": (self.current - timedelta(hours=2)).isoformat(timespec="seconds"),
+            "reason": "Messages accepted the send but chat.db was unreadable"}])
+        self.assertFalse(S.silence_breaker(self.cfg, self.verdict()))
+        self.assertEqual([], self.queue())
+
+    def test_anything_already_queued_to_the_operator_defers_the_breaker(self):
+        # e.g. the state-change alert main() enqueued earlier in this tick
+        self.write_jsonl(STATE / "outbox.jsonl", [{
+            "entry_id": "5" * 32, "at": self.current.isoformat(timespec="seconds"),
+            "to": self.cfg["notify_handle"], "text": "⚠️ degraded → critical",
+            "attachments": []}])
+        self.assertFalse(S.silence_breaker(self.cfg, self.verdict()))
+        self.assertEqual(1, len(self.queue()))
+        self.assertFalse((STATE / "silence-breaker.json").exists())
+
+    def test_healthy_tick_resets_backoff_so_a_relapse_is_told_promptly(self):
+        # Review repro: four pages backed off to 168h; after a recovery the
+        # same failing set relapsed and waited up to a week.
+        for gap in (0, 48, 96, 168):
+            self.current += timedelta(hours=gap)
+            self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))
+            (STATE / "outbox.jsonl").unlink()
+        self.assertEqual(168, self.state()["window_hours"])
+        self.current += timedelta(hours=12)
+        self.assertFalse(S.silence_breaker(self.cfg, self.verdict("healthy")))
+        self.assertEqual("", self.state()["fingerprint"])
+        self.assertEqual(24, self.state()["window_hours"])
+        self.current += timedelta(hours=24)  # 36h after the last page
+        self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))
+        self.assertEqual(48, self.state()["window_hours"])
+
+    def test_invalid_mode_mutes_operational_alerts_but_not_the_breaker(self):
+        typo = dict(self.cfg, notification_mode="art_only")
+        self.assertFalse(S.notification_allowed(typo, "operational"))
+        self.assertTrue(S.silence_breaker(typo, self.verdict()))
+        text = self.queue()[0]["text"]
+        self.assertIn("notification_mode='art_only' is not all/art-only/off", text)
+        self.assertLessEqual(len(text), 700)
+
+    def test_crashing_tick_breaks_silence_in_quiet_mode(self):
+        with mock.patch.object(S, "config", return_value=self.cfg):
+            S.report_crash(SyntaxError("invalid syntax (checks.py, line 1)"))
+        self.assertEqual("crashed", S.load_json(STATE / "last_run.json", {})["status"])
+        q = self.queue()
+        self.assertEqual(1, len(q), q)
+        self.assertIn("Local machinery: sentinel_tick (tick crashed: SyntaxError", q[0]["text"])
+        decisions = [a["decision"] for a in self.alerts()]
+        self.assertEqual(["muted", "paged"], decisions[-2:])
+
+        # In "all" mode the crash alert itself is queued, and the breaker
+        # waits behind it instead of doubling up.
+        (STATE / "outbox.jsonl").unlink()
+        (STATE / "silence-breaker.json").unlink()
+        loud = dict(self.cfg, notification_mode="all")
+        import standup
+        with mock.patch.object(S, "config", return_value=loud), \
+                mock.patch.object(standup, "portable_snapshot", return_value={}), \
+                mock.patch.object(standup, "publish_snapshot", return_value=[]):
+            S.report_crash(RuntimeError("boom"))
+        q = self.queue()
+        self.assertEqual(1, len(q), q)
+        self.assertIn("CRASHED: RuntimeError: boom", q[0]["text"])
 
     def test_main_wraps_breaker_after_state_change_notify_before_level_zero(self):
         S.save_json(STATE / "last_run.json", {"status": "healthy"})

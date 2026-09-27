@@ -31,7 +31,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import hashlib
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -161,8 +160,11 @@ def log(msg):
 def notification_allowed(cfg, kind="operational"):
     mode = str(cfg.get("notification_mode") or "all").strip().lower()
     if mode not in ("all", "art-only", "off"):
-        log(f"invalid notification_mode={mode!r}; failing closed to off")
-        return False
+        # Only an explicit "off" may silence trouble: a typo is not a choice,
+        # so the silence breaker still passes (config_integrity names the typo).
+        log(f"invalid notification_mode={mode!r}; failing closed to off"
+            + (" (silence breaker still allowed)" if kind == "silence" else ""))
+        return kind == "silence"
     if mode == "off":
         return False
     return mode == "all" or kind in ("art", "silence")
@@ -405,33 +407,63 @@ def _parse_time(value):
 
 
 def _jsonl_records(path):
+    """Parse a JSONL ledger, skipping (and counting) unreadable lines.
+
+    A torn tail line must not erase every delivery the ledger does prove.
+    """
     try:
-        return [json.loads(line) for line in Path(path).read_text(
-            encoding="utf-8").splitlines() if line.strip()]
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
         return []
     except Exception as exc:
         log(f"silence breaker could not read {Path(path).name}: {type(exc).__name__}: {exc}")
         return []
+    records, bad = [], 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            bad += 1
+            continue
+        if isinstance(value, dict):
+            records.append(value)
+    if bad:
+        log(f"silence breaker skipped {bad} unreadable line(s) in {Path(path).name}")
+    return records
 
 
-def _last_delivered_at():
-    """Last operator delivery from outbox.SENT.
+def _last_delivered_at(to):
+    """Last send to the operator (`to`) that Messages accepted.
 
     `outbox._append_sent()` writes one terminal JSONL record with the original
     queue fields (`entry_id`, `at`, `to`, `text`, `attachments`, optional
     `dedupe_key`) plus `sent_at`. `watcher_outbox.acknowledge()` uses that same
     helper, so Aqua-session deliveries count without a second ledger. We do not
-    read chat.db here; the sent ledger is the durable delivery source of truth.
+    read chat.db here; the terminal ledgers are the durable source of truth.
+
+    UNVERIFIED rows (`attempted_at`) count too: Messages accepted the send but
+    chat.db could not confirm it (a watcher without Full Disk Access records
+    every send that way, as the Dada Collective's did in 2026-08). Ignoring them
+    would make each breaker the operator did receive look like more silence;
+    alert_delivery already reports the unverified send itself. Rows to other
+    recipients (report_number) never count: that is not the operator hearing.
     """
     try:
         import outbox
-        records = _jsonl_records(outbox.SENT)
+        ledgers = ((outbox.SENT, "sent_at"), (outbox.UNVERIFIED, "attempted_at"))
     except Exception as exc:
         log(f"silence breaker could not open sent ledger: {type(exc).__name__}: {exc}")
         return None
-    times = [_parse_time(r.get("sent_at")) for r in records]
-    times = [t for t in times if t is not None]
+    times = []
+    for path, field in ledgers:
+        for record in _jsonl_records(path):
+            if to and record.get("to") != to:
+                continue
+            t = _parse_time(record.get(field))
+            if t is not None:
+                times.append(t)
     return max(times) if times else None
 
 
@@ -460,8 +492,8 @@ def _first_reliable_instance_at():
     return min(candidates) if candidates else now()
 
 
-def _silence_reference_at():
-    delivered = _last_delivered_at()
+def _silence_reference_at(to):
+    delivered = _last_delivered_at(to)
     return delivered if delivered else _first_reliable_instance_at()
 
 
@@ -484,16 +516,22 @@ def _silence_fingerprint(verdict):
                             if c.get("id")}))
 
 
-def _pending_silence_breaker():
+def _pending_operator_message(to):
+    """Is something already queued to the operator?
+
+    If so it is about to break the silence itself (a state-change or crash
+    alert enqueued earlier in this same tick, a prior breaker, an art receipt),
+    and a breaker behind it would arrive saying "N days without a message"
+    right after one. The queue is FIFO, so a stuck entry would block a breaker
+    queued behind it anyway; waiting loses nothing.
+    """
     try:
         import outbox
         records = _jsonl_records(outbox.QUEUE)
     except Exception:
         return False
-    for record in records:
-        if str(record.get("dedupe_key") or "").startswith("silence-breaker:"):
-            return True
-    return False
+    return any(record.get("to") == to or str(record.get("dedupe_key") or "")
+               .startswith("silence-breaker:") for record in records)
 
 
 def _unhealthy_since():
@@ -548,18 +586,29 @@ def _own_machinery_id(cid):
 SELF_BLIND_IDS = {"gh_identity"}
 
 
+def _is_self_blind(cid, detail):
+    if cid in SELF_BLIND_IDS:
+        return True
+    try:
+        # Imported lazily and guarded: the crash path runs the breaker, and a
+        # broken helper module must not silence the page about the breakage.
+        import cooldown
+        return bool(cooldown.is_self_blindness(f"{cid}: {detail}"))
+    except Exception:
+        return False
+
+
 def _group_failing_checks(checks):
     """Split failing checks into platform findings, blindness, and local machinery.
 
     Root-cause blindness checks (gh_identity) sort first in their group, so a
     shortened message still names why the other checks cannot see.
     """
-    import cooldown
     groups = {"platform": [], "blind": [], "own": []}
     for check in checks:
         cid = str(check.get("id") or "")
         detail = str(check.get("detail") or "")
-        if cid in SELF_BLIND_IDS or cooldown.is_self_blindness(f"{cid}: {detail}"):
+        if _is_self_blind(cid, detail):
             groups["blind"].append(check)
         elif _own_machinery_id(cid):
             groups["own"].append(check)
@@ -599,7 +648,10 @@ def _silence_message(cfg, verdict, silence_hours, next_window):
     groups = _group_failing_checks(_failing_checks(verdict))
     mode = str(cfg.get("notification_mode") or "all").strip().lower()
     footer = []
-    if mode != "all":
+    if mode not in ("all", "art-only", "off"):
+        footer.append(f"Why you haven't heard: notification_mode={mode!r} is not "
+                      "all/art-only/off, so operational alerts fail closed.")
+    elif mode != "all":
         footer.append(f"Why you haven't heard: notification_mode={mode} suppresses operational alerts.")
     footer.append(f"Next reminder in {int(next_window)}h if nothing changes. "
                   "Pause: set silence_ack_until in config.json.")
@@ -653,19 +705,19 @@ def silence_breaker(cfg, verdict):
         return False
 
     status = str(verdict.get("status") or "").lower()
+    if status == "healthy":
+        _reset_silence_backoff(base)
+        return False
     multiplier = 1 if status == "critical" else 3 if status == "degraded" else None
     if multiplier is None:
         return False
-
-    ack_until = _parse_time(cfg.get("silence_ack_until"))
-    if ack_until and now() < ack_until:
-        reason = (f"silence breaker acknowledged until {ack_until.isoformat()}"
-                  f": {str(cfg.get('silence_ack_reason') or '').strip()[:160]}")
-        log(reason)
-        _record_silence_suppressed(cfg, verdict, "suppressed", reason)
+    to = cfg.get("notify_handle")
+    if not cfg.get("notify") or not to:
+        # notify() would drop it anyway: this copy has notifications off or
+        # has nobody to tell.
         return False
 
-    ref = _silence_reference_at()
+    ref = _silence_reference_at(to)
     silence_hours = max(0.0, (now() - ref).total_seconds() / 3600)
     threshold = base * multiplier
     if silence_hours < threshold:
@@ -674,20 +726,13 @@ def silence_breaker(cfg, verdict):
     fp = _silence_fingerprint(verdict)
     if not fp:
         return False
-    if _pending_silence_breaker():
-        log("silence breaker pending in outbox; not enqueueing another")
-        return False
-
-    mode = str(cfg.get("notification_mode") or "all").strip().lower()
-    if mode == "off":
-        text = _silence_message(cfg, verdict, silence_hours, base)
-        _record_muted_alert(
-            cfg, text, "silence",
-            "notification_mode=off disabled the silence breaker by explicit owner choice")
-        log("silence breaker muted by notification_mode=off")
+    if _pending_operator_message(to):
+        log("silence breaker deferred: a message to the operator is already queued")
         return False
 
     state = load_json(SILENCE_BREAKER_STATE, {})
+    if not isinstance(state, dict):
+        state = {}
     last_sent = _parse_time(state.get("last_sent_at"))
     prior_fp = str(state.get("fingerprint") or "")
     try:
@@ -699,14 +744,41 @@ def silence_breaker(cfg, verdict):
     if last_sent and (now() - last_sent).total_seconds() < due_window * 3600:
         return False
 
+    # A breaker is due. The owner's two quiet switches still win, but each is
+    # ledgered once per window per failing set rather than on every tick.
+    ack_until = _parse_time(cfg.get("silence_ack_until"))
+    if ack_until and now() < ack_until:
+        reason = (f"silence breaker acknowledged until {ack_until.isoformat()}"
+                  f": {str(cfg.get('silence_ack_reason') or '').strip()[:160]}")
+        if _quiet_record_due(state, "suppressed", fp, base):
+            log(reason)
+            _record_silence_suppressed(cfg, verdict, "suppressed", reason)
+        return False
+    mode = str(cfg.get("notification_mode") or "all").strip().lower()
+    if mode == "off":
+        if _quiet_record_due(state, "muted", fp, base):
+            text = _silence_message(cfg, verdict, silence_hours, base)
+            _record_muted_alert(
+                cfg, text, "silence",
+                "notification_mode=off disabled the silence breaker by explicit owner choice")
+            log("silence breaker muted by notification_mode=off")
+        return False
+
     unchanged = bool(prior_fp and prior_fp == fp)
-    count = int(state.get("count") or 0) + 1
+    try:
+        count = int(state.get("count") or 0) + 1
+    except (TypeError, ValueError):
+        count = 1
     next_window = min((window * 2 if unchanged or not prior_fp else base * 2),
                       SILENCE_BREAKER_MAX_WINDOW_HOURS)
     text = _silence_message(cfg, verdict, silence_hours, next_window)
-    digest = hashlib.sha256(fp.encode("utf-8")).hexdigest()[:24]
-    ok = notify(cfg, text, kind="silence", attach_report=False,
-                dedupe_key=f"silence-breaker:{digest}:{count}")
+    # No dedupe key. Its uniqueness hung on this state file: a lost or torn
+    # file restarted the count and replayed keys the outbox had already seen,
+    # so enqueue() refused while notify() reported success. And an outbox
+    # quarantine incident blocks every keyed enqueue — exactly when a human is
+    # most needed. The window below and the pending-queue guard above already
+    # prevent duplicates.
+    ok = notify(cfg, text, kind="silence", attach_report=False)
     if ok:
         save_json(SILENCE_BREAKER_STATE, {
             "last_sent_at": now().isoformat(timespec="seconds"),
@@ -716,6 +788,49 @@ def silence_breaker(cfg, verdict):
         })
         log(f"silence breaker queued ({fp}; next {next_window:.0f}h)")
     return ok
+
+
+def _quiet_record_due(state, decision, fp, base):
+    """True (and remembered) at most once per window per decision and failing set."""
+    quiet = state.get("quiet") if isinstance(state.get("quiet"), dict) else {}
+    last = _parse_time(quiet.get("at"))
+    if (quiet.get("decision") == decision and quiet.get("fingerprint") == fp
+            and last and (now() - last).total_seconds() < base * 3600):
+        return False
+    state["quiet"] = {"decision": decision, "fingerprint": fp,
+                      "at": now().isoformat(timespec="seconds")}
+    save_json(SILENCE_BREAKER_STATE, state)
+    return True
+
+
+def _reset_silence_backoff(base):
+    """A healthy tick ends the incident, so the next trouble is news again.
+
+    Without this, a 168h backoff earned by one incident outlived its recovery,
+    and a relapse with the same failing checks waited up to a week to be told.
+    """
+    state = load_json(SILENCE_BREAKER_STATE, {})
+    if not isinstance(state, dict) or not state.get("fingerprint"):
+        return
+    state.update({"fingerprint": "", "window_hours": base,
+                  "reset_at": now().isoformat(timespec="seconds")})
+    save_json(SILENCE_BREAKER_STATE, state)
+    log("silence breaker backoff reset: estate healthy")
+
+
+def crash_verdict(detail):
+    """The verdict a crashed tick never wrote, so the silence breaker can speak.
+
+    The crash alert itself is operational, and quiet modes mute it; without
+    this, a sentinel that crashed every tick in art-only mode stayed silent
+    forever.
+    """
+    check = {"id": "sentinel_tick", "ok": False, "severity": "critical",
+             "detail": f"tick crashed: {detail}"[:200]}
+    return {"generated": now().isoformat(timespec="seconds"),
+            "status": "critical", "checks": [check],
+            "failed": ["sentinel_tick"], "critical": ["sentinel_tick"],
+            "summary": check["detail"]}
 
 
 # ── guardrails ──────────────────────────────────────────────────────────────
@@ -1812,6 +1927,50 @@ def main():
     return 0
 
 
+def report_crash(e):
+    """Record and announce a tick that raised.
+
+    A crash used to be silent in every way that matters: the message went
+    to a log file nobody tails, last_run.json kept its old timestamp, and
+    the only staleness check (w_sentinel_fresh) lives INSIDE the process
+    that just died. Verified by breaking checks.py: exit 1, heartbeat
+    frozen at the previous tick, no notification of any kind.
+
+    So the crash path now does the two things the healthy path does:
+    records that it happened, and says so out loud.
+    """
+    detail = f"{type(e).__name__}: {e}"
+    log(f"sentinel crashed: {detail}")
+    try:
+        save_json(STATE / "last_run.json", {
+            "at": now().isoformat(timespec="seconds"),
+            "status": "crashed",
+            "failed": ["sentinel_tick"],
+            "summary": f"tick raised {detail}"[:400],
+        })
+    except Exception as inner:
+        log(f"could not record the crash heartbeat: {inner}")
+    cfg = None
+    try:
+        # enqueue(), not send(): the queue survives a delivery path that is
+        # itself broken, which is the likeliest thing to be broken here.
+        # Routed through notify() so it still honours cfg["notify"] -- an
+        # earlier draft called outbox directly and would have texted from
+        # any copy of this repo with notifications deliberately turned off.
+        cfg = config()
+        notify(cfg, f"\U0001F534 {instance_name(cfg)} CRASHED: {detail}"[:600])
+    except Exception as inner:
+        log(f"could not queue the crash alert: {inner}")
+    if cfg is not None:
+        # Quiet modes mute the crash alert above; a tick that crashes
+        # every run must still break the silence.
+        try:
+            silence_breaker(cfg, crash_verdict(detail))
+        except Exception as inner:
+            log(f"silence breaker failed after the crash: "
+                f"{type(inner).__name__}: {inner}")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["diagnose"]:
         # Read-only dependency page (#4). Dispatched before the tick so the
@@ -1821,33 +1980,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except Exception as e:
-        # A crash used to be silent in every way that matters: the message went
-        # to a log file nobody tails, last_run.json kept its old timestamp, and
-        # the only staleness check (w_sentinel_fresh) lives INSIDE the process
-        # that just died. Verified by breaking checks.py: exit 1, heartbeat
-        # frozen at the previous tick, no notification of any kind.
-        #
-        # So the crash path now does the two things the healthy path does:
-        # records that it happened, and says so out loud.
-        detail = f"{type(e).__name__}: {e}"
-        log(f"sentinel crashed: {detail}")
-        try:
-            save_json(STATE / "last_run.json", {
-                "at": now().isoformat(timespec="seconds"),
-                "status": "crashed",
-                "failed": ["sentinel_tick"],
-                "summary": f"tick raised {detail}"[:400],
-            })
-        except Exception as inner:
-            log(f"could not record the crash heartbeat: {inner}")
-        try:
-            # enqueue(), not send(): the queue survives a delivery path that is
-            # itself broken, which is the likeliest thing to be broken here.
-            # Routed through notify() so it still honours cfg["notify"] -- an
-            # earlier draft called outbox directly and would have texted from
-            # any copy of this repo with notifications deliberately turned off.
-            cfg = config()
-            notify(cfg, f"\U0001F534 {instance_name(cfg)} CRASHED: {detail}"[:600])
-        except Exception as inner:
-            log(f"could not queue the crash alert: {inner}")
+        report_crash(e)
         sys.exit(1)
