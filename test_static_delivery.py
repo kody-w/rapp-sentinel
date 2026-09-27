@@ -1639,5 +1639,31 @@ class MessageContentTests(unittest.TestCase):
         self.assertEqual("escalation", transcript_kind)
 
 
+class WindowsDirectoryDurabilityTests(unittest.TestCase):
+    """Windows cannot os.open() a directory; the alert path must not depend on it."""
+
+    def test_directory_fsync_is_skipped_on_windows(self):
+        target = Path(tempfile.gettempdir())
+        refused = PermissionError(13, "Permission denied")
+        with mock.patch.object(outbox.os, "name", "nt"), \
+                mock.patch.object(outbox.os, "open", side_effect=refused) as opened:
+            outbox._fsync_directory(target)
+        opened.assert_not_called()
+
+    def test_enqueue_survives_a_platform_that_refuses_directory_opens(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            isolated = {name: root / value.relative_to(outbox.STATE)
+                        for name, value in vars(outbox).items()
+                        if isinstance(value, Path) and outbox.STATE in value.parents}
+            isolated["STATE"] = root
+            with mock.patch.multiple(outbox, **isolated), \
+                    mock.patch.object(outbox.os, "name", "nt"):
+                outbox.enqueue("a Windows alert must still queue", "recipient")
+                lines = outbox.QUEUE.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(1, len(lines))
+        self.assertEqual("a Windows alert must still queue", json.loads(lines[0])["text"])
+
+
 if __name__ == "__main__":
     unittest.main()
