@@ -15,6 +15,8 @@ appends ONE frame to an append-only chain (`state/alerts.jsonl`), whatever it de
     alert.suppressed   the same failing-check set was already reported (cooldown)
     alert.blind        every finding was the watcher failing to observe — recorded,
                        never paged; this is a defect in the WATCHER
+    alert.muted        configuration explicitly rejected the message (for example
+                       notification_mode=off, or art-only rejecting operational)
     alert.resolved     a previously-alerting condition is now green
 
 That chain answers, for free and forever: how many times did this condition fire, how
@@ -84,7 +86,7 @@ def record(kind: str, instance: str, fingerprint: str, text: str,
         except Exception:
             who = {}
         payload = {
-            "decision": kind,                    # paged | suppressed | blind | resolved
+            "decision": kind,                    # paged | suppressed | blind | muted | resolved
             "instance": instance,
             # WHO said it, from WHERE, running WHAT code — the three facts the estate
             # could not answer during the 2026-08-25 alert-noise incident.
@@ -134,6 +136,7 @@ def history(fingerprint: str, instance: str = "sentinel") -> dict:
         "paged": sum(1 for p in mine if p["decision"] == "paged"),
         "suppressed": sum(1 for p in mine if p["decision"] == "suppressed"),
         "blind": sum(1 for p in mine if p["decision"] == "blind"),
+        "muted": sum(1 for p in mine if p["decision"] == "muted"),
         "first_at": mine[0]["at"] if mine else None,
         "last_at": mine[-1]["at"] if mine else None,
     }
@@ -146,7 +149,7 @@ def digest(instance: str = "sentinel", hours: float = 24.0) -> dict:
     except Exception as e:
         return {"error": str(e)[:120]}
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=hours)
-    out = {"paged": 0, "suppressed": 0, "blind": 0, "resolved": 0,
+    out = {"paged": 0, "suppressed": 0, "blind": 0, "muted": 0, "resolved": 0,
            "blind_checks": {}, "window_hours": str(hours)}
     for f in frames:
         p = f["payload"]

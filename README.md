@@ -315,7 +315,9 @@ RAPP Vision: https://kody-w.github.io/rapp-vision/#/watch/nine-sworn-assurances
   behalf, because a summary nobody wrote is a claim nobody made.
 - `notification_mode: "art-only"` suppresses nightwatch, health transitions,
   diagnostics, and private static-report links while retaining this one final
-  deployment receipt.
+  deployment receipt. It does **not** suppress
+  [the silence breaker](#the-silence-breaker): quiet mode may hide calm, never
+  trouble.
 
 Nothing else sends it. `SENTINEL_RESULT: CONTRIBUTED` does not; a PR that was
 opened does not; an abort after the PR does not. The message is built inside
@@ -678,6 +680,7 @@ All enforced **before** a model is invoked.
 | per-check attempt cap → escalate to human | infinite retry or repeated cap alerts on something unfixable |
 | worktree isolation | destroying a working tree with uncommitted work |
 | notify on **state change only** | alert fatigue — a muted watcher is no watcher |
+| silence breaker | quiet modes and "state change only" hiding an outage for weeks |
 | **re-probe after repair** | believing a fix landed when it didn't |
 
 That last one is the difference between self-healing and self-reporting. It re-runs the *same* check and only claims `verified fixed` when what failed now passes.
@@ -697,6 +700,55 @@ add together, and the newest attempt timestamp and result survive.
 Existing `check:` records are not re-migrated; `smoke:` and `evolve:` records stay untouched.
 Sorted batch keys remain in logs and events for correlation, not throttling.
 Offline proof: `python3 prove_per_check_throttle.py`.
+
+### The silence breaker
+
+The tick normally notifies only on status change, because a watcher that texts
+every tick gets muted. A live Dada Collective incident proved the missing case:
+`notification_mode: "art-only"` plus `notify_queue_only: true` produced 36 days
+without an operator-visible message while 3,016/3,484 verdicts were critical,
+"needs a human" was logged 2,903 times, diagnose found root causes, and two
+checks were blind. Silence was not provable because mode-muted operational
+messages never reached the alert ledger; they are now recorded as
+`alert.muted`.
+
+`silence_breaker_hours` (default `24`, `0` disables) runs every tick after the
+ordinary state-change notice, and from the crash handler with a synthetic
+critical `sentinel_tick` verdict, so a tick that crashes every run still
+speaks. Silence is the time since the last send to `notify_handle` that
+Messages accepted: `state/outbox-sent.jsonl` (`sent_at`) or
+`state/outbox-unverified.jsonl` (`attempted_at`; `alert_delivery` reports the
+missing verification itself). Sends to other recipients do not count. If the
+operator has never been sent anything, the grace clock starts at the first
+copilot neighbor chain frame or when the breaker first evaluated on this
+instance (persisted once as `first_seen_at`), whichever is earlier, so even an
+instance that crashes from birth pages after one grace period. It pages after
+that many quiet hours of `critical`, or 3× that many hours of `degraded`.
+
+A breaker is compact plain text (at most 700 characters, no static report):
+how long it has been quiet and unhealthy, the failing checks grouped as
+platforms / blindness / local machinery, why the operator has not heard, and
+how to pause it. It passes in `notification_mode: "all"` and `"art-only"`, and
+under an unrecognized mode too: operational alerts fail closed on a typo, but
+only an explicit `"off"` silences trouble (recorded as `alert.muted`;
+`config_integrity` names the typo).
+
+Cadence lives in `state/silence-breaker.json`: one page per window, doubling
+while the failing check set is unchanged (`24h → 48h → 96h`, capped at 7 days),
+and resetting when the set changes or a healthy tick ends the incident.
+Anything already queued to the operator (a state-change or crash alert from the
+same tick, a prior breaker) defers it, because that message breaks the silence
+itself. Each decision (read, enqueue, persist) runs under
+`state/silence-breaker.lock`; an overlapping tick that finds it held skips
+rather than doubling up. Breakers carry no dedupe key: the window, the
+pending-queue guard and that lock already prevent duplicates, and keyed
+enqueues fail closed during an outbox quarantine incident, exactly when a human
+is most needed. To acknowledge a
+known outage without turning the guard off, set `silence_ack_until` to an ISO
+date/datetime and optionally `silence_ack_reason`; until then each due breaker
+is ledgered as suppressed (once per window, like `off`'s `alert.muted`), and
+reminders resume automatically afterwards. Offline proof:
+`python3 prove_silence_breaker.py`.
 
 ---
 
