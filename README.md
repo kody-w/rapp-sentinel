@@ -261,7 +261,7 @@ The worker (`evolve_worker.py`, `com.rapp.evolve-worker`, every 30 min):
 | child replies are typed | children run with `--output-format=json` and are read only from the final `assistant.message` event — never reasoning, which contains the same JSON. One unparseable reply earns exactly one format-repair process if the deadline and process cap allow (`format_repair_attempts` is 0 or 1 — anything else is a configuration error, not a clamp); it is debited as a spend, recorded, and every attempt's transcript is kept outside the disposable workspace |
 | controller-owned publish | the branch, commit, PR, PR **file scope as GitHub reports it**, squash merge, and the re-read of `origin/main` and the merge commit afterwards are all done by code |
 | dual public deployment | optional `rapp_vision` mirrors the exact gated bytes into a RAPP Vision channel after the canonical collective merge; success stays pending until both GitHub Pages experiences answer, and reconciliation retries without spending another model. Once their verified routes are persisted in a digest/profile-bound deployment receipt, a notification-only retry reuses those exact URLs and does not re-probe Pages/CDN |
-| Azure visual studio | `azure-reviewed-png` preflights bounded deployment/model identifiers before model spend, rejects credential material recursively from child/maker/final metadata, turns a maker-authored visual brief into a local GPT Image PNG, validates the complete PNG and inflated scanlines, attaches actual pixels to a tool-less Copilot multimodal art director, regenerates rejected images, and issues a versioned digest-bound receipt only after score, publish decision, and zero-failure review clear the captured bar |
+| Azure visual studio | `azure-reviewed-png` preflights bounded deployment/model identifiers before model spend, rejects credential material recursively from child/maker/final metadata, turns a maker-authored visual brief into a local GPT Image PNG using Entra or an API key read from an environment variable/owner-only file (never inline config), validates the complete PNG and inflated scanlines, attaches actual pixels to a tool-less Copilot multimodal art director, regenerates rejected images, and issues a versioned digest-bound receipt only after score, publish decision, and zero-failure review clear the captured bar |
 | honest outcomes | only a re-read merge sends a 🎨; once the canonical merge command is invoked, a timeout/error remains pending until fresh PR and `origin/main` evidence proves merge or non-merge |
 | one text per deployment | a verified dual deployment durably enqueues exactly one idempotent iMessage: title, one sentence, the Public Art Collective Pages experience, and the RAPP Vision watch experience — no private report or LAN URL |
 
@@ -699,6 +699,9 @@ Periodic Messages updates link to an immutable, tokenized static HTML snapshot
 served only over the Mac's private Tailscale/LAN addresses. The HTML embeds local
 decision transcripts, so it remains readable on a phone that cannot reach
 `localhost:9797`; dashboard and log routes remain loopback-only.
+`serve.py` binds `SENTINEL_DASH_BIND`, defaulting to all interfaces so those
+share links open on a phone; set it to `127.0.0.1` to keep even share links on
+this machine.
 
 ---
 

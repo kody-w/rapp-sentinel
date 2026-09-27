@@ -1688,6 +1688,22 @@ class AzureImagePipelineTests(ScratchCase):
         self.assertIn("failed visual review", str(cm.exception))
         self.assertFalse((self.out / "piece.png").exists())
 
+    def test_api_key_visual_pipeline_does_not_require_azure_cli(self):
+        key = self.home / "azure-image.key"
+        key.write_text("secret-key", encoding="utf-8")
+        key.chmod(0o600)
+        self.wcfg["azure_image"].update({
+            "auth_mode": "api_key",
+            "api_key_env_var": "TEST_AZURE_IMAGE_KEY_MISSING",
+            "api_key_file": str(key),
+        })
+        binary = lambda name: "/usr/bin/copilot" if name == "copilot" else None
+        with mock.patch.object(EW.shutil, "which", side_effect=binary), \
+                mock.patch.dict(
+                    EW.os.environ, {"COPILOT_GITHUB_TOKEN": "test-token"}):
+            status = EW.assert_visual_pipeline_ready(self.wcfg)
+        self.assertIn("API key auth ready", status)
+
     def test_final_links_open_in_safari_only_when_enabled(self):
         wcfg = EW.worker_config({"evolve_worker": {
             "azure_image": {

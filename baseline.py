@@ -54,7 +54,8 @@ DEFAULT_ENROLLMENT = {
     "rapp-sentinel": {
         "repo": "https://github.com/kody-w/rapp-sentinel.git",
         "test_cmd": [sys.executable, "-m", "unittest",
-                     "test_static_delivery", "test_ledger_coverage",
+                     "test_azure_art", "test_static_delivery",
+                     "test_ledger_coverage",
                      "test_evolution_policy", "test_evolve_worker",
                      "test_subsentinels", "test_worker_liveness"],
     },

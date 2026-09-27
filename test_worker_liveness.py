@@ -175,7 +175,8 @@ class BaselineEnrolmentTests(unittest.TestCase):
         cmd = self.enrolment()
         modules = [c for c in cmd if c.startswith("test_")]
         self.assertEqual(
-            ["test_static_delivery", "test_ledger_coverage",
+            ["test_azure_art", "test_static_delivery",
+             "test_ledger_coverage",
              "test_evolution_policy", "test_evolve_worker",
              "test_subsentinels", "test_worker_liveness"],
             modules,
