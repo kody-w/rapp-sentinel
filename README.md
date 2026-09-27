@@ -704,9 +704,10 @@ Messages accepted: `state/outbox-sent.jsonl` (`sent_at`) or
 `state/outbox-unverified.jsonl` (`attempted_at`; `alert_delivery` reports the
 missing verification itself). Sends to other recipients do not count. If the
 operator has never been sent anything, the grace clock starts at the first
-copilot neighbor chain frame, falling back to persisted run/verdict timestamps.
-It pages after that many quiet hours of `critical`, or 3× that many hours of
-`degraded`.
+copilot neighbor chain frame or when the breaker first evaluated on this
+instance (persisted once as `first_seen_at`), whichever is earlier, so even an
+instance that crashes from birth pages after one grace period. It pages after
+that many quiet hours of `critical`, or 3× that many hours of `degraded`.
 
 A breaker is compact plain text (at most 700 characters, no static report):
 how long it has been quiet and unhealthy, the failing checks grouped as
@@ -721,9 +722,12 @@ while the failing check set is unchanged (`24h → 48h → 96h`, capped at 7 day
 and resetting when the set changes or a healthy tick ends the incident.
 Anything already queued to the operator (a state-change or crash alert from the
 same tick, a prior breaker) defers it, because that message breaks the silence
-itself. Breakers carry no dedupe key: the window and the pending-queue guard
-already prevent duplicates, and keyed enqueues fail closed during an outbox
-quarantine incident, exactly when a human is most needed. To acknowledge a
+itself. Each decision (read, enqueue, persist) runs under
+`state/silence-breaker.lock`; an overlapping tick that finds it held skips
+rather than doubling up. Breakers carry no dedupe key: the window, the
+pending-queue guard and that lock already prevent duplicates, and keyed
+enqueues fail closed during an outbox quarantine incident, exactly when a human
+is most needed. To acknowledge a
 known outage without turning the guard off, set `silence_ack_until` to an ISO
 date/datetime and optionally `silence_ack_reason`; until then each due breaker
 is ledgered as suppressed (once per window, like `off`'s `alert.muted`), and

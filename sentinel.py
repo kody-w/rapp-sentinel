@@ -467,16 +467,20 @@ def _last_delivered_at(to):
     return max(times) if times else None
 
 
-def _first_reliable_instance_at():
+def _first_reliable_instance_at(first_seen=None):
     """Earliest reliable instance timestamp when no delivery has ever happened.
 
     Preferred source: the copilot neighbor's first hash-chained frame (`utc`).
     That chain is append-only and verified by the normal tick, so it is more
-    trustworthy than filesystem mtimes. Fallbacks are persisted state fields
-    (`last_run.at`, `last_verdict.generated`) and finally "now", which gives a
-    fresh instance its full grace window instead of paging on first boot.
+    trustworthy than filesystem mtimes. Then `first_seen` — when the breaker
+    first evaluated on this instance, persisted once and never moved — then
+    persisted state fields (`last_run.at`, `last_verdict.generated`), and
+    finally "now", which gives a fresh instance its full grace window instead
+    of paging on first boot. `last_run.at` alone is not enough: report_crash()
+    rewrites it every run, so an instance crashing from birth would restart
+    its own grace period forever.
     """
-    candidates = []
+    candidates = [first_seen] if first_seen else []
     for record in _jsonl_records(HOME / "neighborhood" / "copilot" / "chain.jsonl"):
         t = _parse_time(record.get("utc"))
         if t:
@@ -492,9 +496,9 @@ def _first_reliable_instance_at():
     return min(candidates) if candidates else now()
 
 
-def _silence_reference_at(to):
+def _silence_reference_at(to, first_seen=None):
     delivered = _last_delivered_at(to)
-    return delivered if delivered else _first_reliable_instance_at()
+    return delivered if delivered else _first_reliable_instance_at(first_seen)
 
 
 def _failing_checks(verdict):
@@ -703,10 +707,40 @@ def silence_breaker(cfg, verdict):
     if base <= 0:
         log("silence breaker disabled by silence_breaker_hours=0")
         return False
+    # Decide, enqueue and persist under one lock. Without a dedupe key, two
+    # overlapping ticks (launchd plus a manual or scheduler run) could each
+    # see an empty queue and a due window, and both page. A tick that finds
+    # the lock held skips: the holder is making the same decision.
+    try:
+        import filelock
+        STATE.mkdir(parents=True, exist_ok=True)
+        lock_fh = open(STATE / "silence-breaker.lock", "a+", encoding="utf-8")
+    except Exception as exc:
+        log(f"silence breaker lock unavailable ({type(exc).__name__}: {exc}); "
+            "deciding unlocked")
+        return _silence_breaker_decide(cfg, verdict, base)
+    with lock_fh:
+        if not filelock.lock_nb(lock_fh):
+            log("silence breaker: another tick is deciding; skipping")
+            return False
+        try:
+            return _silence_breaker_decide(cfg, verdict, base)
+        finally:
+            filelock.unlock(lock_fh)
+
+
+def _silence_breaker_decide(cfg, verdict, base):
+    state = load_json(SILENCE_BREAKER_STATE, {})
+    if not isinstance(state, dict):
+        state = {}
+    if not _parse_time(state.get("first_seen_at")):
+        state["first_seen_at"] = now().isoformat(timespec="seconds")
+        save_json(SILENCE_BREAKER_STATE, state)
+    first_seen = _parse_time(state["first_seen_at"])
 
     status = str(verdict.get("status") or "").lower()
     if status == "healthy":
-        _reset_silence_backoff(base)
+        _reset_silence_backoff(state, base)
         return False
     multiplier = 1 if status == "critical" else 3 if status == "degraded" else None
     if multiplier is None:
@@ -717,7 +751,7 @@ def silence_breaker(cfg, verdict):
         # has nobody to tell.
         return False
 
-    ref = _silence_reference_at(to)
+    ref = _silence_reference_at(to, first_seen)
     silence_hours = max(0.0, (now() - ref).total_seconds() / 3600)
     threshold = base * multiplier
     if silence_hours < threshold:
@@ -730,9 +764,6 @@ def silence_breaker(cfg, verdict):
         log("silence breaker deferred: a message to the operator is already queued")
         return False
 
-    state = load_json(SILENCE_BREAKER_STATE, {})
-    if not isinstance(state, dict):
-        state = {}
     last_sent = _parse_time(state.get("last_sent_at"))
     prior_fp = str(state.get("fingerprint") or "")
     try:
@@ -776,11 +807,12 @@ def silence_breaker(cfg, verdict):
     # file restarted the count and replayed keys the outbox had already seen,
     # so enqueue() refused while notify() reported success. And an outbox
     # quarantine incident blocks every keyed enqueue — exactly when a human is
-    # most needed. The window below and the pending-queue guard above already
-    # prevent duplicates.
+    # most needed. The window and pending-queue guard above, decided under the
+    # breaker lock, already prevent duplicates.
     ok = notify(cfg, text, kind="silence", attach_report=False)
     if ok:
         save_json(SILENCE_BREAKER_STATE, {
+            "first_seen_at": state["first_seen_at"],
             "last_sent_at": now().isoformat(timespec="seconds"),
             "fingerprint": fp,
             "window_hours": next_window,
@@ -803,14 +835,13 @@ def _quiet_record_due(state, decision, fp, base):
     return True
 
 
-def _reset_silence_backoff(base):
+def _reset_silence_backoff(state, base):
     """A healthy tick ends the incident, so the next trouble is news again.
 
     Without this, a 168h backoff earned by one incident outlived its recovery,
     and a relapse with the same failing checks waited up to a week to be told.
     """
-    state = load_json(SILENCE_BREAKER_STATE, {})
-    if not isinstance(state, dict) or not state.get("fingerprint"):
+    if not state.get("fingerprint"):
         return
     state.update({"fingerprint": "", "window_hours": base,
                   "reset_at": now().isoformat(timespec="seconds")})

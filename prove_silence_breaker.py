@@ -275,6 +275,47 @@ class SilenceBreakerProof(unittest.TestCase):
         self.assertFalse(S.silence_breaker(ack, self.verdict()))
         self.assertEqual(before, len(self.alerts()))
 
+    def test_instance_crashing_from_birth_pages_after_one_grace_period(self):
+        # Re-review repro: report_crash() rewrites last_run.at every run, so
+        # with no delivery and no chain the fallback clock restarted on each
+        # crash and 673 crashes over seven days produced zero pages.
+        (STATE / "outbox-sent.jsonl").unlink()
+        (HOME / "neighborhood" / "copilot" / "chain.jsonl").unlink()
+        with mock.patch.object(S, "config", return_value=self.cfg):
+            for _ in range(96):  # 24h of 15-minute crashes
+                S.report_crash(RuntimeError("boom"))
+                self.current += timedelta(minutes=15)
+            self.assertEqual([], self.queue())
+            S.report_crash(RuntimeError("boom"))
+        self.assertEqual(1, len(self.queue()))
+        self.assertIn("sentinel_tick (tick crashed: RuntimeError: boom)",
+                      self.queue()[0]["text"])
+
+    def test_overlapping_ticks_cannot_double_page(self):
+        # Re-review repro: with no dedupe key, two ticks that both saw an
+        # empty queue and a due window each queued a breaker.
+        import threading
+        entered, release = threading.Event(), threading.Event()
+        real = S._pending_operator_message
+
+        def slow_pending(to):
+            entered.set()
+            release.wait(5)
+            return real(to)
+
+        results = []
+        with mock.patch.object(S, "_pending_operator_message", side_effect=slow_pending):
+            first = threading.Thread(
+                target=lambda: results.append(S.silence_breaker(self.cfg, self.verdict())))
+            first.start()
+            self.assertTrue(entered.wait(5))
+            results.append(S.silence_breaker(self.cfg, self.verdict()))
+            release.set()
+            first.join(5)
+        self.assertEqual([False, True], sorted(results))
+        self.assertEqual(1, len(self.queue()))
+        self.assertEqual(1, self.state()["count"])
+
     def test_never_delivered_gets_first_instance_grace(self):
         (STATE / "outbox-sent.jsonl").unlink()
         self.write_chain(hours=(2,), statuses=("critical",))
@@ -360,7 +401,7 @@ class SilenceBreakerProof(unittest.TestCase):
             "attachments": []}])
         self.assertFalse(S.silence_breaker(self.cfg, self.verdict()))
         self.assertEqual(1, len(self.queue()))
-        self.assertFalse((STATE / "silence-breaker.json").exists())
+        self.assertNotIn("last_sent_at", self.state())
 
     def test_healthy_tick_resets_backoff_so_a_relapse_is_told_promptly(self):
         # Review repro: four pages backed off to 168h; after a recovery the
