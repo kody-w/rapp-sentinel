@@ -699,8 +699,9 @@ Periodic Messages updates link to an immutable, tokenized static HTML snapshot
 served only over the Mac's private Tailscale/LAN addresses. The HTML embeds local
 decision transcripts, so it remains readable on a phone that cannot reach
 `localhost:9797`; dashboard and log routes remain loopback-only.
-`serve.py` binds the live dashboard to `SENTINEL_DASH_BIND`, defaulting to
-`127.0.0.1`.
+`serve.py` binds `SENTINEL_DASH_BIND`, defaulting to all interfaces so those
+share links open on a phone; set it to `127.0.0.1` to keep even share links on
+this machine.
 
 ---
 

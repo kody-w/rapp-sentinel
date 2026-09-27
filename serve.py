@@ -11,6 +11,7 @@ be reachable from anywhere but this machine.
 Tokenized static snapshots under /share/ are the sole exception. The server
 binds all private interfaces so a phone can read one unguessable frozen report;
 all dashboard, log, and public-head routes still reject non-loopback clients.
+SENTINEL_DASH_BIND overrides the bind address (127.0.0.1 = no share links).
 
   python3 serve.py            # http://localhost:9797
   python3 serve.py --port N
@@ -38,7 +39,10 @@ _lock = threading.Lock()
 
 
 def bind_address():
-    return os.environ.get("SENTINEL_DASH_BIND", "127.0.0.1")
+    # All interfaces by default: texted /share/ report links must open on a
+    # phone, and every other route already 404s non-loopback clients. Set
+    # SENTINEL_DASH_BIND=127.0.0.1 to keep even share links on this machine.
+    return os.environ.get("SENTINEL_DASH_BIND", "0.0.0.0")
 
 
 def rebuild(hours=14):

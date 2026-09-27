@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """prove_dashboard_bind.py — the dashboard binds only where configured.
 
+Default: all interfaces, so texted /share/ report links open on a phone (every
+other route already rejects non-loopback clients). SENTINEL_DASH_BIND=127.0.0.1
+keeps the server, share links included, on this machine.
+
 Run: python3 prove_dashboard_bind.py
 """
 
@@ -39,13 +43,20 @@ def bound_host_for(env_value):
             os.environ["SENTINEL_DASH_BIND"] = old
 
 
-bind, host, port = bound_host_for(None)
-scenario("default bind address is loopback",
-         bind == "127.0.0.1" and host == "127.0.0.1" and port > 0,
-         f"bind={bind!r} server_address={(host, port)!r}")
+old = os.environ.pop("SENTINEL_DASH_BIND", None)
+try:
+    default_bind = serve.bind_address()
+finally:
+    if old is not None:
+        os.environ["SENTINEL_DASH_BIND"] = old
+# Checked by value, not by binding: opening an all-interface socket in a proof
+# would itself expose this machine (and trip the macOS firewall prompt).
+scenario("default bind keeps phone share links reachable (all interfaces)",
+         default_bind == "0.0.0.0",
+         f"bind={default_bind!r}")
 
 bind, host, port = bound_host_for("127.0.0.1")
-scenario("configured SENTINEL_DASH_BIND controls the server bind",
+scenario("SENTINEL_DASH_BIND=127.0.0.1 binds loopback only",
          bind == "127.0.0.1" and host == "127.0.0.1" and port > 0,
          f"bind={bind!r} server_address={(host, port)!r}")
 
