@@ -496,29 +496,27 @@ def _pending_silence_breaker():
     return False
 
 
-def _status_since(verdict):
-    """When the current status began, from the copilot chain's tick frames.
+def _unhealthy_since():
+    """When the estate last stopped being healthy, from the chain's tick frames.
 
-    Only `sentinel.tick` frames carry a status. Other frames on the same chain
-    (`neighbor.acted`, `repair.verified`, …) have none, so they are skipped
-    rather than read as a status change — otherwise a single diagnosis frame
-    would make a weeks-long outage look minutes old.
+    Returns (since, never_healthy). The breaker's story is "things are not
+    fine", so the duration that matters is time since the last HEALTHY tick,
+    not since the last status change: the Dada Collective flapped between
+    critical and degraded for weeks, and "critical for 24h" undersold a
+    40-day outage in which not one tick was healthy. Only `sentinel.tick`
+    frames carry a status; other frames on the same chain (`neighbor.acted`,
+    `repair.verified`, …) are skipped rather than read as a change.
     """
-    status = verdict.get("status")
-    if not status:
-        return None
     chain = _jsonl_records(HOME / "neighborhood" / "copilot" / "chain.jsonl")
+    ticks = [f for f in chain if f.get("kind") == "sentinel.tick"]
     since = None
-    for frame in reversed(chain):
-        if frame.get("kind") != "sentinel.tick":
-            continue
-        payload = frame.get("payload") or {}
-        if payload.get("status") != status:
-            break
+    for frame in reversed(ticks):
+        if (frame.get("payload") or {}).get("status") == "healthy":
+            return since, False
         t = _parse_time(frame.get("utc"))
         if t:
             since = t
-    return since
+    return since, bool(since)
 
 
 def _hours_words(hours):
@@ -532,6 +530,8 @@ def _hours_words(hours):
 
 def _compact_detail(check, limit=86):
     cid = str(check.get("id") or "").strip()
+    if limit <= 0:
+        return cid
     detail = str(check.get("detail") or "").strip().replace("\n", " ")
     text = f"{cid} ({detail})" if detail else cid
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
@@ -540,23 +540,32 @@ def _compact_detail(check, limit=86):
 def _own_machinery_id(cid):
     return (cid.startswith("w_") or cid in {
         "alert_delivery", "health_runtime", "sentinel_tick",
-        "w_sentinel_fresh", "w_checks_complete",
+        "w_sentinel_fresh", "w_checks_complete", "config_integrity",
     })
 
 
+# Checks that report the watcher's own inability to see, whatever their wording.
+SELF_BLIND_IDS = {"gh_identity"}
+
+
 def _group_failing_checks(checks):
+    """Split failing checks into platform findings, blindness, and local machinery.
+
+    Root-cause blindness checks (gh_identity) sort first in their group, so a
+    shortened message still names why the other checks cannot see.
+    """
     import cooldown
     groups = {"platform": [], "blind": [], "own": []}
     for check in checks:
         cid = str(check.get("id") or "")
-        line = _compact_detail(check)
         detail = str(check.get("detail") or "")
-        if cooldown.is_self_blindness(f"{cid}: {detail}"):
-            groups["blind"].append(line)
+        if cid in SELF_BLIND_IDS or cooldown.is_self_blindness(f"{cid}: {detail}"):
+            groups["blind"].append(check)
         elif _own_machinery_id(cid):
-            groups["own"].append(line)
+            groups["own"].append(check)
         else:
-            groups["platform"].append(line)
+            groups["platform"].append(check)
+    groups["blind"].sort(key=lambda c: 0 if str(c.get("id")) in SELF_BLIND_IDS else 1)
     return groups
 
 
@@ -576,30 +585,41 @@ def _join_limited(items, limit=230):
 def _silence_message(cfg, verdict, silence_hours, next_window):
     status = str(verdict.get("status") or "unknown")
     lines = [f"🔕 {instance_name(cfg)}: {_hours_words(silence_hours)} without a message, and things are not fine."]
-    since = _status_since(verdict)
+    since, never_healthy = _unhealthy_since()
     if since:
         age = max(0.0, (now() - since).total_seconds() / 3600)
-        lines.append(f"Status: {status} for {age:.0f}h.")
+        if never_healthy:
+            lines.append(f"Status: {status}; not healthy in any tick since "
+                         f"{since:%Y-%m-%d} ({_hours_words(age)}).")
+        else:
+            lines.append(f"Status: {status}; not healthy for {_hours_words(age)} "
+                         f"(since {since:%Y-%m-%d}).")
     else:
         lines.append(f"Status: {status}.")
     groups = _group_failing_checks(_failing_checks(verdict))
-    if groups["platform"]:
-        lines.append("Platforms: " + _join_limited(groups["platform"]) + ".")
-    if groups["blind"]:
-        lines.append("I can't see: " + _join_limited(groups["blind"]) + ".")
-    if groups["own"]:
-        lines.append("My own arms: " + _join_limited(groups["own"]) + ".")
     mode = str(cfg.get("notification_mode") or "all").strip().lower()
-    why = []
+    footer = []
     if mode != "all":
-        why.append(f"notification_mode={mode} suppresses operational alerts")
-    if cfg.get("notify_queue_only"):
-        why.append("notify_queue_only leaves delivery to the outbox watcher")
-    if why:
-        lines.append("Why you haven't heard: " + "; ".join(why) + ".")
-    lines.append(f"Next reminder in {int(next_window)}h if nothing changes.")
-    text = "\n".join(lines)
-    return text if len(text) <= 700 else text[:699].rstrip() + "…"
+        footer.append(f"Why you haven't heard: notification_mode={mode} suppresses operational alerts.")
+    footer.append(f"Next reminder in {int(next_window)}h if nothing changes. "
+                  "Pause: set silence_ack_until in config.json.")
+    # The header and footer carry the story and the remedy, so the per-check
+    # detail shrinks to fit the 700-char budget — first shorter details, then
+    # bare check ids, and only then dropped items — instead of the tail
+    # (cadence, how to pause) being cut off.
+    text = ""
+    for detail_limit, join_limit in ((86, 260), (64, 230), (44, 200), (0, 200),
+                                     (0, 120), (0, 60)):
+        body = []
+        for label, key in (("Platforms", "platform"), ("I can't see", "blind"),
+                           ("Local machinery", "own")):
+            if groups[key]:
+                items = [_compact_detail(c, detail_limit) for c in groups[key]]
+                body.append(f"{label}: " + _join_limited(items, join_limit) + ".")
+        text = "\n".join(lines + body + footer)
+        if len(text) <= 700:
+            return text
+    return text[:699].rstrip() + "…"
 
 
 def _record_silence_suppressed(cfg, verdict, kind, reason):

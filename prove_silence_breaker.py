@@ -141,7 +141,35 @@ class SilenceBreakerProof(unittest.TestCase):
                          ["healthy", "critical", "critical", "critical", "critical"],
                          extra_frames=[(0.5, "neighbor.acted")])
         self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))
-        self.assertIn("Status: critical for 147h.", self.queue()[0]["text"])
+        self.assertIn("Status: critical; not healthy for 6 days (since ",
+                      self.queue()[0]["text"])
+
+    def test_flapping_unhealthy_estate_reports_time_since_last_healthy_tick(self):
+        # The field incident: critical and degraded alternated for weeks with no
+        # healthy tick at all. "critical for 24h" undersold that.
+        self.write_chain([900, 600, 300, 24, 1],
+                         ["critical", "degraded", "critical", "degraded", "critical"])
+        self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))
+        self.assertIn("Status: critical; not healthy in any tick since ",
+                      self.queue()[0]["text"])
+        self.assertIn("(37 days).", self.queue()[0]["text"])
+
+    def test_own_config_and_identity_are_not_platform_findings(self):
+        extra = (
+            {"id": "config_integrity", "ok": False, "severity": "warn",
+             "detail": "evolve_worker.max_piece_bytes appears twice"},
+            {"id": "gh_identity", "ok": False, "severity": "warn",
+             "detail": "gh identity rappter1 has a GraphQL quota of 0"},
+        )
+        self.assertTrue(S.silence_breaker(self.cfg, self.verdict(extra=extra)))
+        text = self.queue()[0]["text"]
+        platforms = [l for l in text.splitlines() if l.startswith("Platforms:")][0]
+        self.assertNotIn("config_integrity", platforms)
+        self.assertNotIn("gh_identity", platforms)
+        self.assertIn("gh_identity", [l for l in text.splitlines() if l.startswith("I can't see:")][0])
+        self.assertIn("config_integrity", [l for l in text.splitlines() if l.startswith("Local machinery:")][0])
+        self.assertNotIn("notify_queue_only", text)
+        self.assertIn("Pause: set silence_ack_until in config.json.", text)
 
     def test_art_only_critical_breaks_silence_and_backs_off(self):
         self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))
@@ -151,7 +179,7 @@ class SilenceBreakerProof(unittest.TestCase):
         self.assertIn("36 days without a message", text)
         self.assertIn("Platforms: rv_world_merging", text)
         self.assertIn("I can't see: rv_pr_queue", text)
-        self.assertIn("My own arms: w_evolve_worker", text)
+        self.assertIn("Local machinery: w_evolve_worker", text)
         self.assertIn("notification_mode=art-only", text)
         self.assertIn("Next reminder in 48h", text)
         self.assertLessEqual(len(text), 700)
