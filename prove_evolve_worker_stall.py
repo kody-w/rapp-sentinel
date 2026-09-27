@@ -98,6 +98,43 @@ class EvolveWorkerStallProof(unittest.TestCase):
         self.assertTrue(r["ok"], r)
         self.assertIn("duration unknown", r["detail"])
 
+    def test_rolling_child_budget_skip_is_by_design_other_fanout_failures_are_not(self):
+        ten_days = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat(timespec="seconds")
+        self.status(outcome="skipped", since=ten_days,
+                    reason="fan-out unavailable: child budget spent (24/24)")
+        self.assertTrue(C.evolve_worker_is_alive()["ok"])
+        self.status(outcome="skipped", since=ten_days,
+                    reason="fan-out unavailable: no usable child roles configured")
+        self.assertFalse(C.evolve_worker_is_alive()["ok"])
+
+    def test_stall_warning_cannot_gate_the_worker_into_erasing_it(self):
+        # Review repro: a post-probe broken skip ("publish auth unavailable")
+        # made w_evolve_worker warn; the worker's next health probe was then
+        # degraded ONLY by that warning, so it skipped "degraded at start …
+        # w_evolve_worker" (by design), which reset `since` and turned the
+        # warning green: ~30 min red, ~6.5 h green, forever.
+        self.status(outcome="skipped",
+                    reason="publish auth unavailable: gh token rejected",
+                    since=(datetime.now(timezone.utc) - timedelta(hours=7)).isoformat(timespec="seconds"))
+        stalled = C.evolve_worker_is_alive()
+        self.assertFalse(stalled["ok"], stalled)
+        ok, why = EW.health_gate({}, {"status": "degraded",
+                                      "failed": ["w_evolve_worker"], "critical": []})
+        self.assertTrue(ok, why)
+        self.assertIn("own liveness check", why)
+        ok, why = EW.health_gate({}, {"status": "degraded",
+                                      "failed": ["w_evolve_worker", "rb_workflows"],
+                                      "critical": []})
+        self.assertFalse(ok, why)
+        self.assertIn("rb_workflows", why)
+        self.assertNotIn("w_evolve_worker", why)
+        ok, why = EW.health_gate({}, {"status": "critical",
+                                      "failed": ["w_evolve_worker", "rv_world_merging"],
+                                      "critical": ["rv_world_merging"]})
+        self.assertFalse(ok, why)
+        ok, why = EW.health_gate({}, {"status": "degraded", "failed": [], "critical": []})
+        self.assertFalse(ok, why)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

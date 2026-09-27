@@ -53,6 +53,19 @@ class ConfigIntegrityProof(unittest.TestCase):
         self.write(json.dumps({"evolve_worker": {"max_piece_bytes": 10485760}}))
         self.assertTrue(C.config_integrity()["ok"])
 
+    def test_invalid_notification_mode_is_named_valid_modes_pass(self):
+        # notification_allowed() fails closed to "off" for unknown modes, so a
+        # typo silently muted every operational alert while this check said ok.
+        self.write(json.dumps({"notification_mode": "art_only"}))
+        r = C.config_integrity()
+        self.assertFalse(r["ok"], r)
+        self.assertEqual(C.WARN, r["severity"])
+        self.assertIn('notification_mode "art_only" is not one of all, art-only, off',
+                      r["detail"])
+        for mode in ("all", " Art-Only ", "off", "", None):
+            self.write(json.dumps({"notification_mode": mode}))
+            self.assertTrue(C.config_integrity()["ok"], mode)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

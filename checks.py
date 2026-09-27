@@ -683,6 +683,17 @@ def config_integrity():
             f"{name} appears twice ({first}, then {second} — JSON silently "
             "keeps the last)",
             critical=False)
+    plain = _plain_json_value(doc)
+    if isinstance(plain, dict) and "notification_mode" in plain:
+        # sentinel.notification_allowed() fails closed to "off" for anything
+        # else, so a typo ("art_only") silently mutes every operational alert.
+        mode = plain.get("notification_mode")
+        if str(mode or "all").strip().lower() not in ("all", "art-only", "off"):
+            return fail(
+                "config_integrity",
+                f"notification_mode {_short_json_value(mode)} is not one of "
+                "all, art-only, off — operational alerts fail closed to off",
+                critical=False)
     return ok("config_integrity", "config.json parses with no duplicate keys")
 
 
@@ -2313,6 +2324,8 @@ def _evolve_skip_is_by_design(reason):
         "which this worker does not understand",
         "cannot be allowlisted",
         "a loop that cannot report must not publish",
+        # subsentinels' rolling daily child budget: a cap doing its job.
+        "child budget spent",
     )
     return text.startswith(prefixes) or any(f in text for f in fragments)
 

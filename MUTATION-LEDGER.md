@@ -139,7 +139,7 @@ check keeps its history.*
 |---|---|---|
 | `alert_delivery` | ledger row (unroutable handle) | proven |
 | `channel` | ledger row; `prove_required_id_survives_outage.py` | proven |
-| `config_integrity` | `prove_config_integrity.py` (ships with the check; duplicate `evolve_worker.max_piece_bytes` field incident) | proven |
+| `config_integrity` | `prove_config_integrity.py` (ships with the check; duplicate `evolve_worker.max_piece_bytes` field incident; invalid `notification_mode` that fails closed to off) | proven |
 | `eco_sweep` | ledger row; `prove_blind_green.py` | proven |
 | `gh_identity` | `prove_gh_identity.py` (ships with the check; GraphQL quota 0 field incident) | proven |
 | `gh_status` | `prove_github_status.py` (post-exercise id, #49) | proven |
@@ -164,7 +164,7 @@ check keeps its history.*
 | `w_openrappter` | ledger row (nothing LISTENING on :18790) | proven |
 | `w_sentinel_current` | `prove_sentinel_current.py` (ships with the check) | proven |
 | `w_sentinel_fresh` | ledger row (last_run.json moved 9h into the past) | proven |
-| `w_evolve_worker` | ledger row (stale heartbeat with evolve_worker.enabled true); `prove_evolve_worker_stall.py` (broken-reason skips persisting past the stall bar) | proven |
+| `w_evolve_worker` | ledger row (stale heartbeat with evolve_worker.enabled true); `prove_evolve_worker_stall.py` (broken-reason skips persisting past the stall bar; the stall warning cannot gate the worker into resetting its own clock) | proven |
 | `w_openrappter_spin` | `prove_spinning_job.py` | landed in #76 |
 | `w_freshness_paired` | `prove_freshness_pairing.py` | landed in #76 |
 | `w_outsider_coverage` | `prove_outsider_coverage.py` | proven |

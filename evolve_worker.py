@@ -1577,6 +1577,13 @@ def cadence_ready(history, wcfg):
 #                   and "unknown" must never be allowlisted into "fine".
 NEVER_ALLOWLISTABLE = frozenset({"alert_delivery", "health_runtime"})
 
+# Checks that describe THIS worker rather than the estate it gates on. Gating
+# on them is circular: once w_evolve_worker warned about a stalled broken skip,
+# the next pass skipped as "degraded … w_evolve_worker", which is by design,
+# so the stall clock reset and the warning turned itself green — then the
+# broken skip returned with a fresh clock. It flapped instead of reporting.
+SELF_CHECKS = frozenset({"w_evolve_worker"})
+
 # health.py emits exactly these three. Anything else is a verdict this worker
 # cannot reason about, and an unreadable verdict is never a green light.
 KNOWN_STATUSES = frozenset({"healthy", "degraded", "critical"})
@@ -1613,11 +1620,15 @@ def health_gate(wcfg, verdict, phase="start"):
     critical = list(verdict.get("critical") or [])
     if critical:
         return False, f"critical checks failing at {phase}: {', '.join(sorted(critical))}"
-    failing = list(verdict.get("failed") or [])
-    if status != "healthy" and not failing:
+    reported = list(verdict.get("failed") or [])
+    if status != "healthy" and not reported:
         return False, (f"health verdict at {phase} says {status!r} but names no "
                        f"failing check — the two disagree, so neither is trusted")
+    failing = [c for c in reported if c not in SELF_CHECKS]
     if not failing:
+        if reported:
+            return True, (f"healthy at {phase} apart from this worker's own "
+                          f"liveness check: {', '.join(sorted(set(reported)))}")
         return True, f"healthy at {phase}"
     unskippable = sorted(set(failing) & NEVER_ALLOWLISTABLE)
     if unskippable:
