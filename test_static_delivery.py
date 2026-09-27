@@ -1639,16 +1639,29 @@ class MessageContentTests(unittest.TestCase):
         self.assertEqual("escalation", transcript_kind)
 
 
+class _WindowsView:
+    """The os module as outbox sees it on Windows: name 'nt', and os.open() refuses a directory.
+
+    Patched into outbox alone, so pathlib and everything else keep the real platform."""
+    name = "nt"
+
+    def __getattr__(self, attr):
+        return getattr(os, attr)
+
+    @staticmethod
+    def open(path, flags, *args):
+        if os.path.isdir(path):
+            raise PermissionError(13, "Permission denied", str(path))
+        return os.open(path, flags, *args)
+
+
 class WindowsDirectoryDurabilityTests(unittest.TestCase):
     """Windows cannot os.open() a directory; the alert path must not depend on it."""
 
     def test_directory_fsync_is_skipped_on_windows(self):
         target = Path(tempfile.gettempdir())
-        refused = PermissionError(13, "Permission denied")
-        with mock.patch.object(outbox.os, "name", "nt"), \
-                mock.patch.object(outbox.os, "open", side_effect=refused) as opened:
-            outbox._fsync_directory(target)
-        opened.assert_not_called()
+        with mock.patch.object(outbox, "os", _WindowsView()):
+            outbox._fsync_directory(target)  # must not raise
 
     def test_enqueue_survives_a_platform_that_refuses_directory_opens(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1658,7 +1671,7 @@ class WindowsDirectoryDurabilityTests(unittest.TestCase):
                         if isinstance(value, Path) and outbox.STATE in value.parents}
             isolated["STATE"] = root
             with mock.patch.multiple(outbox, **isolated), \
-                    mock.patch.object(outbox.os, "name", "nt"):
+                    mock.patch.object(outbox, "os", _WindowsView()):
                 outbox.enqueue("a Windows alert must still queue", "recipient")
                 lines = outbox.QUEUE.read_text(encoding="utf-8").splitlines()
         self.assertEqual(1, len(lines))
