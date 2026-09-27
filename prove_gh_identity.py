@@ -126,6 +126,19 @@ sys.exit(3)
         self.assertNotIn(SECRET, transcript)
         self.assertNotIn(SECRET, json.dumps(r))
 
+    def test_unavailable_gh_user_is_named_and_never_falls_back(self):
+        # Field incident: with HOME redirected, `gh auth token --user kody-w`
+        # printed "no oauth token found …" and every read reported a bare
+        # "auth". The cause must name the account and gh's own words, and the
+        # read must not quietly retry as the machine's active (flagged) account.
+        self.write_config({"gh_user": "nobody"})
+        r = C.gh_identity()
+        self.assertFalse(r["ok"], r)
+        self.assertIn("gh_user nobody unavailable: unknown user", r["detail"])
+        calls = self.log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(["GH_TOKEN=unset"], calls,
+                         "only the token lookup may run; no api call as another account")
+
     def test_missing_gh_records_cause_for_callers(self):
         with mock.patch.dict(os.environ, {"PATH": str(self.emptybin)}, clear=False):
             self.reset_gh_cache()

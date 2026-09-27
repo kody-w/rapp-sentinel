@@ -186,12 +186,18 @@ def _resolve_gh_token():
         r = subprocess.run(["gh", "auth", "token", "--user", user],
                            capture_output=True, text=True, timeout=TIMEOUT)
     except Exception as exc:
-        _GH_TOKEN_CACHE["cause"] = _classify_gh_failure(exc=exc)
+        _GH_TOKEN_CACHE["cause"] = (f"gh_user {user} unavailable: "
+                                    f"{_classify_gh_failure(exc=exc)}")
         return None, _GH_TOKEN_CACHE["cause"]
     token = (r.stdout or "").strip()
     if r.returncode != 0 or not token:
-        _GH_TOKEN_CACHE["cause"] = _classify_gh_failure(
-            r.returncode, (r.stdout or "") + (r.stderr or ""))
+        # Name the account and gh's own first line ("no oauth token found for
+        # github.com account …"): a bare "auth" sent the operator hunting for a
+        # credential problem when the fix is `gh auth login` for that account.
+        first = ((r.stderr or r.stdout or "").strip().splitlines() or [""])[0]
+        _GH_TOKEN_CACHE["cause"] = (
+            f"gh_user {user} unavailable: "
+            + (first[:90] if first else _classify_gh_failure(r.returncode, "")))
         return None, _GH_TOKEN_CACHE["cause"]
     _GH_TOKEN_CACHE["token"] = token
     return token, None
