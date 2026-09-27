@@ -525,6 +525,39 @@ def _git(*args, timeout=25):
         return None, ""
 
 
+def _current_grace_hours():
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        return max(0.0, float(cfg.get("current_grace_hours", 72)))
+    except Exception:
+        return 72.0
+
+
+def _missing_published_commits(running, published):
+    rc, count = _git("rev-list", "--count", f"{running}..{published}")
+    try:
+        n = int(count) if rc == 0 else 0
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return 0, None, []
+    rc, out = _git("log", "--format=%ct%x00%h%x00%s", "--reverse",
+                   f"{running}..{published}")
+    commits = []
+    if rc == 0:
+        for line in (out or "").splitlines():
+            parts = line.split("\0", 2)
+            if len(parts) == 3:
+                try:
+                    ts = int(parts[0])
+                except ValueError:
+                    ts = 0
+                commits.append({"ts": ts, "sha": parts[1],
+                                "subject": parts[2]})
+    oldest = commits[0]["ts"] if commits else None
+    return n, oldest, commits
+
+
 def _deployed_code_is_current():
     """Is the code that is RUNNING the code that was merged? (R2 turned on
     the watcher itself.)
@@ -553,11 +586,13 @@ def _deployed_code_is_current():
     code it is running would be deploying unreviewed changes to the watcher
     mid-tick.
 
-    Warn, not critical, and only for BEHIND. Ahead or diverged is a person
-    mid-development, not a stranded repair, and paging on it every tick on
-    the maintainer's own box is how a channel gets ignored (the eco_sweep
-    reasoning). Unknowable states report warn rather than green, because
-    "I could not tell whether my repairs are arriving" is not health.
+    Warn, not critical. Ahead and freshly-diverged local work stay ok, but the
+    Dada Collective field incident showed the old "diverged means a person is
+    developing" carve-out can hide merged repairs for weeks: branch
+    fix/azure-api-key-auth lacked six origin/main fixes for three weeks while
+    this check reported green. If origin/main has commits this process lacks
+    and the oldest is beyond current_grace_hours, merged repairs are not
+    reaching this process.
     """
     rc, running = _git("rev-parse", "HEAD")
     if rc != 0 or not running:
@@ -588,6 +623,37 @@ def _deployed_code_is_current():
                       "fetched to classify it", critical=False)
     rc, _ = _git("merge-base", "--is-ancestor", running, published)
     if rc != 0:
+        n, oldest, commits = _missing_published_commits(running, published)
+        if n > 0 and oldest:
+            age_h = (datetime.now(timezone.utc)
+                     - datetime.fromtimestamp(oldest, timezone.utc)
+                     ).total_seconds() / 3600
+            grace_h = _current_grace_hours()
+            if age_h > grace_h:
+                fixes = [c for c in commits
+                         if "fix" in c.get("subject", "").lower()]
+                named = fixes[:3] or commits[:3]
+                commit_bits = "; ".join(
+                    f"{c['sha']} {c['subject'][:50]}" for c in named)
+                return C.fail(
+                    "w_sentinel_current",
+                    f"running {running[:7]} (diverged) lacks {n} commits "
+                    f"merged to origin/main, oldest {age_h / 24:.1f}d ago "
+                    f"({len(fixes)} fix: {commit_bits}): merged repairs are "
+                    "not reaching this process",
+                    critical=False)
+            return C.ok(
+                "w_sentinel_current",
+                f"running {running[:7]} is freshly diverged from origin/main "
+                f"{published[:7]} and lacks {n} published commit(s), oldest "
+                f"{age_h / 24:.1f}d ago within {grace_h / 24:.1f}d grace")
+        if n > 0:
+            return C.fail(
+                "w_sentinel_current",
+                f"running {running[:7]} (diverged) lacks {n} commits merged "
+                "to origin/main, but their dates could not be read - unable "
+                "to tell whether merged repairs are arriving",
+                critical=False)
         return C.ok("w_sentinel_current",
                     f"running {running[:7]} is not behind origin/main "
                     f"{published[:7]} (ahead or diverged - local work, "

@@ -18,7 +18,14 @@ mid-development on the maintainer's own box, not a stranded repair.
 Run: python3 prove_sentinel_current.py   (exit 0 only on all-behaved)
 """
 
+import json
+import os
+import subprocess
 import sys
+import tempfile
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import health as H
 
@@ -36,7 +43,7 @@ def scenario(name, cond, observed):
 
 
 def make_git(head=OLD, remote=NEW, have_remote=True, is_ancestor=True,
-             behind="8", head_rc=0, remote_rc=0):
+             behind="8", head_rc=0, remote_rc=0, log=""):
     """Stand in for the git plumbing. Exit STATUS is the whole signal for
     merge-base/cat-file, so the fake speaks in return codes too."""
     def _git(*args, timeout=25):
@@ -54,6 +61,8 @@ def make_git(head=OLD, remote=NEW, have_remote=True, is_ancestor=True,
             return (0 if is_ancestor else 1, "")
         if a[:1] == ["rev-list"]:
             return (0, behind)
+        if a[:1] == ["log"]:
+            return (0, log)
         raise AssertionError(f"unexpected git call: {a}")
     return _git
 
@@ -89,11 +98,19 @@ scenario("(b) control: running exactly origin/main -> ok",
          r["ok"] and NEW[:7] in r["detail"], r["detail"])
 
 # ── (c) ahead / diverged is not a stranded repair ───────────────────────────
-H._git = make_git(head=NEW, remote=OLD, is_ancestor=False)
+H._git = make_git(head=NEW, remote=OLD, is_ancestor=False, behind="0")
 r = H._deployed_code_is_current()
-scenario("(c) ahead or diverged -> ok; local work must not page every tick "
+scenario("(c) ahead -> ok; local work must not page every tick "
          "on the maintainer's own box",
          r["ok"] and "not behind" in r["detail"], r["detail"])
+
+recent_ts = int(time.time() - 3600)
+H._git = make_git(head=NEW, remote=OLD, is_ancestor=False, behind="2",
+                  log=f"{recent_ts}\0abc1234\0fresh fix just merged")
+r = H._deployed_code_is_current()
+scenario("(c2) freshly diverged with new origin/main commits -> ok inside "
+         "current_grace_hours",
+         r["ok"] and "freshly diverged" in r["detail"], r["detail"])
 
 # ── (d) not a git checkout: blind is never green (#45) ──────────────────────
 H._git = make_git(head_rc=128)
@@ -142,6 +159,73 @@ scenario("(h) watching the checkout cannot endanger uncommitted work: no "
          "tree-touching git verb is ever issued",
          not (used & forbidden),
          f"verbs issued: {sorted(used)}")
+
+
+def git(cwd, *args, **env):
+    e = os.environ.copy()
+    e.update({
+        "GIT_AUTHOR_NAME": "sim",
+        "GIT_AUTHOR_EMAIL": "sim@example.invalid",
+        "GIT_COMMITTER_NAME": "sim",
+        "GIT_COMMITTER_EMAIL": "sim@example.invalid",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_TERMINAL_PROMPT": "0",
+    })
+    e.update(env)
+    return subprocess.run(("git",) + args, cwd=str(cwd), env=e,
+                          check=True, capture_output=True, text=True)
+
+
+def write_commit(repo, name, text, when=None):
+    (repo / name).write_text(text, encoding="utf-8")
+    git(repo, "add", name)
+    env = {}
+    if when:
+        env["GIT_AUTHOR_DATE"] = when
+        env["GIT_COMMITTER_DATE"] = when
+    git(repo, "commit", "-m", text, **env)
+    return git(repo, "rev-parse", "HEAD").stdout.strip()
+
+
+scratch_root = Path(__file__).resolve().parent / "state" / "prove-current-git"
+scratch_root.mkdir(parents=True, exist_ok=True)
+with tempfile.TemporaryDirectory(dir=str(scratch_root)) as td:
+    root = Path(td)
+    remote = root / "remote.git"
+    seed = root / "seed"
+    live = root / "live"
+    home = root / "home"
+    home.mkdir()
+    git(root, "init", "--bare", str(remote))
+    git(root, "clone", str(remote), str(seed))
+    git(seed, "checkout", "-b", "main")
+    write_commit(seed, "base.txt", "base")
+    git(seed, "push", "-u", "origin", "main")
+    git(root, "clone", str(remote), str(live))
+    git(live, "checkout", "main")
+    write_commit(live, "local.txt", "local-only")
+    old = (datetime.now(timezone.utc) - timedelta(days=10)).strftime(
+        "%Y-%m-%dT%H:%M:%S%z")
+    write_commit(seed, "repair.txt", "fix merged repair", when=old)
+    write_commit(seed, "other.txt", "docs after repair", when=old)
+    git(seed, "push", "origin", "main")
+    old_code, old_home = H.CODE, H.HOME
+    H.CODE, H.HOME = live, home
+    (home / "config.json").write_text(
+        json.dumps({"current_grace_hours": 72}), encoding="utf-8")
+    try:
+        H._git = real_git
+        r = H._deployed_code_is_current()
+    finally:
+        H.CODE, H.HOME = old_code, old_home
+    scenario("(i) REAL GIT: stale-diverged checkout lacking old origin/main "
+             "fixes -> WARN instead of the old green 'ahead or diverged'",
+             (not r["ok"]) and r["severity"] == H.C.WARN
+             and "diverged" in r["detail"]
+             and "lacks 2 commits" in r["detail"]
+             and "fix merged repair" in r["detail"]
+             and "merged repairs are not reaching this process" in r["detail"],
+             r["detail"])
 
 H._git = real_git
 

@@ -6,7 +6,9 @@
     "alert_delivery",
     "cadence_honest",
     "channel",
+    "config_integrity",
     "eco_sweep",
+    "gh_identity",
     "gh_status",
     "ip_hygiene",
     "page_fetch",
@@ -182,6 +184,14 @@
     },
     "w_hub_integrity": {
       "domain": "hub",
+      "kind": "consistency"
+    },
+    "config_integrity": {
+      "domain": "self",
+      "kind": "consistency"
+    },
+    "gh_identity": {
+      "domain": "github",
       "kind": "consistency"
     }
   },

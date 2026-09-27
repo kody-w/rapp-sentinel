@@ -105,6 +105,22 @@ cp config.example.json config.json    # start at level 0
 ./morning                             # read the overnight shift report
 ```
 
+If GitHub reads should run as a specific account from the local `gh` keyring,
+set `"gh_user": "account-name"`. The checks resolve
+`gh auth token --user <account-name>` once per process and pass only `GH_TOKEN`
+to `gh`, so GraphQL-backed checks do not silently use the machine's active
+account. `gh_identity` warns when that identity cannot be resolved or has no
+GraphQL quota, naming the checks it blinds.
+
+`config_integrity` warns when `config.json` is invalid, repeats a key at any
+depth (JSON silently keeps the last value), or sets a `notification_mode` other
+than `all` / `art-only` / `off` (unknown modes fail closed to off).
+
+`"current_grace_hours"` (default 72) controls `w_sentinel_current`: ahead and
+freshly-diverged local work stay ok, but a running checkout that lacks older
+commits already merged to `origin/main` warns that repairs are not reaching the
+process.
+
 The installer also loads an Aqua-session outbox drainer every five minutes.
 Background reporters remain queue-only; the drainer is the single serialized
 process allowed to drive Messages, so reports survive both producer failures
@@ -237,7 +253,7 @@ The worker (`evolve_worker.py`, `com.rapp.evolve-worker`, every 30 min):
 | nonblocking `flock` | two passes never overlap; a killed pass leaves no stale lock |
 | global cadence + rolling daily budget | shared across roles, in its own ledger, never repair's |
 | fail-closed ledgers | a corrupt or truncated history **stops the pass**; it is never read as "no spend" |
-| health at start, before the push, before the merge | any **critical** check aborts; degraded proceeds only when *every* failing id is in `degraded_allowlist` — `evolve_on_degraded` is ignored here, and `alert_delivery` / `health_runtime` refuse to be allowlisted at all |
+| health at start, before the push, before the merge | any **critical** check aborts; degraded proceeds only when *every* failing id is in `degraded_allowlist` — `evolve_on_degraded` is ignored here, and `alert_delivery` / `health_runtime` refuse to be allowlisted at all. The worker's own `w_evolve_worker` never gates it: that check describes the worker, and gating on it let a stall warning reset its own clock |
 | confined model | **no `--allow-all`**: the maker gets bounded file tools rooted at `--add-dir` and no shell, git, gh, MCP or network tool; built-in MCPs, custom instructions, `BASH_ENV`, the system temp dir, remote control and auto-update are off; HOME/XDG/TMPDIR/gh/git config live in a runtime directory the tools cannot reach, behind a strict env allowlist; inference auth is one `--secret-env-vars` variable |
 | sanitized staging | the maker never sees a repository — its root holds only its read context and a **precreated** `out/submission/`, with no `.git` and no clone metadata. It writes three files into paths that already exist (it has file tools and no shell, so it cannot create a directory); the slug lives in `meta.json`, and the controller materialises `submissions/<slug>/` in its own private clone from the gated bytes |
 | whole-tree staging check | the controller hashes the entire prepared staging tree before the model runs, and afterwards every baseline path must be byte- and mode-identical, with the only new paths allowed being `out/submission/meta.json`, one `piece.<ext>` and `state-out.json` — no new directories, no hidden files, no drafts, no rewritten context |
@@ -252,7 +268,7 @@ The worker (`evolve_worker.py`, `com.rapp.evolve-worker`, every 30 min):
 | protected reviewed-PNG provenance | an `azure-reviewed-png` PR persists its URL/number before reading exit-zero `gh pr view --json statusCheckRollup,mergeStateStatus,state`; only the exact CheckRun job `Verify controller provenance` from workflow `Reviewed PNG provenance` is classified. After exact success the complete rollup is read again, and only `CLEAN` permits `gh pr merge`; `BLOCKED`, `BEHIND`, pending checks, and inspection/non-JSON failure durably retain the PR in `checks-pending`. Absence is never success; a lone `CANCELLED` gets the same bounded grace for a cancel-in-progress replacement, while a pending exact replacement remains pending. Expired absence/cancellation and explicit failure/timed-out/action-required/stale results abort only after non-merge is proved |
 | reconciliation | a cycle killed between `gh pr merge` and the ledger write is finished (or its PR closed) on the next pass, from the PR and `origin/main` |
 | continuity that migrates | the creative ledger's current cycle is read canonically — `cycle`, else `last_cycle`, else a validated `cycles[]` — and fields that disagree fail closed rather than guessing. History is a strictly ordered contiguous run: a prefix from cycle 1, or a bounded tail that must carry an explicit counter, be exactly `creative_history_limit` long and end at that counter. Reader and writer share one constant, so the state written after cycle 50 is state the worker can still read. A rejected attempt is a failed spend that leaves public continuity alone |
-| liveness | every pass writes a heartbeat, and `w_evolve_worker` reports enabled-but-never-loaded or stale |
+| liveness | every pass writes a heartbeat, and `w_evolve_worker` reports enabled-but-never-loaded or stale; broken repeated skips fail after `max(three intervals, evolve_worker.stall_hours)` while health-gate/budget/child-budget/STOP/cadence skips remain by-design |
 | bounded sub-sentinel fan-out | optional: 3-5 read-only children in separate processes with no repo, no token and no ability to spawn children, aggregated deterministically into exactly 10 finalists — see below |
 | deterministic gate | exactly **two root-level regular files** (`lstat`: no symlink, no hardlink, no fifo, not executable, nothing nested) in one new `submissions/<slug>/`, valid slug/schema/kind/extension/license, piece within the configured bounded cap (50 KB by default), SVG parses with no script, no `on*` handler and no external reference (including CSS), and `_dada_cycle` proving 1-5 rounds of **exactly 10** scored candidates whose round one reproduces the finalist records by digest |
 | one repository, two names | the configured `repo` is normalised once: a validated transport URL for git, and `[HOST/]OWNER/REPO` for gh. `owner/name`, a full `https://` URL and a `.git` suffix all describe the same repository — before this, a URL config passed the auth preflight and then died at `gh pr create --repo https://…` |

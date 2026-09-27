@@ -1580,6 +1580,13 @@ def cadence_ready(history, wcfg):
 #                   and "unknown" must never be allowlisted into "fine".
 NEVER_ALLOWLISTABLE = frozenset({"alert_delivery", "health_runtime"})
 
+# Checks that describe THIS worker rather than the estate it gates on. Gating
+# on them is circular: once w_evolve_worker warned about a stalled broken skip,
+# the next pass skipped as "degraded … w_evolve_worker", which is by design,
+# so the stall clock reset and the warning turned itself green — then the
+# broken skip returned with a fresh clock. It flapped instead of reporting.
+SELF_CHECKS = frozenset({"w_evolve_worker"})
+
 # health.py emits exactly these three. Anything else is a verdict this worker
 # cannot reason about, and an unreadable verdict is never a green light.
 KNOWN_STATUSES = frozenset({"healthy", "degraded", "critical"})
@@ -1616,11 +1623,15 @@ def health_gate(wcfg, verdict, phase="start"):
     critical = list(verdict.get("critical") or [])
     if critical:
         return False, f"critical checks failing at {phase}: {', '.join(sorted(critical))}"
-    failing = list(verdict.get("failed") or [])
-    if status != "healthy" and not failing:
+    reported = list(verdict.get("failed") or [])
+    if status != "healthy" and not reported:
         return False, (f"health verdict at {phase} says {status!r} but names no "
                        f"failing check — the two disagree, so neither is trusted")
+    failing = [c for c in reported if c not in SELF_CHECKS]
     if not failing:
+        if reported:
+            return True, (f"healthy at {phase} apart from this worker's own "
+                          f"liveness check: {', '.join(sorted(set(reported)))}")
         return True, f"healthy at {phase}"
     unskippable = sorted(set(failing) & NEVER_ALLOWLISTABLE)
     if unskippable:
@@ -5462,12 +5473,28 @@ def write_status(outcome, reason="", **extra):
 
     A job that runs and skips and a job launchd never loaded look identical
     from outside — both produce no art and no log line anybody reads. This
-    file is what lets w_evolve_worker tell those two apart (#6).
+    file is what lets w_evolve_worker tell those two apart (#6). The `since`
+    field is the first time the current (outcome, reason) pair was written
+    consecutively; it is what lets health tell a normal skip from weeks of the
+    same broken preflight.
     """
+    at = sentinel.now().isoformat(timespec="seconds")
+    reason_text = str(reason)[:400]
+    since = at
+    try:
+        previous = json.loads(STATUS_PATH.read_text(encoding="utf-8"))
+        if (previous.get("outcome") == outcome
+                and str(previous.get("reason") or "") == reason_text
+                and isinstance(previous.get("since"), str)
+                and previous.get("since")):
+            since = previous["since"]
+    except Exception:
+        pass
     payload = {
-        "at": sentinel.now().isoformat(timespec="seconds"),
+        "at": at,
+        "since": since,
         "outcome": outcome,
-        "reason": str(reason)[:400],
+        "reason": reason_text,
         "pid": os.getpid(),
         "depth": SS.current_depth(),
         **extra,

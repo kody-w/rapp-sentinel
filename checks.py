@@ -145,6 +145,83 @@ def http_status(url):
 # single-threaded, so outsider_check() can snapshot this around a check to
 # prove the execution never touched the owner's credentials.
 _GH_CALLS = 0
+_GH_LAST_FAILURE = ""
+_GH_TOKEN_CACHE = {"user": None, "token": None, "cause": None, "loaded": False}
+
+
+def _configured_gh_user():
+    try:
+        cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        user = cfg.get("gh_user")
+        return user.strip() if isinstance(user, str) else ""
+    except Exception:
+        return ""
+
+
+def _classify_gh_failure(returncode=None, output="", exc=None):
+    if isinstance(exc, FileNotFoundError):
+        return "gh binary not found"
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return "timeout"
+    if exc is not None:
+        return type(exc).__name__
+    text = str(output or "").lower()
+    if "rate limit" in text or "secondary rate" in text:
+        return "rate limited"
+    if any(w in text for w in ("auth", "authentication", "credential",
+                               "login", "forbidden", "unauthorized")):
+        return "auth"
+    return f"exit {returncode}"
+
+
+def _resolve_gh_token():
+    user = _configured_gh_user()
+    if not user:
+        return None, None
+    if _GH_TOKEN_CACHE.get("loaded") and _GH_TOKEN_CACHE.get("user") == user:
+        return _GH_TOKEN_CACHE.get("token"), _GH_TOKEN_CACHE.get("cause")
+    _GH_TOKEN_CACHE.update(
+        {"user": user, "token": None, "cause": None, "loaded": True})
+    try:
+        r = subprocess.run(["gh", "auth", "token", "--user", user],
+                           capture_output=True, text=True, timeout=TIMEOUT)
+    except Exception as exc:
+        _GH_TOKEN_CACHE["cause"] = (f"gh_user {user} unavailable: "
+                                    f"{_classify_gh_failure(exc=exc)}")
+        return None, _GH_TOKEN_CACHE["cause"]
+    token = (r.stdout or "").strip()
+    if r.returncode != 0 or not token:
+        # Name the account and gh's own first line ("no oauth token found for
+        # github.com account …"): a bare "auth" sent the operator hunting for a
+        # credential problem when the fix is `gh auth login` for that account.
+        first = ((r.stderr or r.stdout or "").strip().splitlines() or [""])[0]
+        _GH_TOKEN_CACHE["cause"] = (
+            f"gh_user {user} unavailable: "
+            + (first[:90] if first else _classify_gh_failure(r.returncode, "")))
+        return None, _GH_TOKEN_CACHE["cause"]
+    _GH_TOKEN_CACHE["token"] = token
+    return token, None
+
+
+def gh_environment():
+    """Environment for direct gh subprocesses, honoring config gh_user.
+
+    Returns (env, failure_cause). A cause means the configured identity could
+    not be resolved and the caller should treat the gh read as blind rather
+    than silently falling back to the machine's active account.
+    """
+    token, cause = _resolve_gh_token()
+    if cause:
+        return None, cause
+    if token:
+        env = os.environ.copy()
+        env["GH_TOKEN"] = token
+        return env, None
+    return None, None
+
+
+def gh_failure_cause():
+    return _GH_LAST_FAILURE or str(_GH_TOKEN_CACHE.get("cause") or "")
 
 
 def gh(args, default=None):
@@ -155,15 +232,29 @@ def gh(args, default=None):
     so even a failed or timed-out gh call counts as having reached for the
     owner's credentials.
     """
-    global _GH_CALLS
+    global _GH_CALLS, _GH_LAST_FAILURE
     _GH_CALLS += 1
+    _GH_LAST_FAILURE = ""
+    env, cause = gh_environment()
+    if cause:
+        _GH_LAST_FAILURE = cause
+        return default
     try:
         r = subprocess.run(["gh"] + args, capture_output=True,
-                           text=True, timeout=TIMEOUT)
+                           text=True, timeout=TIMEOUT, env=env)
         if r.returncode != 0:
+            _GH_LAST_FAILURE = _classify_gh_failure(
+                r.returncode, (r.stdout or "") + (r.stderr or ""))
             return default
-        return json.loads(r.stdout) if r.stdout.strip() else default
-    except Exception:
+        try:
+            value = json.loads(r.stdout) if r.stdout.strip() else default
+        except Exception as exc:
+            _GH_LAST_FAILURE = _classify_gh_failure(exc=exc)
+            return default
+        _GH_LAST_FAILURE = ""
+        return value
+    except Exception as exc:
+        _GH_LAST_FAILURE = _classify_gh_failure(exc=exc)
         return default
 
 
@@ -180,6 +271,16 @@ def hours_since(iso):
 def url_check(cid, url, critical=False):
     s = http_status(url)
     return ok(cid, url) if s == 200 else fail(cid, f"HTTP {s} — {url}", critical)
+
+
+def _iso_age_hours(iso):
+    try:
+        stamp = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - stamp).total_seconds() / 3600
+    except Exception:
+        return None
 
 
 class _Sentinel:
@@ -504,6 +605,152 @@ RB = "kody-w/rappterbook"
 # difference between "watched shallowly" and "not watched at all".
 DEEPLY_CHECKED = {RV, RB}
 CHANNEL = "https://kody-w.github.io/rappvision-field-notes"
+
+
+class _JsonPairs(list):
+    pass
+
+
+def _plain_json_value(value):
+    if isinstance(value, _JsonPairs):
+        out = {}
+        for k, v in value:
+            out[k] = _plain_json_value(v)
+        return out
+    if isinstance(value, list):
+        return [_plain_json_value(v) for v in value]
+    return value
+
+
+def _short_json_value(value):
+    try:
+        text = json.dumps(_plain_json_value(value), sort_keys=True)
+    except Exception:
+        text = repr(value)
+    return text if len(text) <= 80 else text[:77] + "..."
+
+
+def _duplicate_json_keys(value, path=""):
+    duplicates = []
+    if isinstance(value, _JsonPairs):
+        seen = {}
+        for key, child in value:
+            here = f"{path}.{key}" if path else str(key)
+            if key in seen:
+                duplicates.append(
+                    (here, _short_json_value(seen[key]),
+                     _short_json_value(child)))
+            seen[key] = child
+            duplicates.extend(_duplicate_json_keys(child, here))
+    elif isinstance(value, list):
+        for i, child in enumerate(value):
+            duplicates.extend(_duplicate_json_keys(child, f"{path}[{i}]"))
+    return duplicates
+
+
+@check
+def config_integrity():
+    """The sentinel must not silently lie about the config it is obeying.
+
+    Field incident, 2026-08-22 through 2026-09-26: Dada Collective's art arm
+    skipped every pass because config.json contained
+    evolve_worker.max_piece_bytes twice. json.loads kept the later 51200,
+    hiding the earlier valid 10485760 and making the azure-reviewed-png
+    preflight fail for weeks while w_evolve_worker stayed green. Warn, not
+    critical: a malformed config can blind or disable checks, but the repair
+    arm cannot safely rewrite an operator's configuration.
+    """
+    path = HOME / "config.json"
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ok("config_integrity", "config.json absent; defaults only")
+    except OSError as exc:
+        return fail("config_integrity",
+                    f"cannot read config.json ({type(exc).__name__}: {exc})",
+                    critical=False)
+    try:
+        doc = json.loads(raw, object_pairs_hook=_JsonPairs)
+    except Exception as exc:
+        return fail("config_integrity",
+                    f"config.json is invalid JSON ({type(exc).__name__}: {exc})",
+                    critical=False)
+    duplicates = _duplicate_json_keys(doc)
+    if duplicates:
+        name, first, second = duplicates[0]
+        return fail(
+            "config_integrity",
+            f"{name} appears twice ({first}, then {second} — JSON silently "
+            "keeps the last)",
+            critical=False)
+    plain = _plain_json_value(doc)
+    if isinstance(plain, dict) and "notification_mode" in plain:
+        # sentinel.notification_allowed() fails closed to "off" for anything
+        # else, so a typo ("art_only") silently mutes every operational alert.
+        mode = plain.get("notification_mode")
+        if str(mode or "all").strip().lower() not in ("all", "art-only", "off"):
+            return fail(
+                "config_integrity",
+                f"notification_mode {_short_json_value(mode)} is not one of "
+                "all, art-only, off — operational alerts fail closed to off",
+                critical=False)
+    return ok("config_integrity", "config.json parses with no duplicate keys")
+
+
+@check
+def gh_identity():
+    """The GitHub CLI identity is part of the instrument, so measure it.
+
+    Field incident, Dada Collective 2026-09: GraphQL-backed checks were blind
+    3,101 times each because the machine's active gh account had
+    resources.graphql.limit == 0, while another account in the same keyring had
+    quota. Warn, not critical: quota/account selection is operator action and
+    the repair arm cannot mint or choose credentials safely, but a watchdog
+    must not report GraphQL-backed checks as meaningful when the account has no
+    GraphQL budget.
+    """
+    rate = gh(["api", "rate_limit"], default=UNREADABLE)
+    if rate is UNREADABLE:
+        cause = gh_failure_cause()
+        return fail("gh_identity",
+                    "cannot read gh rate_limit"
+                    + (f" ({cause})" if cause else ""),
+                    critical=False)
+    user = gh(["api", "user"], default=UNREADABLE)
+    if user is UNREADABLE:
+        cause = gh_failure_cause()
+        return fail("gh_identity",
+                    "cannot read gh user"
+                    + (f" ({cause})" if cause else ""),
+                    critical=False)
+    login = str(user.get("login") or "unknown") if isinstance(user, dict) else "unknown"
+    try:
+        graphql = (rate.get("resources") or {}).get("graphql") or {}
+        limit = int(graphql.get("limit"))
+        remaining = int(graphql.get("remaining"))
+    except Exception as exc:
+        return fail("gh_identity",
+                    f"gh rate_limit response has no GraphQL quota "
+                    f"({type(exc).__name__}: {exc})",
+                    critical=False)
+    if limit == 0:
+        return fail(
+            "gh_identity",
+            f"gh identity {login} has a GraphQL quota of 0: "
+            "GraphQL-backed checks are blind (e.g. rv_pr_queue, "
+            "rb_rollup_coverage). Set gh_user in config.json to an account "
+            "with quota.",
+            critical=False)
+    if remaining == 0:
+        return fail(
+            "gh_identity",
+            f"gh identity {login} has no remaining GraphQL quota: "
+            "GraphQL-backed checks are blind (e.g. rv_pr_queue, "
+            "rb_rollup_coverage). Set gh_user in config.json to an account "
+            "with quota.",
+            critical=False)
+    return ok("gh_identity",
+              f"gh identity {login}, GraphQL remaining {remaining}/{limit}")
 
 
 def public_json(repo, path, attempts=2):
@@ -903,7 +1150,11 @@ def queue_draining():
     if not isinstance(prs, list):
         # default=0 made a dead API indistinguishable from an empty queue, and
         # an empty queue is the healthiest possible reading (#45).
-        return fail("rv_pr_queue", "cannot read the PR queue", critical=False)
+        cause = gh_failure_cause()
+        return fail("rv_pr_queue",
+                    "cannot read the PR queue"
+                    + (f" ({cause})" if cause else ""),
+                    critical=False)
     n = len(prs)
     if not prs:
         return ok("rv_pr_queue", "empty")
@@ -1321,8 +1572,10 @@ def rb_rollup_covers_corpus():
     if data is UNREADABLE:
         # gh() returns its default on ANY failure, so `None` made a dead
         # subprocess and a real answer the same value. Say blind, not broken.
+        cause = gh_failure_cause()
         return fail("rb_rollup_coverage",
-                    "cannot read corpus size (gh graphql read failed)",
+                    "cannot read corpus size (gh graphql read failed"
+                    + (f": {cause}" if cause else "") + ")",
                     critical=False)
     try:
         actual = int(data["data"]["repository"]["discussions"]["totalCount"])
@@ -2051,6 +2304,54 @@ def channel_serving():
     )) or ok("channel", "serving")
 
 
+def _evolve_skip_is_by_design(reason):
+    text = str(reason or "")
+    prefixes = (
+        "STOP file present",
+        "evolve_worker.enabled is false",
+        "level ",
+        "evolve budget spent ",
+        "creative cadence ",
+        "another worker holds the lock",
+        "nested run refused",
+        "critical checks failing at ",
+        "health at ",
+        "health verdict at ",
+        "degraded at ",
+    )
+    fragments = (
+        "shape unknown, not healthy",
+        "which this worker does not understand",
+        "cannot be allowlisted",
+        "a loop that cannot report must not publish",
+        # subsentinels' rolling daily child budget: a cap doing its job.
+        "child budget spent",
+    )
+    return text.startswith(prefixes) or any(f in text for f in fragments)
+
+
+def _last_evolve_contribution_detail():
+    try:
+        rows = json.loads((HOME / "state" / "evolve-worker-history.json"
+                           ).read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(rows, list):
+        return ""
+    for row in reversed(rows):
+        if isinstance(row, dict) and row.get("outcome") == "contributed":
+            when = str(row.get("at") or row.get("merged_at") or "").strip()
+            slug = str(row.get("slug") or "").strip()
+            if when and slug:
+                return f"; last contribution {when} ({slug})"
+            if when:
+                return f"; last contribution {when}"
+            if slug:
+                return f"; last contribution {slug}"
+            return "; last contribution recorded without timestamp"
+    return "; no prior contribution in history"
+
+
 @check
 def evolve_worker_is_alive():
     """The art arm is a SEPARATE launchd job, so its silence is invisible here.
@@ -2097,6 +2398,11 @@ def evolve_worker_is_alive():
                     critical=False)
     stale_after = interval_m * 3
     try:
+        stall_h = float(block.get("stall_hours", 6))
+    except (TypeError, ValueError):
+        stall_h = 6.0
+    stall_bar_h = max(stale_after / 60.0, stall_h)
+    try:
         age_m = (datetime.now(timezone.utc)
                  - datetime.fromisoformat(status["at"])).total_seconds() / 60
     except Exception:
@@ -2135,6 +2441,21 @@ def evolve_worker_is_alive():
         return ok("w_evolve_worker",
                   f"dual deployment pending, attempt {attempts} "
                   f"({pending_age:.0f}m)")
+    reason = str(status.get("reason") or "")
+    if outcome == "skipped" and not _evolve_skip_is_by_design(reason):
+        since = status.get("since")
+        stall_age_h = _iso_age_hours(since) if since else None
+        if stall_age_h is not None and stall_age_h > stall_bar_h:
+            days = stall_age_h / 24.0
+            return fail(
+                "w_evolve_worker",
+                f"art arm stalled for {days:.1f}d: {reason[:160]}"
+                f"{_last_evolve_contribution_detail()}",
+                critical=False)
+        if stall_age_h is None:
+            return ok("w_evolve_worker",
+                      f"skipped {age_m:.0f}m ago (broken-skip reason has no "
+                      "since yet; duration unknown)")
     return ok("w_evolve_worker",
               f"{outcome} {age_m:.0f}m ago"
               + (f" (cycle {status['cycle']})" if status.get("cycle") else ""))
