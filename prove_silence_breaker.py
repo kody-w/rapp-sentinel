@@ -81,13 +81,19 @@ class SilenceBreakerProof(unittest.TestCase):
             "sent_at": when.isoformat(timespec="seconds"),
         }])
 
-    def write_chain(self, hours, statuses):
+    def write_chain(self, hours, statuses, extra_frames=()):
         rows = []
         for i, (age, status) in enumerate(zip(hours, statuses)):
-            rows.append({"seq": i,
+            rows.append({"seq": i, "kind": "sentinel.tick",
                          "utc": (self.current - timedelta(hours=age)).isoformat(
                              timespec="seconds"),
                          "payload": {"status": status}})
+        for age, kind in extra_frames:
+            rows.append({"seq": len(rows), "kind": kind,
+                         "utc": (self.current - timedelta(hours=age)).isoformat(
+                             timespec="seconds"),
+                         "payload": {"act": "diagnose"}})
+        rows.sort(key=lambda r: r["utc"])
         self.write_jsonl(HOME / "neighborhood" / "copilot" / "chain.jsonl", rows)
 
     def verdict(self, status="critical", extra=()):
@@ -127,6 +133,15 @@ class SilenceBreakerProof(unittest.TestCase):
     def state(self):
         return json.loads((STATE / "silence-breaker.json").read_text(
             encoding="utf-8"))
+
+    def test_status_duration_ignores_non_tick_frames(self):
+        # 147h of critical ticks, preceded by healthy ticks, with a diagnosis
+        # frame (no status) as the newest record on the chain.
+        self.write_chain([200, 147, 100, 10, 1],
+                         ["healthy", "critical", "critical", "critical", "critical"],
+                         extra_frames=[(0.5, "neighbor.acted")])
+        self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))
+        self.assertIn("Status: critical for 147h.", self.queue()[0]["text"])
 
     def test_art_only_critical_breaks_silence_and_backs_off(self):
         self.assertTrue(S.silence_breaker(self.cfg, self.verdict()))

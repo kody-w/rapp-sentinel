@@ -497,12 +497,21 @@ def _pending_silence_breaker():
 
 
 def _status_since(verdict):
+    """When the current status began, from the copilot chain's tick frames.
+
+    Only `sentinel.tick` frames carry a status. Other frames on the same chain
+    (`neighbor.acted`, `repair.verified`, …) have none, so they are skipped
+    rather than read as a status change — otherwise a single diagnosis frame
+    would make a weeks-long outage look minutes old.
+    """
     status = verdict.get("status")
     if not status:
         return None
     chain = _jsonl_records(HOME / "neighborhood" / "copilot" / "chain.jsonl")
     since = None
     for frame in reversed(chain):
+        if frame.get("kind") != "sentinel.tick":
+            continue
         payload = frame.get("payload") or {}
         if payload.get("status") != status:
             break
