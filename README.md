@@ -783,6 +783,21 @@ reminders resume automatically afterwards. Offline proof:
 
 Reads the chains — it keeps **no log of its own**, because a dashboard with a private copy of the truth is a second source that can disagree with the first. It re-verifies every chain from genesis while rendering, so a tampered record shows as a red banner instead of a tidy chart.
 
+Health ticks no longer rebuild this report by default: `serve.py` already
+refreshes on request, and `./morning` / `python3 standup.py --hours=14` refresh
+explicitly. This removes a redundant, formerly blocking 180-second refresh
+from the health path. Static-file-only installations can opt back in with
+`"dashboard_refresh_on_tick": true`; the tick saves its health heartbeat first,
+then allows at most 180 seconds for that optional render. Renderer failures
+are logged and never abort the tick.
+
+The HTTP server serves the last render immediately while refreshing in the
+background. It keeps at most one refresh thread active, and a nonblocking
+per-instance file lock covers every renderer (including CLI and portable
+snapshots), so slow requests cannot accumulate renderers. A busy renderer
+refuses a competing rebuild explicitly rather than waiting in a queue.
+Offline proof: `python3 prove_tick_dashboard.py`.
+
 Every claim links to evidence: commits to GitHub, contributions to their source, and each autonomous decision to the full local transcript of the run that produced it.
 
 Periodic Messages updates link to an immutable, tokenized static HTML snapshot

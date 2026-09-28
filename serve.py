@@ -35,6 +35,7 @@ PORT = 9797
 # Don't rebuild on every asset request — a page load fires several.
 MIN_REBUILD_INTERVAL = 20
 _last_build = 0.0
+_building = False
 _lock = threading.Lock()
 
 
@@ -56,20 +57,34 @@ def rebuild(hours=14):
     So: serve the last render immediately, refresh behind it. You always get a
     page instantly; it is at most one page-load stale.
     """
-    global _last_build
+    global _last_build, _building
     with _lock:
-        if time.time() - _last_build < MIN_REBUILD_INTERVAL:
+        if _building or time.monotonic() - _last_build < MIN_REBUILD_INTERVAL:
             return
-        _last_build = time.time()
+        _last_build = time.monotonic()
+        _building = True
 
     def _work():
+        global _building
         try:
             subprocess.run([sys.executable, str(CODE / "standup.py"), f"--hours={hours}"],
-                           capture_output=True, timeout=180, cwd=str(HOME))
-        except Exception:
-            pass  # keep serving the last good copy rather than a stack trace
+                           capture_output=True, text=True, check=True,
+                           timeout=180, cwd=str(HOME))
+        except (OSError, subprocess.SubprocessError) as exc:
+            detail = (getattr(exc, "stderr", "") or "").strip()[:200]
+            print(f"dashboard refresh failed: {type(exc).__name__}: {exc}"
+                  + (f": {detail}" if detail else ""), file=sys.stderr, flush=True)
+        finally:
+            with _lock:
+                _building = False
 
-    threading.Thread(target=_work, daemon=True).start()
+    try:
+        threading.Thread(target=_work, daemon=True).start()
+    except (OSError, RuntimeError) as exc:
+        with _lock:
+            _building = False
+        print(f"dashboard refresh could not start: {type(exc).__name__}: {exc}",
+              file=sys.stderr, flush=True)
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):

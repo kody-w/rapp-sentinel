@@ -30,6 +30,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import filelock
 import neighborhood as NB
 from paths import HOME
 
@@ -278,6 +279,19 @@ footer{margin-top:44px;padding-top:16px;border-top:1px solid rgba(20,20,19,.14)}
 
 
 def render(hours=14):
+    """Only one renderer per instance, including CLI, HTTP, and snapshots."""
+    lock_path = HOME / "state" / "dashboard-refresh.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a", encoding="utf-8") as lock:
+        if not filelock.lock_nb(lock):
+            raise RuntimeError("dashboard refresh already running for this instance")
+        try:
+            return _render(hours)
+        finally:
+            filelock.unlock(lock)
+
+
+def _render(hours):
     events = shift(hours)
     commits = [c for r in REPOS for c in recent_commits(r, hours)]
     commits.sort(key=lambda c: c["when"], reverse=True)

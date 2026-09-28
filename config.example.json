@@ -26,6 +26,8 @@
   "gh_user": "",
   "_current_grace_hours_why": "w_sentinel_current keeps ahead/freshly-diverged local work ok, but fails at warn when this process lacks commits already merged to origin/main for longer than this grace. This catches merged repairs that never reached the running checkout.",
   "current_grace_hours": 72,
+  "_dashboard_refresh_on_tick_why": "False by default: serve.py already rebuilds on request and morning/standup.py rebuild explicitly, so health ticks need not wait for a redundant report. True preserves periodic static dashboard/index.html refreshes, after saving the health heartbeat, with a 180-second ceiling. All renderers share a nonblocking per-instance lock, so requests and ticks cannot pile up rendering jobs.",
+  "dashboard_refresh_on_tick": false,
   "_host_pressure_why": "Cheap local measurements of the volume holding SENTINEL_HOME and sustained host load. Always warn, never critical: the repair arm cannot safely free disk or stop other people's workloads. Unavailable measurements or invalid thresholds warn rather than passing blind.",
   "host_pressure": {
     "_min_free_gib_why": "Warn below the larger of this many GiB free and min_free_percent of the volume's total capacity. Nonnegative; 0 disables only the absolute floor.",
