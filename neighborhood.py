@@ -487,6 +487,8 @@ def _chain_prefix_digests(frames, lengths):
     filesystem metadata is trusted, and every witnessed prefix is checked.
     """
     lengths = set(lengths)
+    if any(not isinstance(length, int) for length in lengths):
+        raise TypeError("anchor prefix lengths must be integers")
     if not lengths:
         return {}
     digest = hashlib.sha256(b'rapp/1:wave\n{"hashes":[')

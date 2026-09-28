@@ -177,6 +177,16 @@ class AnchorPerformanceProof(unittest.TestCase):
         self.write_anchors()
         self.assertEqual(3, self.parity()["revised_before_seq"])
 
+    def test_noninteger_anchor_sequence_cannot_silently_skip_verification(self):
+        for sequence in (3.0, 3.5):
+            with self.subTest(sequence=sequence):
+                self.anchors[3]["heads"]["copilot"]["seq"] = sequence
+                self.write_anchors()
+                with self.assertRaises(TypeError):
+                    legacy_check()
+                with self.assertRaisesRegex(TypeError, "must be integers"):
+                    NB.check_anchors()
+
     def test_truncation_and_disappearance_match(self):
         self.write_chain(self.chain[:-4])
         self.assertTrue(self.parity()["truncated"])
