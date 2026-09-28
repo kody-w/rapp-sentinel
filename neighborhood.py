@@ -55,6 +55,7 @@ Frames follow `rapp/1` exactly, via the vendored reference implementation
 (rapp.py, copied from kody-w/rapp-1 — stdlib only).
 """
 
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -478,15 +479,49 @@ def anchors_for(slug):
     return out
 
 
+def _chain_prefix_digests(frames, lengths):
+    """The exact chain_digest for each requested prefix, in one pass.
+
+    SHA-256 state is copied before adding the JCS closing delimiters. The
+    bytes match H("rapp/1:wave", {"hashes": [...]}); no persisted head or
+    filesystem metadata is trusted, and every witnessed prefix is checked.
+    """
+    lengths = set(lengths)
+    if not lengths:
+        return {}
+    digest = hashlib.sha256(b'rapp/1:wave\n{"hashes":[')
+    out = {}
+
+    def remember(length):
+        closed = digest.copy()
+        closed.update(b"]}")
+        out[length] = closed.hexdigest()
+
+    if 0 in lengths:
+        remember(0)
+    last = max(lengths)
+    for length, frame in enumerate(frames, 1):
+        if length > last:
+            break
+        if length > 1:
+            digest.update(b",")
+        digest.update(rapp.canonical(frame["frame_hash"]).encode("utf-8"))
+        if length in lengths:
+            remember(length)
+    return out
+
+
 def check_anchors():
-    """Compare each chain against the oldest anchor that covers it.
+    """Compare every witnessed prefix with the current chain in linear work.
 
     A truncated chain shows up as a head whose seq went BACKWARDS, or a seq we
-    once witnessed that the chain can no longer produce.
+    once witnessed that the chain can no longer produce. An interior rewrite
+    must still disagree with ANY historical digest, including duplicate seqs.
     """
     if not ANCHORS.exists():
         return {}
     seen = {}
+    history = {}
     for line in ANCHORS.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -495,6 +530,7 @@ def check_anchors():
         except Exception:
             continue
         for slug, h in r.get("heads", {}).items():
+            history.setdefault(slug, []).append(h)
             prev = seen.get(slug)
             if prev is None or h["seq"] > prev["seq"]:
                 seen[slug] = h
@@ -503,17 +539,13 @@ def check_anchors():
         ch = read_chain(slug)
         cur = ch[-1]["seq"] if ch else -1
         hashes = {f["frame_hash"] for f in ch}
-        # Re-derive each historical digest over the prefix it covered. A
-        # rewritten interior frame changes its own frame_hash, so every digest
-        # recorded at or after that seq stops reproducing — even though the
-        # chain still verifies and the head never moved.
+        witnessed = [a for a in history[slug]
+                     if a.get("chain_digest") and a["seq"] <= cur]
+        digests = _chain_prefix_digests(ch, (a["seq"] + 1 for a in witnessed))
         revised_at = None
-        for a in anchors_for(slug):
-            d = a.get("chain_digest")
-            if not d or a["seq"] > cur:
-                continue
-            prefix = ch[:a["seq"] + 1]
-            if len(prefix) == a["seq"] + 1 and chain_digest(prefix) != d:
+        for a in witnessed:
+            length = a["seq"] + 1
+            if length in digests and digests[length] != a["chain_digest"]:
                 revised_at = a["seq"] if revised_at is None else min(revised_at, a["seq"])
         out[slug] = {
             "witnessed_seq": high["seq"],

@@ -636,6 +636,16 @@ An outside anchor is something a splice cannot rewrite, because it does not live
 in the chain. `neighborhood.py` now writes `neighborhood/anchors.jsonl` and the
 morning report shows head-vs-anchor.
 
+Every historical anchor is still checked, including conflicting observations
+at the same sequence number. Prefix digests are now computed in one streaming
+SHA-256 pass per chain instead of re-hashing the entire prefix for every
+anchor: work grows with frames plus anchors, not their product. The digest
+bytes and anchor format are unchanged. There is no persisted verification
+cache or mtime shortcut; `verify()` and each roll call still verify every
+frame from genesis, and rewriting an interior frame is checked again on the
+next call even if the file size, timestamp, and final head did not change.
+Offline proof: `python3 prove_anchor_performance.py`.
+
 So the honest version of the claim:
 
 > A chain makes tampering *detectable*. An external anchor makes truncation
