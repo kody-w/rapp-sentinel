@@ -138,6 +138,18 @@ class HostPressureProof(unittest.TestCase):
             self.cpus.return_value = cores
             self.warn("CPU count unavailable")
 
+    def test_platform_without_load_average_skips_it_instead_of_warning(self):
+        # Windows has no os.getloadavg at all. A required check must not warn
+        # forever for a measurement the platform never provides; setUp's
+        # patcher restores the attribute afterwards.
+        with mock.patch.object(C.sys, "platform", "win32"):
+            delattr(C.os, "getloadavg")
+            result = C.host_pressure()
+        self.assertTrue(result["ok"], result)
+        self.assertIn("load average not provided by this platform (skipped)",
+                      result["detail"])
+        self.assertIn("disk 40.00 GiB", result["detail"])
+
     def test_invalid_measurements_warn(self):
         for usage in (Usage(0, 0, 0), Usage(100, 101, -1),
                       Usage(100, 0, 101), Usage(float("nan"), 0, 10)):
@@ -288,9 +300,15 @@ class HostPressureProof(unittest.TestCase):
         nb.roll_call.return_value = {}
         nb.peer_roll_call.return_value = {}
         nb.check_anchors.return_value = {}
+        # host_pressure() above ran under setUp's spawn guard. The tick itself
+        # may run its dashboard refresh; nothing else, and never repair.
+        self.commands.side_effect = None
+        self.commands.return_value = mock.Mock(returncode=0, stdout="", stderr="")
         self.assertEqual(0, S.main())
         repair.assert_not_called()
-        self.commands.assert_not_called()
+        spawned = [call.args[0] for call in self.commands.call_args_list]
+        self.assertTrue(all(len(argv) > 1 and Path(argv[1]).name == "standup.py"
+                            for argv in spawned), spawned)
 
 
 class NativeSysctlProof(unittest.TestCase):

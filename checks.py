@@ -784,24 +784,29 @@ def host_pressure():
         pressured = True
         details.append(f"disk measurement unavailable ({type(exc).__name__}: {exc})")
 
-    try:
-        _, five, fifteen = os.getloadavg()
-        cores = os.cpu_count()
-        if (not isinstance(cores, int) or isinstance(cores, bool) or cores <= 0):
-            raise ValueError("CPU count unavailable")
-        if any(isinstance(v, bool) or not math.isfinite(v) or v < 0
-               for v in (five, fifteen)):
-            raise ValueError("invalid 5/15-minute load measurement")
-        ceiling = cores * limits["load_per_core"]
-        high_load = five > ceiling and fifteen > ceiling
-        pressured |= high_load
-        details.append(
-            f"load 5m={five:.2f}, 15m={fifteen:.2f} on {cores} cores "
-            f"(warn when both > {ceiling:g}, {limits['load_per_core']:g}x cores)"
-            + (" - sustained load above ceiling" if high_load else ""))
-    except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
-        pressured = True
-        details.append(f"load measurement unavailable ({type(exc).__name__}: {exc})")
+    if not hasattr(os, "getloadavg"):
+        # Windows has no load average; like swap/memory off macOS, this metric
+        # is skipped explicitly rather than reported as a permanent failure.
+        details.append("load average not provided by this platform (skipped)")
+    else:
+        try:
+            _, five, fifteen = os.getloadavg()
+            cores = os.cpu_count()
+            if (not isinstance(cores, int) or isinstance(cores, bool) or cores <= 0):
+                raise ValueError("CPU count unavailable")
+            if any(isinstance(v, bool) or not math.isfinite(v) or v < 0
+                   for v in (five, fifteen)):
+                raise ValueError("invalid 5/15-minute load measurement")
+            ceiling = cores * limits["load_per_core"]
+            high_load = five > ceiling and fifteen > ceiling
+            pressured |= high_load
+            details.append(
+                f"load 5m={five:.2f}, 15m={fifteen:.2f} on {cores} cores "
+                f"(warn when both > {ceiling:g}, {limits['load_per_core']:g}x cores)"
+                + (" - sustained load above ceiling" if high_load else ""))
+        except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
+            pressured = True
+            details.append(f"load measurement unavailable ({type(exc).__name__}: {exc})")
 
     if sys.platform == "darwin":
         try:
