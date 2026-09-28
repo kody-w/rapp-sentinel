@@ -116,17 +116,34 @@ GraphQL quota, naming the checks it blinds.
 depth (JSON silently keeps the last value), or sets a `notification_mode` other
 than `all` / `art-only` / `off` (unknown modes fail closed to off).
 
-`host_pressure` reports local disk headroom and sustained CPU load on every
+`host_pressure` reports local disk headroom and sustained load on every
 tick, without subprocesses or network calls. It measures the volume holding
 `SENTINEL_HOME`, warning below `max(10 GiB, 5% of total capacity)` free, or when
 **both** the 5-minute and 15-minute load averages exceed four times
 `os.cpu_count()`. A 1-minute spike alone does not warn. Configure these bars
 with `host_pressure.min_free_gib` (default 10), `min_free_percent` (default 5,
-range 0-100), and `load_per_core` (default 4, positive). Values must be finite
-numbers; the disk floors may be zero and equality to a bar passes. Unavailable
+range 0-100), and `load_per_core` (default 4, positive). Load averages include
+tasks stalled on paging; they are not CPU-utilization measurements.
+
+On macOS, the same check also reads `vm.swapusage` and
+`kern.memorystatus_level` through stdlib `ctypes` / native `sysctlbyname`:
+no `sysctl` or `memory_pressure` subprocess, and no cached telemetry.
+`host_pressure.max_swap_used_percent` (default 85, greater than 0 and at most
+100) warns when swap used/allocated is **at or above** the threshold.
+`host_pressure.min_memory_percent` (default 15, range 0-100) warns when the
+kernel's available-memory level is **below** that floor. Swap allocation
+grows dynamically; these are occupancy/availability signals, not paging
+rates, and the memory level is not simply the free-page percentage. A 0/0
+swap pool explicitly reports no swap allocated. On non-macOS systems, these
+two metrics are explicitly skipped without spawning a platform command.
+
+All threshold values must be finite numbers; the disk and memory floors may
+be zero. Equality passes for disk, load, and memory, but warns for swap.
+Unavailable macOS sysctls, malformed kernel replies, other unavailable
 measurements (including an unknown CPU count) and invalid configuration warn
 explicitly, never claim healthy. This check is **always warn, never critical**:
-it cannot page the repair arm to delete files or stop other people's workloads.
+it cannot page the repair arm to delete files, clear swap, or stop other
+people's workloads. Offline proof: `python3 prove_host_pressure.py`.
 
 `"current_grace_hours"` (default 72) controls `w_sentinel_current`: ahead and
 freshly-diverged local work stay ok, but a running checkout that lacks older

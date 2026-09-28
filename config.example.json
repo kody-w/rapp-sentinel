@@ -28,14 +28,18 @@
   "current_grace_hours": 72,
   "_dashboard_refresh_on_tick_why": "False by default: serve.py already rebuilds on request and morning/standup.py rebuild explicitly, so health ticks need not wait for a redundant report. True preserves periodic static dashboard/index.html refreshes, after saving the health heartbeat, with a 180-second ceiling. All renderers share a nonblocking per-instance lock, so requests and ticks cannot pile up rendering jobs.",
   "dashboard_refresh_on_tick": false,
-  "_host_pressure_why": "Cheap local measurements of the volume holding SENTINEL_HOME and sustained host load. Always warn, never critical: the repair arm cannot safely free disk or stop other people's workloads. Unavailable measurements or invalid thresholds warn rather than passing blind.",
+  "_host_pressure_why": "Cheap local measurements of the volume holding SENTINEL_HOME and sustained host load (not CPU utilization). On macOS, swap occupancy and kernel available-memory level are read through native sysctlbyname, never subprocesses. Always warn, never critical: the repair arm cannot safely free disk, clear swap, or stop other people's workloads. Unavailable measurements or invalid thresholds warn rather than passing blind; non-macOS hosts explicitly skip the two Darwin-only metrics.",
   "host_pressure": {
     "_min_free_gib_why": "Warn below the larger of this many GiB free and min_free_percent of the volume's total capacity. Nonnegative; 0 disables only the absolute floor.",
     "min_free_gib": 10,
     "_min_free_percent_why": "Percentage free-space floor (0-100), combined with min_free_gib using max, not min. Equality to the floor passes.",
     "min_free_percent": 5,
     "_load_per_core_why": "Warn only when BOTH the 5-minute and 15-minute load averages exceed this positive multiple of os.cpu_count(). The 1-minute spike alone never warns; missing load/CPU measurements are reported explicitly.",
-    "load_per_core": 4
+    "load_per_core": 4,
+    "_max_swap_used_percent_why": "macOS vm.swapusage: warn at or above this percentage of currently allocated swap used (greater than 0, at most 100). Swap capacity grows dynamically; occupancy is not a paging-activity rate. A zero-sized pool with zero used is reported as no swap allocated, not a failed measurement.",
+    "max_swap_used_percent": 85,
+    "_min_memory_percent_why": "macOS kern.memorystatus_level: warn below this kernel available-memory percentage (0-100; equality passes). This is not simply the free-page percentage or a paging-activity rate. Unavailable/failed reads warn explicitly; no free-page estimate or fake zero is substituted.",
+    "min_memory_percent": 15
   },
   "copilot_model": "claude-opus-5",
   "copilot_timeout_s": 900,
