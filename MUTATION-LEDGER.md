@@ -143,6 +143,7 @@ check keeps its history.*
 | `eco_sweep` | ledger row; `prove_blind_green.py` | proven |
 | `gh_identity` | `prove_gh_identity.py` (ships with the check; GraphQL quota 0 field incident) | proven |
 | `gh_status` | `prove_github_status.py` (post-exercise id, #49) | proven |
+| `host_pressure` | `prove_host_pressure.py`: low absolute/percentage free space, sustained 5/15-minute load per core, macOS swap occupancy and available-memory level, threshold boundaries/overrides, unavailable/malformed native sysctl replies and invalid config all stay warn; explicit non-macOS skips; read-only ABI/no-process guarantees, local-machinery alert routing and a level-2 tick never invokes repair | proven |
 | `rails_fresh` | `prove_rails_fresh.py` | lands with #6's PR |
 | `rb_content_moving` | ledger row; `prove_content_moving.py`; `prove_transport_failure_is_not_a_content_stall.py` | proven |
 | `rb_derived_truth` | none committed — unit branch tests only (`RappterbookDerivedTruthTests` in `test_static_delivery.py`); no mutation row, no prove file | UNPROVEN |

@@ -116,6 +116,43 @@ GraphQL quota, naming the checks it blinds.
 depth (JSON silently keeps the last value), or sets a `notification_mode` other
 than `all` / `art-only` / `off` (unknown modes fail closed to off).
 
+`host_pressure` reports local disk headroom and sustained load on every
+tick, without subprocesses or network calls. It measures the volume holding
+`SENTINEL_HOME`, warning below `max(10 GiB, 5% of total capacity)` free, or when
+**both** the 5-minute and 15-minute load averages exceed four times
+`os.cpu_count()`. A 1-minute spike alone does not warn. Configure these bars
+with `host_pressure.min_free_gib` (default 10), `min_free_percent` (default 5,
+range 0-100), and `load_per_core` (default 4, positive). Load averages include
+tasks stalled on paging; they are not CPU-utilization measurements.
+
+On macOS, the same check also reads `vm.swapusage` and
+`kern.memorystatus_level` through stdlib `ctypes` / native `sysctlbyname`:
+no `sysctl` or `memory_pressure` subprocess, and no cached telemetry.
+`host_pressure.max_swap_used_percent` (default 85, greater than 0 and at most
+100) warns when swap used/allocated is **at or above** the threshold.
+`host_pressure.min_memory_percent` (default 15, range 0-100) warns when the
+kernel's available-memory level is **below** that floor. Swap allocation
+grows dynamically; these are occupancy/availability signals, not paging
+rates, and the memory level is not simply the free-page percentage. A 0/0
+swap pool explicitly reports no swap allocated. On non-macOS systems, these
+two metrics are explicitly skipped without spawning a platform command.
+
+All threshold values must be finite numbers; the disk and memory floors may
+be zero. Equality passes for disk, load, and memory, but warns for swap.
+Unavailable macOS sysctls, malformed kernel replies, other unavailable
+measurements (including an unknown CPU count) and invalid configuration warn
+explicitly, never claim healthy. This check is **always warn, never critical**:
+it cannot page the repair arm to delete files, clear swap, or stop other
+people's workloads. Hosts without `os.getloadavg` (Windows) skip the load
+metric explicitly instead of warning forever.
+
+Like any other warn, a failing `host_pressure` makes the verdict degraded, so
+the evolve worker's health gate pauses art while the host is under pressure:
+art is the heaviest optional workload, and a thrashing host is the worst place
+to start a 30-minute model run. To keep making art anyway, add
+`host_pressure` to `evolve_worker.degraded_allowlist`. Offline proof:
+`python3 prove_host_pressure.py`.
+
 `"current_grace_hours"` (default 72) controls `w_sentinel_current`: ahead and
 freshly-diverged local work stay ok, but a running checkout that lacks older
 commits already merged to `origin/main` warns that repairs are not reaching the
@@ -623,6 +660,16 @@ The watcher's own repair was the right one: **publish the head hash externally.*
 An outside anchor is something a splice cannot rewrite, because it does not live
 in the chain. `neighborhood.py` now writes `neighborhood/anchors.jsonl` and the
 morning report shows head-vs-anchor.
+
+Every historical anchor is still checked, including conflicting observations
+at the same sequence number. Prefix digests are now computed in one streaming
+SHA-256 pass per chain instead of re-hashing the entire prefix for every
+anchor: work grows with frames plus anchors, not their product. The digest
+bytes and anchor format are unchanged. There is no persisted verification
+cache or mtime shortcut; `verify()` and each roll call still verify every
+frame from genesis, and rewriting an interior frame is checked again on the
+next call even if the file size, timestamp, and final head did not change.
+Offline proof: `python3 prove_anchor_performance.py`.
 
 So the honest version of the claim:
 

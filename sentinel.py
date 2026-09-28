@@ -582,7 +582,7 @@ def _compact_detail(check, limit=86):
 def _own_machinery_id(cid):
     return (cid.startswith("w_") or cid in {
         "alert_delivery", "health_runtime", "sentinel_tick",
-        "w_sentinel_fresh", "w_checks_complete", "config_integrity",
+        "w_sentinel_fresh", "w_checks_complete", "config_integrity", "host_pressure",
     })
 
 

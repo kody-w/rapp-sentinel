@@ -48,10 +48,14 @@ probe_watchers and are retargeted through config.json's `watchers` block
 (see config.example.json), not by editing this file.
 """
 
+import ctypes
 import functools
 import json
+import math
 import os
+import shutil
 import subprocess
+import sys
 import urllib.error
 import urllib.request
 from collections import Counter
@@ -695,6 +699,152 @@ def config_integrity():
                 "all, art-only, off — operational alerts fail closed to off",
                 critical=False)
     return ok("config_integrity", "config.json parses with no duplicate keys")
+
+
+class _DarwinSwapUsage(ctypes.Structure):
+    """Darwin's 32-byte struct xsw_usage (bsd/sys/sysctl.h), in bytes."""
+    _fields_ = [
+        ("total", ctypes.c_uint64), ("available", ctypes.c_uint64),
+        ("used", ctypes.c_uint64), ("pagesize", ctypes.c_uint32),
+        ("encrypted", ctypes.c_uint32),
+    ]
+
+
+def _darwin_sysctl(name, value):
+    """Read a typed kernel value without spawning sysctl or caching telemetry."""
+    query = ctypes.CDLL(None, use_errno=True).sysctlbyname
+    query.argtypes = [ctypes.c_char_p, ctypes.c_void_p,
+                     ctypes.POINTER(ctypes.c_size_t),
+                     ctypes.c_void_p, ctypes.c_size_t]
+    query.restype = ctypes.c_int
+    expected = ctypes.sizeof(value)
+    size = ctypes.c_size_t(expected)
+    if query(name.encode("ascii"), ctypes.byref(value),
+             ctypes.byref(size), None, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error) if error else "sysctlbyname failed",
+                      name)
+    if size.value != expected:
+        raise ValueError(f"{name} returned {size.value} bytes, expected {expected}")
+    return value
+
+
+@check
+def host_pressure():
+    """Warn about the host, never ask the repair arm to manage its resources."""
+    limits = {"min_free_gib": 10, "min_free_percent": 5, "load_per_core": 4,
+              "max_swap_used_percent": 85, "min_memory_percent": 15}
+    try:
+        try:
+            cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            cfg = {}
+        if not isinstance(cfg, dict):
+            raise ValueError("config.json must be an object")
+        configured = cfg.get("host_pressure", {})
+        if not isinstance(configured, dict):
+            raise ValueError("host_pressure must be an object")
+        for key, default in limits.items():
+            value = configured.get(key, default)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f"host_pressure.{key} must be a finite nonnegative number")
+            limits[key] = value
+        for key in ("min_free_percent", "max_swap_used_percent", "min_memory_percent"):
+            if limits[key] > 100:
+                raise ValueError(f"host_pressure.{key} must be at most 100")
+        if limits["max_swap_used_percent"] == 0:
+            raise ValueError("host_pressure.max_swap_used_percent must be greater than zero")
+        if limits["load_per_core"] == 0:
+            raise ValueError("host_pressure.load_per_core must be greater than zero")
+        if not math.isfinite(limits["min_free_gib"] * 2**30):
+            raise ValueError("host_pressure.min_free_gib is too large")
+    except (OSError, UnicodeError, ValueError, OverflowError) as exc:
+        return fail("host_pressure",
+                    f"cannot read host pressure thresholds ({type(exc).__name__}: {exc})",
+                    critical=False)
+
+    details = []
+    pressured = False
+    try:
+        usage = shutil.disk_usage(HOME)
+        if (not all(math.isfinite(v) for v in (usage.total, usage.free))
+                or usage.total <= 0 or not 0 <= usage.free <= usage.total):
+            raise ValueError("invalid disk capacity/free-space measurement")
+        floor = max(limits["min_free_gib"] * 2**30,
+                    usage.total * (limits["min_free_percent"] / 100))
+        low_disk = usage.free < floor
+        pressured |= low_disk
+        details.append(
+            f"disk {usage.free / 2**30:.2f} GiB free "
+            f"({100 * usage.free / usage.total:.1f}%) on {HOME}; "
+            f"floor {floor / 2**30:.2f} GiB"
+            + (" - below floor" if low_disk else ""))
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
+        pressured = True
+        details.append(f"disk measurement unavailable ({type(exc).__name__}: {exc})")
+
+    if not hasattr(os, "getloadavg"):
+        # Windows has no load average; like swap/memory off macOS, this metric
+        # is skipped explicitly rather than reported as a permanent failure.
+        details.append("load average not provided by this platform (skipped)")
+    else:
+        try:
+            _, five, fifteen = os.getloadavg()
+            cores = os.cpu_count()
+            if (not isinstance(cores, int) or isinstance(cores, bool) or cores <= 0):
+                raise ValueError("CPU count unavailable")
+            if any(isinstance(v, bool) or not math.isfinite(v) or v < 0
+                   for v in (five, fifteen)):
+                raise ValueError("invalid 5/15-minute load measurement")
+            ceiling = cores * limits["load_per_core"]
+            high_load = five > ceiling and fifteen > ceiling
+            pressured |= high_load
+            details.append(
+                f"load 5m={five:.2f}, 15m={fifteen:.2f} on {cores} cores "
+                f"(warn when both > {ceiling:g}, {limits['load_per_core']:g}x cores)"
+                + (" - sustained load above ceiling" if high_load else ""))
+        except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
+            pressured = True
+            details.append(f"load measurement unavailable ({type(exc).__name__}: {exc})")
+
+    if sys.platform == "darwin":
+        try:
+            swap = _darwin_sysctl("vm.swapusage", _DarwinSwapUsage())
+            if swap.used > swap.total:
+                raise ValueError("swap used exceeds total allocation")
+            if swap.total == 0:
+                details.append("swap: no swap allocated (0 GiB used / 0 GiB total)")
+            else:
+                percent = 100 * swap.used / swap.total
+                high_swap = percent >= limits["max_swap_used_percent"]
+                pressured |= high_swap
+                details.append(
+                    f"swap {swap.used / 2**30:.2f}/{swap.total / 2**30:.2f} GiB "
+                    f"used ({percent:.1f}%; warn >= {limits['max_swap_used_percent']:g}%)"
+                    + (" - high swap usage" if high_swap else ""))
+        except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
+            pressured = True
+            details.append(f"swap measurement unavailable ({type(exc).__name__}: {exc})")
+
+        try:
+            level = _darwin_sysctl("kern.memorystatus_level", ctypes.c_uint32()).value
+            if not 0 <= level <= 100:
+                raise ValueError("memorystatus level is not a percentage (0-100)")
+            low_memory = level < limits["min_memory_percent"]
+            pressured |= low_memory
+            details.append(
+                f"memory available level {level}% (kern.memorystatus_level; "
+                f"floor {limits['min_memory_percent']:g}%)"
+                + (" - below floor" if low_memory else ""))
+        except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
+            pressured = True
+            details.append(f"memory measurement unavailable ({type(exc).__name__}: {exc})")
+    else:
+        details.append("swap/memory measurements skipped (macOS sysctls only)")
+    detail = "; ".join(details)
+    return (fail("host_pressure", detail, critical=False) if pressured
+            else ok("host_pressure", detail))
 
 
 @check
