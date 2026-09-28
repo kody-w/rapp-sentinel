@@ -50,7 +50,9 @@ probe_watchers and are retargeted through config.json's `watchers` block
 
 import functools
 import json
+import math
 import os
+import shutil
 import subprocess
 import urllib.error
 import urllib.request
@@ -695,6 +697,80 @@ def config_integrity():
                 "all, art-only, off — operational alerts fail closed to off",
                 critical=False)
     return ok("config_integrity", "config.json parses with no duplicate keys")
+
+
+@check
+def host_pressure():
+    """Warn about the host, never ask the repair arm to manage its resources."""
+    limits = {"min_free_gib": 10, "min_free_percent": 5, "load_per_core": 4}
+    try:
+        try:
+            cfg = json.loads((HOME / "config.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            cfg = {}
+        if not isinstance(cfg, dict):
+            raise ValueError("config.json must be an object")
+        configured = cfg.get("host_pressure", {})
+        if not isinstance(configured, dict):
+            raise ValueError("host_pressure must be an object")
+        for key, default in limits.items():
+            value = configured.get(key, default)
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f"host_pressure.{key} must be a finite nonnegative number")
+            limits[key] = value
+        if limits["min_free_percent"] > 100:
+            raise ValueError("host_pressure.min_free_percent must be at most 100")
+        if limits["load_per_core"] == 0:
+            raise ValueError("host_pressure.load_per_core must be greater than zero")
+        if not math.isfinite(limits["min_free_gib"] * 2**30):
+            raise ValueError("host_pressure.min_free_gib is too large")
+    except (OSError, UnicodeError, ValueError, OverflowError) as exc:
+        return fail("host_pressure",
+                    f"cannot read host pressure thresholds ({type(exc).__name__}: {exc})",
+                    critical=False)
+
+    details = []
+    pressured = False
+    try:
+        usage = shutil.disk_usage(HOME)
+        if (not all(math.isfinite(v) for v in (usage.total, usage.free))
+                or usage.total <= 0 or not 0 <= usage.free <= usage.total):
+            raise ValueError("invalid disk capacity/free-space measurement")
+        floor = max(limits["min_free_gib"] * 2**30,
+                    usage.total * (limits["min_free_percent"] / 100))
+        low_disk = usage.free < floor
+        pressured |= low_disk
+        details.append(
+            f"disk {usage.free / 2**30:.2f} GiB free "
+            f"({100 * usage.free / usage.total:.1f}%) on {HOME}; "
+            f"floor {floor / 2**30:.2f} GiB"
+            + (" - below floor" if low_disk else ""))
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
+        pressured = True
+        details.append(f"disk measurement unavailable ({type(exc).__name__}: {exc})")
+
+    try:
+        _, five, fifteen = os.getloadavg()
+        cores = os.cpu_count()
+        if (not isinstance(cores, int) or isinstance(cores, bool) or cores <= 0):
+            raise ValueError("CPU count unavailable")
+        if any(isinstance(v, bool) or not math.isfinite(v) or v < 0
+               for v in (five, fifteen)):
+            raise ValueError("invalid 5/15-minute load measurement")
+        ceiling = cores * limits["load_per_core"]
+        high_load = five > ceiling and fifteen > ceiling
+        pressured |= high_load
+        details.append(
+            f"load 5m={five:.2f}, 15m={fifteen:.2f} on {cores} cores "
+            f"(warn when both > {ceiling:g}, {limits['load_per_core']:g}x cores)"
+            + (" - sustained load above ceiling" if high_load else ""))
+    except (AttributeError, OSError, TypeError, ValueError, OverflowError) as exc:
+        pressured = True
+        details.append(f"load measurement unavailable ({type(exc).__name__}: {exc})")
+    detail = "; ".join(details)
+    return (fail("host_pressure", detail, critical=False) if pressured
+            else ok("host_pressure", detail))
 
 
 @check

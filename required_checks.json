@@ -10,6 +10,7 @@
     "eco_sweep",
     "gh_identity",
     "gh_status",
+    "host_pressure",
     "ip_hygiene",
     "page_fetch",
     "rails_fresh",
@@ -69,6 +70,10 @@
     "gh_status": {
       "domain": "github",
       "kind": "reachability"
+    },
+    "host_pressure": {
+      "domain": "host",
+      "kind": "capacity"
     },
     "ip_hygiene": {
       "domain": "self",
