@@ -18,6 +18,7 @@ os.environ["SENTINEL_HOME"] = IMPORT_HOME.name
 
 import checks as C
 import health as H
+import sentinel as S
 
 GIB = 2**30
 Usage = namedtuple("Usage", "total used free")
@@ -163,6 +164,35 @@ class HostPressureProof(unittest.TestCase):
         self.assertEqual("degraded", verdict["status"])
         self.assertEqual(["host_pressure"], verdict["failed"])
         self.assertEqual([], verdict["critical"])
+
+    def test_pressure_is_local_machinery_and_never_invokes_repair(self):
+        self.disk.return_value = Usage(200 * GIB, 199 * GIB, GIB)
+        result = C.host_pressure()
+        groups = S._group_failing_checks([result])
+        self.assertEqual([result], groups["own"])
+        self.assertEqual([], groups["platform"])
+        state = self.home / "state"
+        state.mkdir()
+        self.patch(S, "HOME", new=self.home)
+        self.patch(S, "STATE", new=state)
+        self.patch(S, "STOP", new=self.home / "STOP")
+        self.patch(S, "config", return_value=dict(S.DEFAULTS, level=2, notify=False))
+        self.patch(S, "run_health", return_value={
+            "status": "degraded", "checks": [result], "failed": ["host_pressure"],
+            "critical": [], "summary": result["detail"],
+        })
+        for name in ("log", "ensure_evolution_worker_loaded", "publish_head_hook",
+                     "notify", "silence_breaker"):
+            self.patch(S, name)
+        self.patch(S, "outsider_smoke", return_value=False)
+        repair = self.patch(S, "escalate")
+        nb = self.patch(S, "NB")
+        nb.roll_call.return_value = {}
+        nb.peer_roll_call.return_value = {}
+        nb.check_anchors.return_value = {}
+        self.assertEqual(0, S.main())
+        repair.assert_not_called()
+        self.commands.assert_not_called()
 
 
 if __name__ == "__main__":

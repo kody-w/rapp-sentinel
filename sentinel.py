@@ -583,7 +583,7 @@ def _compact_detail(check, limit=86):
 def _own_machinery_id(cid):
     return (cid.startswith("w_") or cid in {
         "alert_delivery", "health_runtime", "sentinel_tick",
-        "w_sentinel_fresh", "w_checks_complete", "config_integrity",
+        "w_sentinel_fresh", "w_checks_complete", "config_integrity", "host_pressure",
     })
 
 
@@ -1623,7 +1623,7 @@ def refresh_dashboard(cfg):
                        capture_output=True, text=True, check=True,
                        timeout=180, cwd=str(HOME))
     except (OSError, subprocess.SubprocessError) as exc:
-        detail = (getattr(exc, "stderr", "") or "").strip()[:200]
+        detail = (getattr(exc, "stderr", "") or "").strip()[-200:]
         log(f"dashboard refresh failed: {type(exc).__name__}: {exc}"
             + (f": {detail}" if detail else ""))
         return False

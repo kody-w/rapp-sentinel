@@ -160,6 +160,17 @@ class TickDashboardProof(unittest.TestCase):
         serve.rebuild()
         self.assertEqual(2, thread.call_count)
 
+    def test_first_request_is_not_throttled_just_after_boot(self):
+        clock, thread, _ = self.prepare_server()
+        self.patch(serve, "_last_build", None)
+        clock.return_value = 0
+        serve.rebuild()
+        thread.assert_called_once()
+        thread.call_args.kwargs["target"]()
+        clock.return_value = 5
+        serve.rebuild()
+        thread.assert_called_once()
+
     def test_server_failure_is_reported_and_does_not_latch_refresh_closed(self):
         clock, thread, run = self.prepare_server()
         run.side_effect = subprocess.TimeoutExpired(["standup.py"], 180)

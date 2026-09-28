@@ -34,7 +34,7 @@ SHARED_REPORTS = HOME / "state" / "shared-reports"
 PORT = 9797
 # Don't rebuild on every asset request — a page load fires several.
 MIN_REBUILD_INTERVAL = 20
-_last_build = 0.0
+_last_build = None
 _building = False
 _lock = threading.Lock()
 
@@ -59,7 +59,8 @@ def rebuild(hours=14):
     """
     global _last_build, _building
     with _lock:
-        if _building or time.monotonic() - _last_build < MIN_REBUILD_INTERVAL:
+        if _building or (_last_build is not None
+                         and time.monotonic() - _last_build < MIN_REBUILD_INTERVAL):
             return
         _last_build = time.monotonic()
         _building = True
@@ -71,7 +72,7 @@ def rebuild(hours=14):
                            capture_output=True, text=True, check=True,
                            timeout=180, cwd=str(HOME))
         except (OSError, subprocess.SubprocessError) as exc:
-            detail = (getattr(exc, "stderr", "") or "").strip()[:200]
+            detail = (getattr(exc, "stderr", "") or "").strip()[-200:]
             print(f"dashboard refresh failed: {type(exc).__name__}: {exc}"
                   + (f": {detail}" if detail else ""), file=sys.stderr, flush=True)
         finally:
