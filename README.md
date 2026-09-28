@@ -143,7 +143,15 @@ Unavailable macOS sysctls, malformed kernel replies, other unavailable
 measurements (including an unknown CPU count) and invalid configuration warn
 explicitly, never claim healthy. This check is **always warn, never critical**:
 it cannot page the repair arm to delete files, clear swap, or stop other
-people's workloads. Offline proof: `python3 prove_host_pressure.py`.
+people's workloads. Hosts without `os.getloadavg` (Windows) skip the load
+metric explicitly instead of warning forever.
+
+Like any other warn, a failing `host_pressure` makes the verdict degraded, so
+the evolve worker's health gate pauses art while the host is under pressure:
+art is the heaviest optional workload, and a thrashing host is the worst place
+to start a 30-minute model run. To keep making art anyway, add
+`host_pressure` to `evolve_worker.degraded_allowlist`. Offline proof:
+`python3 prove_host_pressure.py`.
 
 `"current_grace_hours"` (default 72) controls `w_sentinel_current`: ahead and
 freshly-diverged local work stay ok, but a running checkout that lacks older
@@ -799,21 +807,6 @@ reminders resume automatically afterwards. Offline proof:
 ```
 
 Reads the chains — it keeps **no log of its own**, because a dashboard with a private copy of the truth is a second source that can disagree with the first. It re-verifies every chain from genesis while rendering, so a tampered record shows as a red banner instead of a tidy chart.
-
-Health ticks no longer rebuild this report by default: `serve.py` already
-refreshes on request, and `./morning` / `python3 standup.py --hours=14` refresh
-explicitly. This removes a redundant, formerly blocking 180-second refresh
-from the health path. Static-file-only installations can opt back in with
-`"dashboard_refresh_on_tick": true`; the tick saves its health heartbeat first,
-then allows at most 180 seconds for that optional render. Renderer failures
-are logged and never abort the tick.
-
-The HTTP server serves the last render immediately while refreshing in the
-background. It keeps at most one refresh thread active, and a nonblocking
-per-instance file lock covers every renderer (including CLI and portable
-snapshots), so slow requests cannot accumulate renderers. A busy renderer
-refuses a competing rebuild explicitly rather than waiting in a queue.
-Offline proof: `python3 prove_tick_dashboard.py`.
 
 Every claim links to evidence: commits to GitHub, contributions to their source, and each autonomous decision to the full local transcript of the run that produced it.
 

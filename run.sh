@@ -22,7 +22,7 @@ cd "$(dirname "$0")" || exit 1
 #
 # macOS ships no timeout(1), so the ceiling is enforced here. Sized against
 # the worst LEGITIMATE tick, so real work is never killed mid-flight:
-# health run (600) + opt-in static dashboard (180) + the one model-spending arm the tick
+# health run (600) + dashboard (180) + the one model-spending arm the tick
 # is allowed (evolve, 1800 — smoke and evolve never stack, sentinel.py
 # defers evolve when a smoke ran) + overhead. Anything past that is hung,
 # not working. The old 2100 was sized when health was 180s and smoke did

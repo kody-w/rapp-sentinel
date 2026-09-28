@@ -58,7 +58,6 @@ DEFAULTS = {
     # deployed art receipt; off: no outbound messages.
     "notification_mode": "all",
     "silence_breaker_hours": 24,
-    "dashboard_refresh_on_tick": False,
     "copilot_model": "claude-sonnet-4.6",
     "copilot_timeout_s": 900,
     # Outsider smoke (#5 ask 2): a smoke test is a WRITE (it files a real
@@ -1610,26 +1609,6 @@ def outsider_smoke(cfg):
 
 # ── main ────────────────────────────────────────────────────────────────────
 
-def refresh_dashboard(cfg):
-    """Optional static-file refresh; the HTTP dashboard rebuilds on demand."""
-    enabled = cfg.get("dashboard_refresh_on_tick", False)
-    if not isinstance(enabled, bool):
-        log("dashboard refresh skipped: dashboard_refresh_on_tick must be a boolean")
-        return False
-    if not enabled:
-        return False
-    try:
-        subprocess.run([sys.executable, str(CODE / "standup.py"), "--hours=14"],
-                       capture_output=True, text=True, check=True,
-                       timeout=180, cwd=str(HOME))
-    except (OSError, subprocess.SubprocessError) as exc:
-        detail = (getattr(exc, "stderr", "") or "").strip()[-200:]
-        log(f"dashboard refresh failed: {type(exc).__name__}: {exc}"
-            + (f": {detail}" if detail else ""))
-        return False
-    return True
-
-
 def main():
     cfg = config()
 
@@ -1639,6 +1618,15 @@ def main():
 
     ensure_evolution_worker_loaded(cfg)
 
+    def refresh_dashboard():
+        """Rebuild the shift report every tick. It only ever reads the chains,
+        so it can never disagree with the record it renders."""
+        try:
+            subprocess.run([sys.executable, str(CODE / "standup.py"), "--hours=14"],
+                           capture_output=True, timeout=180, cwd=str(HOME))
+        except Exception as e:
+            log(f"dashboard refresh failed: {type(e).__name__}: {e}")
+
     verdict = run_health()
     status = verdict["status"]
     failing = verdict["failed"]
@@ -1646,6 +1634,7 @@ def main():
     prev_status = prev.get("status")
 
     log(f"status={status} failing={failing or 'none'}")
+    refresh_dashboard()
 
     # own heartbeat, so a stalled sentinel is detectable by the next run,
     # by the brainstem, and by openrappter
@@ -1656,7 +1645,6 @@ def main():
         "summary": verdict["summary"],
     })
     save_json(STATE / "last_verdict.json", verdict)
-    refresh_dashboard(cfg)
 
     # Record this tick as a rapp/1 frame on the copilot neighbor's chain, and
     # take the roll call. The frame is what makes the sentinel's own history
