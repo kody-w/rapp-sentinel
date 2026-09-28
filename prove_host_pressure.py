@@ -143,6 +143,11 @@ class HostPressureProof(unittest.TestCase):
         # forever for a measurement the platform never provides; setUp's
         # patcher restores the attribute afterwards.
         with mock.patch.object(C.sys, "platform", "win32"):
+            # Put setUp's fake back before its patcher cleanup runs (cleanups
+            # are LIFO): on a real Windows host the patcher deletes the
+            # attribute it created, which would fail if this test had
+            # already removed it.
+            self.addCleanup(setattr, C.os, "getloadavg", C.os.getloadavg)
             delattr(C.os, "getloadavg")
             result = C.host_pressure()
         self.assertTrue(result["ok"], result)
