@@ -629,12 +629,13 @@ class OutboxAttachmentTests(unittest.TestCase):
     def test_interior_terminal_corruption_is_quarantined_and_rewritten(self):
         first = {"dedupe_key": "first", "sent_at": outbox.now()}
         last = {"dedupe_key": "last", "sent_at": outbox.now()}
-        outbox.SENT.write_text(
+        # Bytes, not write_text: on Windows text mode stores "\r\n", and the
+        # quarantine below must keep exactly the raw bytes that were on disk.
+        outbox.SENT.write_bytes((
             json.dumps(first) + "\n"
             + "{broken\n"
-            + json.dumps(last) + "\n",
-            encoding="utf-8",
-        )
+            + json.dumps(last) + "\n"
+        ).encode("utf-8"))
         self.assertTrue(outbox.enqueue("plain alert", "recipient"))
         with mock.patch.object(
                 outbox, "_send", return_value=(True, "")) as send:
