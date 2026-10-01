@@ -177,6 +177,14 @@ def _queue_entry_identity(message, queue_sha256):
 
 
 def _fsync_directory(path):
+    """Make a new or renamed directory entry durable, where the platform allows it.
+
+    POSIX needs the directory itself fsynced for the entry to survive a crash. Windows
+    refuses os.open() on a directory (PermissionError), and NTFS journals the entry with
+    the file, so there is nothing to do there. Raising instead would drop the very alert
+    this durability protects: every enqueue on a Windows sentinel failed that way."""
+    if os.name == "nt":
+        return
     descriptor = os.open(str(Path(path)), os.O_RDONLY)
     try:
         os.fsync(descriptor)
